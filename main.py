@@ -14,6 +14,7 @@ from config.config import Config
 from run import run_wandb, run, sweep_init
 from preprocessing.lobster import LOBSTERDataBuilder
 from preprocessing.btc import BTCDataBuilder
+from preprocessing.battery import BatteryDataBuilder
 from constants import DatasetType
 
 @hydra.main(config_path="config", config_name="config")
@@ -28,6 +29,9 @@ def hydra_app(config: Config):
         if config.model.type.value == "MLPLOB" or config.model.type.value == "TLOB":
             config.model.hyperparameters_fixed["hidden_dim"] = 144
     elif config.dataset.type == DatasetType.BTC:
+        if config.model.type.value == "MLPLOB" or config.model.type.value == "TLOB":
+            config.model.hyperparameters_fixed["hidden_dim"] = 40
+    elif config.dataset.type == DatasetType.BATTERY:
         if config.model.type.value == "MLPLOB" or config.model.type.value == "TLOB":
             config.model.hyperparameters_fixed["hidden_dim"] = 40
     elif config.dataset.type == DatasetType.LOBSTER:
@@ -62,6 +66,17 @@ def hydra_app(config: Config):
         
     elif config.dataset.type == cst.DatasetType.BTC and not config.experiment.is_data_preprocessed:
         data_builder = BTCDataBuilder(
+        data_dir=cst.DATA_DIR,
+        date_trading_days=config.dataset.dates,
+        split_rates=cst.SPLIT_RATES,
+        sampling_type=config.dataset.sampling_type,
+        sampling_time=config.dataset.sampling_time,
+        sampling_quantity=config.dataset.sampling_quantity,
+        )
+        data_builder.prepare_save_datasets()
+
+    elif config.dataset.type == cst.DatasetType.BATTERY and not config.experiment.is_data_preprocessed:
+        data_builder = BatteryDataBuilder(
         data_dir=cst.DATA_DIR,
         date_trading_days=config.dataset.dates,
         split_rates=cst.SPLIT_RATES,

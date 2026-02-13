@@ -13,6 +13,7 @@ from models.engine import Engine
 from preprocessing.fi_2010 import fi_2010_load
 from preprocessing.lobster import lobster_load
 from preprocessing.btc import btc_load
+from preprocessing.battery import battery_load
 from preprocessing.dataset import Dataset, DataModule
 import constants as cst
 from constants import DatasetType, SamplingType
@@ -94,6 +95,46 @@ def train(config: Config, trainer: L.Trainer, run=None):
             num_workers=4
         ) 
 
+        test_loaders = [data_module.test_dataloader()]
+
+    elif dataset_type == "BATTERY":
+        stock = config.dataset.training_stocks[0]
+        train_input, train_labels = battery_load(
+            cst.DATA_DIR + f"/{stock}/train.npy",
+            config.model.hyperparameters_fixed["all_features"],
+            cst.LEN_SMOOTH,
+            horizon,
+            seq_size,
+        )
+        val_input, val_labels = battery_load(
+            cst.DATA_DIR + f"/{stock}/val.npy",
+            config.model.hyperparameters_fixed["all_features"],
+            cst.LEN_SMOOTH,
+            horizon,
+            seq_size,
+        )
+        test_input, test_labels = battery_load(
+            cst.DATA_DIR + f"/{stock}/test.npy",
+            config.model.hyperparameters_fixed["all_features"],
+            cst.LEN_SMOOTH,
+            horizon,
+            seq_size,
+        )
+        train_set = Dataset(train_input, train_labels, seq_size)
+        val_set = Dataset(val_input, val_labels, seq_size)
+        test_set = Dataset(test_input, test_labels, seq_size)
+        if config.experiment.is_debug:
+            train_set.length = 1000
+            val_set.length = 1000
+            test_set.length = 10000
+        data_module = DataModule(
+            train_set=train_set,
+            val_set=val_set,
+            test_set=test_set,
+            batch_size=config.dataset.batch_size,
+            test_batch_size=config.dataset.batch_size * 4,
+            num_workers=4,
+        )
         test_loaders = [data_module.test_dataloader()]
         
     elif dataset_type == "LOBSTER":

@@ -70,6 +70,17 @@ class BTC(Dataset):
     testing_stocks: list = field(default_factory=lambda: ["BTC"])
 
 @dataclass
+class BATTERY(Dataset):
+    type: DatasetType = DatasetType.BATTERY
+    dates: list = field(default_factory=lambda: ["2021-01-01", "2021-12-31"])
+    sampling_type: SamplingType = SamplingType.NONE
+    sampling_time: str = "1s"
+    sampling_quantity: int = 0
+    batch_size: int = 128
+    training_stocks: list = field(default_factory=lambda: ["battery_markets"])
+    testing_stocks: list = field(default_factory=lambda: ["battery_markets"])
+
+@dataclass
 class Experiment:
     is_data_preprocessed: bool = False
     is_wandb: bool = True
@@ -105,3 +116,4 @@ cs.store(group="model", name="deeplob", node=DeepLOB)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)
 cs.store(group="dataset", name="btc", node=BTC)
+cs.store(group="dataset", name="battery", node=BATTERY)

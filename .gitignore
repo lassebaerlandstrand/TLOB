@@ -248,3 +248,34 @@ data/checkpoints/EvolutionData/
 
 # Generated precision-recall figures
 data/checkpoints/*/precision_recall_curve_FI_2010.svg
+
+# Heavy artifacts
+2021/
+data/battery_markets/
+data/battery_markets.zip
+data/battery_markets/**/*.zip
+data/BTC/**/*.zip
+data/BTC/**/*.csv
+data/BTC/**/*.parquet
+data/**/*.npy
+data/**/*.npz
+outputs/**
+wandb/**
+lightning_logs/**
+.hydra/**
+
+# Checkpoint and experiment artifacts
+data/checkpoints/**/checkpoints/
+data/checkpoints/**/*.ckpt
+data/checkpoints/**/*.pt
+data/checkpoints/**/*.onnx
+data/checkpoints/**/*.csv
+data/checkpoints/**/*.json
+data/checkpoints/**/*.png
+data/checkpoints/**/*.svg
+
+# Local logs and temporary files
+*.out
+*.err
+*.tmp
+*.bak

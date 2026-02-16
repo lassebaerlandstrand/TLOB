@@ -145,17 +145,16 @@ def labeling(X, len, h):
     previous_mid_prices = np.mean(previous_mid_prices, axis=1)
     future_mid_prices = np.mean(future_mid_prices, axis=1)
 
-    # Compute percentage change
-    percentage_change = (future_mid_prices - previous_mid_prices) / previous_mid_prices
-    
-    # alpha is the average percentage change of the stock
-    alpha = np.abs(percentage_change).mean() / 2
-    
-    # alpha is the average spread of the stock in percentage of the mid-price
-    #alpha = (X[:, 0] - X[:, 2]).mean() / ((X[:, 0] + X[:, 2]) / 2).mean()
-        
+    # Compute absolute price change instead of percentage change.
+    # Absolute change is well-defined for all prices (including zero and
+    # negative, which occur in energy markets)
+    price_change = future_mid_prices - previous_mid_prices
+
+    # Adaptive threshold: half the mean absolute change
+    alpha = np.abs(price_change).mean() / 2
+
     print(f"Alpha: {alpha}")
-    labels = np.where(percentage_change < -alpha, 2, np.where(percentage_change > alpha, 0, 1))
+    labels = np.where(price_change < -alpha, 2, np.where(price_change > alpha, 0, 1))
     print(f"Number of labels: {np.unique(labels, return_counts=True)}")
     print(f"Percentage of labels: {np.unique(labels, return_counts=True)[1] / labels.shape[0]}")
     return labels

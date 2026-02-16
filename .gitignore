@@ -234,6 +234,7 @@ TLOB_Paper.pdf
 TLOB_SETUP.md
 .claude
 diagnose_tests/
+notebooks/dataset_analysis.ipynb
 
 # Large local archive
 data/battery_market.zip

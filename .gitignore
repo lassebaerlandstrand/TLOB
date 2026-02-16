@@ -233,6 +233,7 @@ __marimo__/
 TLOB_Paper.pdf
 TLOB_SETUP.md
 .claude
+diagnose_tests/
 
 # Large local archive
 data/battery_market.zip

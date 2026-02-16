@@ -358,6 +358,7 @@ class BatteryDataBuilder:
 
         rows = []
         previous_ts = None
+        book_ready = False
 
         for row in df_contract.itertuples(index=False):
             transaction = row.transaction
@@ -394,7 +395,26 @@ class BatteryDataBuilder:
 
             # 4. Build LOB snapshot
             orderbook = self._top_levels(active)
-            if orderbook[0] <= 0 or orderbook[2] <= 0:
+
+            # Wait until the book is established before recording snapshots.
+            # The C++ engine queries LOB state at specific times when the book
+            # is mature; our event-by-event approach must skip the warmup
+            # period at contract start where the book is still building up.
+            # Once full depth is reached, we keep recording for this contract.
+            # Use quantity > 0 (not price > 0) because energy prices can be
+            # zero or negative.
+            if not book_ready:
+                n_ask = sum(1 for lvl in range(self.n_lob_levels) if orderbook[lvl * 4 + 1] > 0)
+                n_bid = sum(1 for lvl in range(self.n_lob_levels) if orderbook[lvl * 4 + 3] > 0)
+                if n_ask < self.n_lob_levels or n_bid < self.n_lob_levels:
+                    continue
+                book_ready = True
+
+            # After the book is established, orders can still expire and drain
+            # a side completely.  Skip snapshots where either side is empty
+            # (qty == 0 at level 1) because the mid-price from a one-sided
+            # book is not meaningful.
+            if orderbook[1] == 0.0 or orderbook[3] == 0.0:
                 continue
 
             time_delta = 0.0 if previous_ts is None else max((transaction - previous_ts).total_seconds(), 0.0)

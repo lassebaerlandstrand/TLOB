@@ -36,7 +36,9 @@ def battery_load(path, all_features, len_smooth, h, seq_size):
         )
 
     if all_features:
-        input_ = set_[:, : cst.LEN_ORDER + cst.N_LOB_LEVELS * cst.LEN_LEVEL]
+        orderbook = set_[:, cst.LEN_ORDER : cst.LEN_ORDER + cst.N_LOB_LEVELS * cst.LEN_LEVEL]
+        messages = set_[:, : cst.LEN_ORDER]
+        input_ = np.concatenate([orderbook, messages], axis=1)
     else:
         input_ = set_[:, cst.LEN_ORDER : cst.LEN_ORDER + cst.N_LOB_LEVELS * cst.LEN_LEVEL]
 

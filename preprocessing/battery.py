@@ -300,6 +300,56 @@ class BatteryDataBuilder:
 
         return pd.concat(contract_frames, axis=0, ignore_index=True)
 
+    def _match_order(self, active, side, price, quantity):
+        """Simulate order matching against resting orders on the opposite side.
+
+        When an aggressive order crosses the book (buy price >= best ask, or
+        sell price <= best bid), it should be matched against resting orders
+        rather than sitting in the book and creating a crossed state.
+
+        Returns the remaining (unfilled) quantity after matching.
+        """
+        remaining = quantity
+
+        if side == "BUY":
+            # Match against asks (sells) from lowest price up
+            # Collect ask-side orders sorted by price (price-time priority)
+            ask_orders = [
+                (o["price"], oid)
+                for oid, o in active.items()
+                if o["side"] == "SELL" and o["quantity"] > 0
+            ]
+            ask_orders.sort()  # lowest price first
+
+            for ask_price, oid in ask_orders:
+                if remaining <= 0 or price < ask_price:
+                    break
+                fill = min(remaining, active[oid]["quantity"])
+                active[oid]["quantity"] -= fill
+                remaining -= fill
+                if active[oid]["quantity"] <= 0:
+                    del active[oid]
+
+        elif side == "SELL":
+            # Match against bids (buys) from highest price down
+            bid_orders = [
+                (o["price"], oid)
+                for oid, o in active.items()
+                if o["side"] == "BUY" and o["quantity"] > 0
+            ]
+            bid_orders.sort(reverse=True)  # highest price first
+
+            for bid_price, oid in bid_orders:
+                if remaining <= 0 or price > bid_price:
+                    break
+                fill = min(remaining, active[oid]["quantity"])
+                active[oid]["quantity"] -= fill
+                remaining -= fill
+                if active[oid]["quantity"] <= 0:
+                    del active[oid]
+
+        return remaining
+
     def _replay_contract(self, df_contract: pd.DataFrame):
         df_contract = df_contract.sort_values(["transaction", "initial"]).reset_index(drop=True)
         active = {}
@@ -317,22 +367,32 @@ class BatteryDataBuilder:
             price = float(row.price)
             quantity = float(row.quantity)
 
+            # 1. Expire orders whose validity has been reached
             while expiry_heap and expiry_heap[0][0] <= transaction:
                 _, expired_initial, expired_version = heapq.heappop(expiry_heap)
                 if expired_initial in active and versions.get(expired_initial, -1) == expired_version:
                     del active[expired_initial]
 
-            version = versions.get(initial, 0) + 1
-            versions[initial] = version
-            active[initial] = {
-                "side": side,
-                "price": price,
-                "quantity": quantity,
-                "validity": validity,
-                "version": version,
-            }
-            heapq.heappush(expiry_heap, (validity, initial, version))
+            # 2. Simulate order matching: aggressive orders cross the book
+            remaining = self._match_order(active, side, price, quantity)
 
+            # 3. Add residual quantity as a resting order (if any)
+            if remaining > 0:
+                version = versions.get(initial, 0) + 1
+                versions[initial] = version
+                active[initial] = {
+                    "side": side,
+                    "price": price,
+                    "quantity": remaining,
+                    "validity": validity,
+                    "version": version,
+                }
+                heapq.heappush(expiry_heap, (validity, initial, version))
+            else:
+                # Fully matched: bump version so stale expiry entries are ignored
+                versions[initial] = versions.get(initial, 0) + 1
+
+            # 4. Build LOB snapshot
             orderbook = self._top_levels(active)
             if orderbook[0] <= 0 or orderbook[2] <= 0:
                 continue
@@ -343,9 +403,12 @@ class BatteryDataBuilder:
             direction = 1 if side == "BUY" else -1
             depth = self._compute_depth(price, direction, orderbook)
 
+            # event_type: 1 = resting (limit), 3 = aggressive (trade)
+            event_type = 1.0 if remaining > 0 else 3.0
+
             message = [
                 time_delta,
-                1.0,
+                event_type,
                 quantity,
                 price,
                 float(direction),

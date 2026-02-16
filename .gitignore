@@ -232,6 +232,7 @@ __marimo__/
 # Context
 TLOB_Paper.pdf
 TLOB_SETUP.md
+.claude
 
 # Large local archive
 data/battery_market.zip

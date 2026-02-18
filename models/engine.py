@@ -1,5 +1,6 @@
 from lightning import LightningModule
 import numpy as np
+import time
 from sklearn.metrics import classification_report, precision_recall_curve
 from torch import nn
 import os
@@ -76,6 +77,11 @@ class Engine(LightningModule):
         self.last_path_ckpt = None
         self.first_test = True
         self.test_mid_prices = []
+        self.train_epoch_start_time = None
+        self.epoch_sample_count = 0
+        self.epoch_iteration_count = 0
+        self.epoch_samples_per_sec = []
+        self.epoch_it_per_sec = []
 
     def _compile_model(self):
         if not self.use_torch_compile:
@@ -110,13 +116,30 @@ class Engine(LightningModule):
         batch_loss = self.loss(y_hat, y)
         batch_loss_mean = torch.mean(batch_loss)
         self.train_losses.append(batch_loss_mean.item())
+        self.epoch_iteration_count += 1
+        self.epoch_sample_count += int(y.shape[0])
         self.ema.update()
         if batch_idx % 1000 == 0:
             print(f'train loss: {sum(self.train_losses) / len(self.train_losses)}')
         return batch_loss_mean
     
     def on_train_epoch_start(self) -> None:
+        self.train_epoch_start_time = time.perf_counter()
+        self.epoch_sample_count = 0
+        self.epoch_iteration_count = 0
         print(f'learning rate: {self.optimizer.param_groups[0]["lr"]}')
+
+    def on_train_epoch_end(self) -> None:
+        if self.train_epoch_start_time is None:
+            return
+        epoch_duration = max(time.perf_counter() - self.train_epoch_start_time, 1e-12)
+        samples_per_sec = self.epoch_sample_count / epoch_duration
+        it_per_sec = self.epoch_iteration_count / epoch_duration
+        self.epoch_samples_per_sec.append(samples_per_sec)
+        self.epoch_it_per_sec.append(it_per_sec)
+        print(
+            f"Epoch {self.current_epoch} throughput - samples/s: {samples_per_sec:.2f}, it/s: {it_per_sec:.2f}"
+        )
     
     def validation_step(self, batch, batch_idx):
         x, y = batch
@@ -224,6 +247,21 @@ class Engine(LightningModule):
         test_proba = np.concatenate(self.test_proba)
         precision, recall, _ = precision_recall_curve(targets, test_proba, pos_label=1)
         self.plot_pr_curves(recall, precision, self.is_wandb) 
+
+    def on_fit_end(self) -> None:
+        if not self.epoch_samples_per_sec or not self.epoch_it_per_sec:
+            return
+        avg_samples_per_sec = float(np.mean(self.epoch_samples_per_sec))
+        avg_it_per_sec = float(np.mean(self.epoch_it_per_sec))
+        self.log("avg_samples_per_sec", avg_samples_per_sec, logger=True)
+        self.log("avg_it_per_sec", avg_it_per_sec, logger=True)
+        if self.is_wandb and wandb.run is not None:
+            wandb.log(
+                {
+                    "avg_samples_per_sec": avg_samples_per_sec,
+                    "avg_it_per_sec": avg_it_per_sec,
+                }
+            )
         
     def configure_optimizers(self):
         if self.model_type == "DEEPLOB":

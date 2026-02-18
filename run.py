@@ -238,6 +238,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 map_location=cst.DEVICE,
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
                 )
         elif model_type == "TLOB":
             model = Engine.load_from_checkpoint(
@@ -258,7 +262,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_heads=checkpoint["hyper_parameters"]["num_heads"],
                 is_sin_emb=checkpoint["hyper_parameters"]["is_sin_emb"],
                 map_location=cst.DEVICE,
-                len_test_dataloader=len(test_loaders[0])
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
                 )
         elif model_type == "BINCTABL":
             model = Engine.load_from_checkpoint(
@@ -275,7 +283,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 map_location=cst.DEVICE,
-                len_test_dataloader=len(test_loaders[0])
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
                 )
         elif model_type == "DEEPLOB":
             model = Engine.load_from_checkpoint(
@@ -292,7 +304,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 map_location=cst.DEVICE,
-                len_test_dataloader=len(test_loaders[0])
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
                 )
               
     else:
@@ -311,7 +327,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_layers=config.model.hyperparameters_fixed["num_layers"],
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
-                len_test_dataloader=len(test_loaders[0])
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
             )
         elif model_type == cst.ModelType.TLOB:
             model = Engine(
@@ -330,7 +350,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dataset_type=dataset_type,
                 num_heads=config.model.hyperparameters_fixed["num_heads"],
                 is_sin_emb=config.model.hyperparameters_fixed["is_sin_emb"],
-                len_test_dataloader=len(test_loaders[0])
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
             )
         elif model_type == cst.ModelType.BINCTABL:
             model = Engine(
@@ -345,7 +369,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dir_ckpt=config.experiment.dir_ckpt,
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
-                len_test_dataloader=len(test_loaders[0])
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
             )
         elif model_type == cst.ModelType.DEEPLOB:
             model = Engine(
@@ -360,7 +388,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dir_ckpt=config.experiment.dir_ckpt,
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
-                len_test_dataloader=len(test_loaders[0])
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
             )
     
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))   
@@ -371,7 +403,14 @@ def train(config: Config, trainer: L.Trainer, run=None):
         best_model_path = model.last_path_ckpt
         print("Best model path: ", best_model_path) 
         try:
-            best_model = Engine.load_from_checkpoint(best_model_path, map_location=cst.DEVICE)
+            best_model = Engine.load_from_checkpoint(
+                best_model_path,
+                map_location=cst.DEVICE,
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
+            )
         except: 
             print("no checkpoints has been saved, selecting the last model")
             best_model = model
@@ -502,6 +541,10 @@ def print_setup(config: Config):
     print("Is data preprocessed: ", config.experiment.is_data_preprocessed)
     print("Is wandb: ", config.experiment.is_wandb)
     print("Is sweep: ", config.experiment.is_sweep)
+    print("Use torch.compile: ", config.experiment.use_torch_compile)
+    print("torch.compile mode: ", config.experiment.torch_compile_mode)
+    print("torch.compile dynamic: ", config.experiment.torch_compile_dynamic)
+    print("torch.compile backend: ", config.experiment.torch_compile_backend)
     print(config.experiment.type)
     print("Is debug: ", config.experiment.is_debug) 
     if config.dataset.type == cst.DatasetType.LOBSTER:

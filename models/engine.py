@@ -32,6 +32,10 @@ class Engine(LightningModule):
         num_heads=8,
         is_sin_emb=True,
         len_test_dataloader=None,
+        use_torch_compile=False,
+        torch_compile_mode="default",
+        torch_compile_dynamic=False,
+        torch_compile_backend="inductor",
     ):
         super().__init__()
         self.seq_size = seq_size
@@ -49,7 +53,12 @@ class Engine(LightningModule):
         self.num_layers = num_layers
         self.num_features = num_features
         self.experiment_type = experiment_type
-        self.model = pick_model(model_type, hidden_dim, num_layers, seq_size, num_features, num_heads, is_sin_emb, dataset_type) 
+        self.use_torch_compile = use_torch_compile
+        self.torch_compile_mode = torch_compile_mode
+        self.torch_compile_dynamic = torch_compile_dynamic
+        self.torch_compile_backend = torch_compile_backend
+        self.model = pick_model(model_type, hidden_dim, num_layers, seq_size, num_features, num_heads, is_sin_emb, dataset_type)
+        self._compile_model()
         self.ema = ExponentialMovingAverage(self.parameters(), decay=0.999)
         self.ema.to(cst.DEVICE)
         self.loss_function = nn.CrossEntropyLoss()
@@ -67,6 +76,26 @@ class Engine(LightningModule):
         self.last_path_ckpt = None
         self.first_test = True
         self.test_mid_prices = []
+
+    def _compile_model(self):
+        if not self.use_torch_compile:
+            return
+        if self.model_type not in {"TLOB", "MLPLOB"}:
+            return
+        try:
+            self.model = torch.compile(
+                self.model,
+                mode=self.torch_compile_mode,
+                dynamic=self.torch_compile_dynamic,
+                backend=self.torch_compile_backend,
+            )
+            print(
+                "torch.compile enabled for",
+                self.model_type,
+                f"(backend={self.torch_compile_backend}, mode={self.torch_compile_mode}, dynamic={self.torch_compile_dynamic})",
+            )
+        except Exception as compile_error:
+            print(f"torch.compile failed, continuing without compilation: {compile_error}")
         
     def forward(self, x, batch_idx=None):
         output = self.model(x)
@@ -240,8 +269,9 @@ class Engine(LightningModule):
             
             # Export to ONNX
             try:
+                export_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
                 torch.onnx.export(
-                    self.model,                  # model being run
+                    export_model,                # model being run
                     dummy_input,                 # model input (or a tuple for multiple inputs)
                     onnx_path,                   # where to save the model
                     dynamo=False,                # use legacy TorchScript-based exporter (as this is what the old TLOB with PyTorch 2.5 uses)

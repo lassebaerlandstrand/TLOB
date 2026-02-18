@@ -93,6 +93,10 @@ class Experiment:
     max_epochs: int = 10
     dir_ckpt: str = "model.ckpt"
     optimizer: str = "Adam"
+    use_torch_compile: bool = True
+    torch_compile_mode: str = "reduce-overhead"
+    torch_compile_dynamic: bool = False
+    torch_compile_backend: str = "inductor"
     
 defaults = [Model, Experiment, Dataset]
 

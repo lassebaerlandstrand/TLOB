@@ -34,10 +34,10 @@ class TransformerLayer(nn.Module):
         self.mlp = MLP(hidden_dim, hidden_dim*4, final_dim)
         self.w0 = nn.Linear(hidden_dim*num_heads, hidden_dim)
         
-    def forward(self, x):
+    def forward(self, x, need_weights=False):
         res = x
         q, k, v = self.qkv(x)
-        x, att = self.attention(q, k, v, average_attn_weights=False, need_weights=True)
+        x, att = self.attention(q, k, v, average_attn_weights=False, need_weights=need_weights)
         x = self.w0(x)
         x = x + res
         x = self.norm(x)
@@ -109,8 +109,9 @@ class TLOB(nn.Module):
         x = self.emb_layer(x)
         x = x[:] + self.pos_encoder
         for i in range(len(self.layers)):
-            x, att = self.layers[i](x)
-            att = att.detach()
+            x, att = self.layers[i](x, need_weights=store_att)
+            if store_att and att is not None:
+                att = att.detach()
             x = x.permute(0, 2, 1)
         x = rearrange(x, 'b s f -> b (f s) 1')              
         x = x.reshape(x.shape[0], -1)

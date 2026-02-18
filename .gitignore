@@ -282,3 +282,6 @@ data/checkpoints/**/*.svg
 *.err
 *.tmp
 *.bak
+
+# Agent files
+AGENTS.md

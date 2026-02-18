@@ -2,7 +2,7 @@ from typing import List
 from hydra.core.config_store import ConfigStore
 from dataclasses import dataclass, field
 from constants import DatasetType, ModelType, SamplingType
-from omegaconf import MISSING, OmegaConf
+from omegaconf import MISSING
 
 
 @dataclass

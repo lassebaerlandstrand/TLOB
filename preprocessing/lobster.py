@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import torch
 import constants as cst
-from torch.utils import data
 
 
 def lobster_load(path, all_features, len_smooth, h, seq_size):

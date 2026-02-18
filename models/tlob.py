@@ -5,8 +5,6 @@ import constants as cst
 from models.bin import BiN
 from models.mlplob import MLP
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 
 class ComputeQKV(nn.Module):

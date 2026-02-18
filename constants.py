@@ -1,6 +1,5 @@
 import torch
 from enum import Enum
-from preprocessing.dataset import Dataset  
 
 class DatasetType(Enum):
     LOBSTER = "LOBSTER"

@@ -1,5 +1,5 @@
 import os
-from utils.utils_data import z_score_orderbook, labeling, reset_indexes
+from utils.utils_data import z_score_orderbook, labeling
 import pandas as pd
 import numpy as np
 import torch

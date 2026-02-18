@@ -4,9 +4,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 import numpy as np
 import constants as cst
-import time
 from torch.utils import data
-from utils.utils_data import one_hot_encoding_type, tanh_encoding_type
 
 class Dataset(data.Dataset):
     """Characterizes a dataset for PyTorch"""

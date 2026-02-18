@@ -2,7 +2,6 @@ import os
 import random
 import warnings
 
-import urllib
 import zipfile
 warnings.filterwarnings("ignore")
 import numpy as np

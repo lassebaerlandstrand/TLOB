@@ -1,7 +1,6 @@
 import lightning as L
 import omegaconf
 import torch
-import glob
 import os
 from lightning.pytorch.loggers import WandbLogger
 import wandb
@@ -16,7 +15,7 @@ from preprocessing.btc import btc_load
 from preprocessing.battery import battery_load
 from preprocessing.dataset import Dataset, DataModule
 import constants as cst
-from constants import DatasetType, SamplingType
+from constants import SamplingType
 torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
 
 

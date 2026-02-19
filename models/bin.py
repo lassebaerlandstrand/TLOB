@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-import constants as cst
 
 class BiN(nn.Module):
     def __init__(self, d1, t1):
@@ -33,27 +32,18 @@ class BiN(nn.Module):
         nn.init.constant_(self.y2, 0.5)
 
     def forward(self, x):
-
-        # if the two scalars are negative then we setting them to 0
-        if (self.y1[0] < 0):
-            y1 = torch.cuda.FloatTensor(1, )
-            self.y1 = nn.Parameter(y1)
-            nn.init.constant_(self.y1, 0.01)
-
-        if (self.y2[0] < 0):
-            y2 = torch.cuda.FloatTensor(1, )
-            self.y2 = nn.Parameter(y2)
-            nn.init.constant_(self.y2, 0.01)
+        y1 = torch.clamp(self.y1, min=0.01)
+        y2 = torch.clamp(self.y2, min=0.01)
 
         # normalization along the temporal dimensione
-        T2 = torch.ones([self.t1, 1], device=cst.DEVICE)
+        T2 = torch.ones([self.t1, 1], device=x.device)
         x2 = torch.mean(x, dim=2)
         x2 = torch.reshape(x2, (x2.shape[0], x2.shape[1], 1))
         
         std = torch.std(x, dim=2)
         std = torch.reshape(std, (std.shape[0], std.shape[1], 1))
         # it can be possible that the std of some temporal slices is 0, and this produces inf values, so we have to set them to one
-        std[std < 1e-4] = 1
+        std = torch.clamp(std, min=1e-4)
         diff = x - (x2 @ (T2.T))
         Z2 = diff / (std @ (T2.T))
 
@@ -62,7 +52,7 @@ class BiN(nn.Module):
         X2 = X2 + (self.B2 @ T2.T)
 
         # normalization along the feature dimension
-        T1 = torch.ones([self.d1, 1], device=cst.DEVICE)
+        T1 = torch.ones([self.d1, 1], device=x.device)
         x1 = torch.mean(x, dim=1)
         x1 = torch.reshape(x1, (x1.shape[0], x1.shape[1], 1))
 
@@ -81,6 +71,6 @@ class BiN(nn.Module):
         X1 = X1 + (T1 @ self.B1.T)
 
         # weighing the imporance of temporal and feature normalization
-        x = self.y1 * X1 + self.y2 * X2
+        x = y1 * X1 + y2 * X2
 
         return x

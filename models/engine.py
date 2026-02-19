@@ -1,6 +1,8 @@
 from lightning import LightningModule
+import logging
 import numpy as np
 import time
+import warnings
 from sklearn.metrics import classification_report, precision_recall_curve
 from torch import nn
 import os
@@ -326,21 +328,41 @@ class Engine(LightningModule):
                 if hasattr(export_model, "set_fast_attention"):
                     previous_fast_attention_state = export_model.use_fast_attention
                     export_model.set_fast_attention(False)
-                torch.onnx.export(
-                    export_model,                # model being run
-                    dummy_input,                 # model input (or a tuple for multiple inputs)
-                    onnx_path,                   # where to save the model
-                    dynamo=False,                # use legacy TorchScript-based exporter (as this is what the old TLOB with PyTorch 2.5 uses)
-                    export_params=True,          # store the trained parameter weights inside the model file
-                    opset_version=18,            # the ONNX version to export the model to
-                    do_constant_folding=True,    # whether to execute constant folding for optimization
-                    input_names=['input'],       # the model's input names
-                    output_names=['output'],     # the model's output names
-                    dynamic_axes={               # variable length axes
-                        'input': {0: 'batch_size'},
-                        'output': {0: 'batch_size'}
-                    }
-                )
+                export_error = None
+                schema_logger = logging.getLogger("torch.onnx._internal.exporter._schemas")
+                previous_schema_logger_level = schema_logger.level
+                schema_logger.setLevel(logging.ERROR)
+                for use_dynamo_exporter in (True, False):
+                    try:
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings(
+                                "ignore",
+                                message=r"Missing annotation for parameter '.*'.*Treating as an Input\\.",
+                                category=UserWarning,
+                                module=r"torch\\.onnx\\._internal\\.exporter\\._schemas",
+                            )
+                            torch.onnx.export(
+                                export_model,                # model being run
+                                dummy_input,                 # model input (or a tuple for multiple inputs)
+                                onnx_path,                   # where to save the model
+                                dynamo=use_dynamo_exporter,  # prefer new exporter for broader op support, fallback to legacy
+                                export_params=True,          # store the trained parameter weights inside the model file
+                                opset_version=18,            # the ONNX version to export the model to
+                                do_constant_folding=True,    # whether to execute constant folding for optimization
+                                input_names=['input'],       # the model's input names
+                                output_names=['output'],     # the model's output names
+                                dynamic_axes={               # variable length axes
+                                    'input': {0: 'batch_size'},
+                                    'output': {0: 'batch_size'}
+                                }
+                            )
+                        export_error = None
+                        break
+                    except Exception as current_error:
+                        export_error = current_error
+                schema_logger.setLevel(previous_schema_logger_level)
+                if export_error is not None:
+                    raise export_error
             except Exception as e:
                 print(f"Failed to export ONNX model: {e}")
             finally:

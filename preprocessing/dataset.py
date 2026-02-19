@@ -75,7 +75,8 @@ class DataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             drop_last=False,
             num_workers=self.num_workers,
-            persistent_workers=True
+            persistent_workers=True,
+            multiprocessing_context='spawn' if self.num_workers > 0 else None,
         )
 
         

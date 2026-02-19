@@ -174,7 +174,8 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 pin_memory=True,
                 drop_last=False,
                 num_workers=4,
-                persistent_workers=True
+                persistent_workers=True,
+                multiprocessing_context='spawn',
             )
             test_loaders.append(test_dataloader)
         

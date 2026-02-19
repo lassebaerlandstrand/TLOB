@@ -265,15 +265,14 @@ class Engine(LightningModule):
             return
         avg_samples_per_sec = float(np.mean(self.epoch_samples_per_sec))
         avg_it_per_sec = float(np.mean(self.epoch_it_per_sec))
-        self.log("avg_samples_per_sec", avg_samples_per_sec, logger=True)
-        self.log("avg_it_per_sec", avg_it_per_sec, logger=True)
+        metrics = {
+            "avg_samples_per_sec": avg_samples_per_sec,
+            "avg_it_per_sec": avg_it_per_sec,
+        }
+        if self.logger is not None:
+            self.logger.log_metrics(metrics, step=self.global_step)
         if self.is_wandb and wandb.run is not None:
-            wandb.log(
-                {
-                    "avg_samples_per_sec": avg_samples_per_sec,
-                    "avg_it_per_sec": avg_it_per_sec,
-                }
-            )
+            wandb.log(metrics)
         
     def configure_optimizers(self):
         if self.model_type == "DEEPLOB":

@@ -1,5 +1,6 @@
 from torch import nn
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 import constants as cst
 from models.bin import BiN
@@ -24,20 +25,44 @@ class ComputeQKV(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, final_dim: int):
+    def __init__(self, hidden_dim: int, num_heads: int, final_dim: int, use_fast_attention: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.use_fast_attention = use_fast_attention
         self.norm = nn.LayerNorm(hidden_dim)
         self.qkv = ComputeQKV(hidden_dim, num_heads)
         self.attention = nn.MultiheadAttention(hidden_dim*num_heads, num_heads, batch_first=True, device=cst.DEVICE)
         self.mlp = MLP(hidden_dim, hidden_dim*4, final_dim)
         self.w0 = nn.Linear(hidden_dim*num_heads, hidden_dim)
+
+    def set_fast_attention(self, use_fast_attention: bool):
+        self.use_fast_attention = use_fast_attention
+
+    def _fast_attention(self, q, k, v):
+        bsz, seq_len, embed_dim = q.shape
+        head_dim = embed_dim // self.num_heads
+        q = q.reshape(bsz, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        k = k.reshape(bsz, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        v = v.reshape(bsz, seq_len, self.num_heads, head_dim).transpose(1, 2)
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        x = x.transpose(1, 2).contiguous().reshape(bsz, seq_len, embed_dim)
+        return x
         
     def forward(self, x, need_weights=False):
         res = x
         q, k, v = self.qkv(x)
-        x, att = self.attention(q, k, v, average_attn_weights=False, need_weights=need_weights)
+        use_fast_path = (
+            self.use_fast_attention
+            and not need_weights
+            and x.is_cuda
+            and not torch.onnx.is_in_onnx_export()
+        )
+        if use_fast_path:
+            x = self._fast_attention(q, k, v)
+            att = None
+        else:
+            x, att = self.attention(q, k, v, average_attn_weights=False, need_weights=need_weights)
         x = self.w0(x)
         x = x + res
         x = self.norm(x)
@@ -55,7 +80,8 @@ class TLOB(nn.Module):
                  num_features: int,
                  num_heads: int,
                  is_sin_emb: bool,
-                 dataset_type: str
+                 dataset_type: str,
+                 use_fast_attention: bool = True
                  ) -> None:
         super().__init__()
         
@@ -65,6 +91,7 @@ class TLOB(nn.Module):
         self.seq_size = seq_size
         self.num_heads = num_heads
         self.dataset_type = dataset_type
+        self.use_fast_attention = use_fast_attention
         self.layers = nn.ModuleList()
         self.first_branch = nn.ModuleList()
         self.second_branch = nn.ModuleList()
@@ -78,11 +105,11 @@ class TLOB(nn.Module):
         
         for i in range(num_layers):
             if i != num_layers-1:
-                self.layers.append(TransformerLayer(hidden_dim, num_heads, hidden_dim))
-                self.layers.append(TransformerLayer(seq_size, num_heads, seq_size))
+                self.layers.append(TransformerLayer(hidden_dim, num_heads, hidden_dim, use_fast_attention=use_fast_attention))
+                self.layers.append(TransformerLayer(seq_size, num_heads, seq_size, use_fast_attention=use_fast_attention))
             else:
-                self.layers.append(TransformerLayer(hidden_dim, num_heads, hidden_dim//4))
-                self.layers.append(TransformerLayer(seq_size, num_heads, seq_size//4))
+                self.layers.append(TransformerLayer(hidden_dim, num_heads, hidden_dim//4, use_fast_attention=use_fast_attention))
+                self.layers.append(TransformerLayer(seq_size, num_heads, seq_size//4, use_fast_attention=use_fast_attention))
         self.att_temporal = []
         self.att_feature = []
         self.mean_att_distance_temporal = []
@@ -93,6 +120,12 @@ class TLOB(nn.Module):
             self.final_layers.append(nn.GELU())
             total_dim = total_dim//4
         self.final_layers.append(nn.Linear(total_dim, 3))
+
+    def set_fast_attention(self, use_fast_attention: bool):
+        self.use_fast_attention = use_fast_attention
+        for layer in self.layers:
+            if isinstance(layer, TransformerLayer):
+                layer.set_fast_attention(use_fast_attention)
         
     
     def forward(self, input, store_att=False):

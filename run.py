@@ -31,7 +31,7 @@ def run(config: Config, accelerator):
 
     trainer = L.Trainer(
         accelerator=accelerator,
-        precision=cst.PRECISION,
+        precision=config.experiment.precision,
         max_epochs=config.experiment.max_epochs,
         callbacks=[
             EarlyStopping(monitor="val_loss", mode="min", patience=1, verbose=True, min_delta=0.002),
@@ -242,6 +242,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
                 )
         elif model_type == "TLOB":
             model = Engine.load_from_checkpoint(
@@ -267,6 +268,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
                 )
         elif model_type == "BINCTABL":
             model = Engine.load_from_checkpoint(
@@ -288,6 +290,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
                 )
         elif model_type == "DEEPLOB":
             model = Engine.load_from_checkpoint(
@@ -309,6 +312,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
                 )
               
     else:
@@ -332,6 +336,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
             )
         elif model_type == cst.ModelType.TLOB:
             model = Engine(
@@ -355,6 +360,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
             )
         elif model_type == cst.ModelType.BINCTABL:
             model = Engine(
@@ -374,6 +380,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
             )
         elif model_type == cst.ModelType.DEEPLOB:
             model = Engine(
@@ -393,6 +400,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
             )
     
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))   
@@ -410,6 +418,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
             )
         except: 
             print("no checkpoints has been saved, selecting the last model")
@@ -475,7 +484,7 @@ def run_wandb(config: Config, accelerator):
             
         trainer = L.Trainer(
             accelerator=accelerator,
-            precision=cst.PRECISION,
+            precision=config.experiment.precision,
             max_epochs=config.experiment.max_epochs,
             callbacks=[
             EarlyStopping(monitor="val_loss", mode="min", patience=1, verbose=True, min_delta=0.002),
@@ -545,6 +554,8 @@ def print_setup(config: Config):
     print("torch.compile mode: ", config.experiment.torch_compile_mode)
     print("torch.compile dynamic: ", config.experiment.torch_compile_dynamic)
     print("torch.compile backend: ", config.experiment.torch_compile_backend)
+    print("Precision: ", config.experiment.precision)
+    print("Use fast attention: ", config.experiment.use_fast_attention)
     print(config.experiment.type)
     print("Is debug: ", config.experiment.is_debug) 
     if config.dataset.type == cst.DatasetType.LOBSTER:

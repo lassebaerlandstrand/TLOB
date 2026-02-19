@@ -37,6 +37,7 @@ class Engine(LightningModule):
         torch_compile_mode="default",
         torch_compile_dynamic=False,
         torch_compile_backend="inductor",
+        use_fast_attention=True,
     ):
         super().__init__()
         self.seq_size = seq_size
@@ -58,7 +59,18 @@ class Engine(LightningModule):
         self.torch_compile_mode = torch_compile_mode
         self.torch_compile_dynamic = torch_compile_dynamic
         self.torch_compile_backend = torch_compile_backend
-        self.model = pick_model(model_type, hidden_dim, num_layers, seq_size, num_features, num_heads, is_sin_emb, dataset_type)
+        self.use_fast_attention = use_fast_attention
+        self.model = pick_model(
+            model_type,
+            hidden_dim,
+            num_layers,
+            seq_size,
+            num_features,
+            num_heads,
+            is_sin_emb,
+            dataset_type,
+            use_fast_attention=use_fast_attention,
+        )
         self._compile_model()
         self.ema = ExponentialMovingAverage(self.parameters(), decay=0.999)
         self.ema.to(cst.DEVICE)
@@ -306,8 +318,12 @@ class Engine(LightningModule):
             dummy_input = torch.randn(1, self.seq_size, self.num_features, device=self.device)
             
             # Export to ONNX
+            export_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+            previous_fast_attention_state = None
             try:
-                export_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+                if hasattr(export_model, "set_fast_attention"):
+                    previous_fast_attention_state = export_model.use_fast_attention
+                    export_model.set_fast_attention(False)
                 torch.onnx.export(
                     export_model,                # model being run
                     dummy_input,                 # model input (or a tuple for multiple inputs)
@@ -325,6 +341,12 @@ class Engine(LightningModule):
                 )
             except Exception as e:
                 print(f"Failed to export ONNX model: {e}")
+            finally:
+                if (
+                    hasattr(export_model, "set_fast_attention")
+                    and previous_fast_attention_state is not None
+                ):
+                    export_model.set_fast_attention(previous_fast_attention_state)
         
         self.last_path_ckpt = path_ckpt  
         

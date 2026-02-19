@@ -97,6 +97,8 @@ class Experiment:
     torch_compile_mode: str = "reduce-overhead"
     torch_compile_dynamic: bool = False
     torch_compile_backend: str = "inductor"
+    precision: str = "32-true"
+    use_fast_attention: bool = True
     
 defaults = [Model, Experiment, Dataset]
 

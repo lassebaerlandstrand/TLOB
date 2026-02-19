@@ -4,11 +4,30 @@ from models.binctabl import BiN_CTABL
 from models.deeplob import DeepLOB
 
 
-def pick_model(model_type, hidden_dim, num_layers, seq_size, num_features, num_heads=8, is_sin_emb=False, dataset_type=None):
+def pick_model(
+    model_type,
+    hidden_dim,
+    num_layers,
+    seq_size,
+    num_features,
+    num_heads=8,
+    is_sin_emb=False,
+    dataset_type=None,
+    use_fast_attention=True,
+):
     if model_type == "MLPLOB":
         return MLPLOB(hidden_dim, num_layers, seq_size, num_features, dataset_type)
     elif model_type == "TLOB":
-        return TLOB(hidden_dim, num_layers, seq_size, num_features, num_heads, is_sin_emb, dataset_type)
+        return TLOB(
+            hidden_dim,
+            num_layers,
+            seq_size,
+            num_features,
+            num_heads,
+            is_sin_emb,
+            dataset_type,
+            use_fast_attention=use_fast_attention,
+        )
     elif model_type == "BINCTABL":
         return BiN_CTABL(60, num_features, seq_size, seq_size, 120, 5, 3, 1)
     elif model_type == "DEEPLOB":

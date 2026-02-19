@@ -65,7 +65,7 @@ class MLP(nn.Module):
                  ) -> None:
         super().__init__()
         
-        self.layer_norm = nn.LayerNorm(final_dim)
+        self.layer_norm = nn.RMSNorm(final_dim)
         self.fc = nn.Linear(start_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, final_dim)
         self.gelu = nn.GELU()

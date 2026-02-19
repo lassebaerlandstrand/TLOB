@@ -30,7 +30,7 @@ class TransformerLayer(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.use_fast_attention = use_fast_attention
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm = nn.RMSNorm(hidden_dim)
         self.qkv = ComputeQKV(hidden_dim, num_heads)
         self.attention = nn.MultiheadAttention(hidden_dim*num_heads, num_heads, batch_first=True, device=cst.DEVICE)
         self.mlp = MLP(hidden_dim, hidden_dim*4, final_dim)

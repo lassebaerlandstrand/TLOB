@@ -1,4 +1,6 @@
 from lightning import LightningModule
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import logging
 import numpy as np
 import time
@@ -328,41 +330,30 @@ class Engine(LightningModule):
                 if hasattr(export_model, "set_fast_attention"):
                     previous_fast_attention_state = export_model.use_fast_attention
                     export_model.set_fast_attention(False)
-                export_error = None
-                schema_logger = logging.getLogger("torch.onnx._internal.exporter._schemas")
-                previous_schema_logger_level = schema_logger.level
-                schema_logger.setLevel(logging.ERROR)
-                for use_dynamo_exporter in (True, False):
-                    try:
-                        with warnings.catch_warnings():
-                            warnings.filterwarnings(
-                                "ignore",
-                                message=r"Missing annotation for parameter '.*'.*Treating as an Input\\.",
-                                category=UserWarning,
-                                module=r"torch\\.onnx\\._internal\\.exporter\\._schemas",
-                            )
-                            torch.onnx.export(
-                                export_model,                # model being run
-                                dummy_input,                 # model input (or a tuple for multiple inputs)
-                                onnx_path,                   # where to save the model
-                                dynamo=use_dynamo_exporter,  # prefer new exporter for broader op support, fallback to legacy
-                                export_params=True,          # store the trained parameter weights inside the model file
-                                opset_version=18,            # the ONNX version to export the model to
-                                do_constant_folding=True,    # whether to execute constant folding for optimization
-                                input_names=['input'],       # the model's input names
-                                output_names=['output'],     # the model's output names
-                                dynamic_axes={               # variable length axes
-                                    'input': {0: 'batch_size'},
-                                    'output': {0: 'batch_size'}
-                                }
-                            )
-                        export_error = None
-                        break
-                    except Exception as current_error:
-                        export_error = current_error
-                schema_logger.setLevel(previous_schema_logger_level)
-                if export_error is not None:
-                    raise export_error
+                onnx_logger = logging.getLogger("torch.onnx")
+                onnx_schemas_logger = logging.getLogger("torch.onnx._internal.exporter._schemas")
+                previous_onnx_logger_level = onnx_logger.level
+                previous_onnx_schemas_logger_level = onnx_schemas_logger.level
+                onnx_logger.setLevel(logging.ERROR)
+                onnx_schemas_logger.setLevel(logging.ERROR)
+                try:
+                    with warnings.catch_warnings(), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                        warnings.simplefilter("ignore")
+                        torch.onnx.export(
+                            export_model,
+                            dummy_input,
+                            onnx_path,
+                            dynamo=True,
+                            export_params=True,
+                            opset_version=25,
+                            do_constant_folding=True,
+                            input_names=['input'],
+                            output_names=['output'],
+                            dynamic_shapes={'input': {0: torch.export.Dim('batch_size')}},
+                        )
+                finally:
+                    onnx_logger.setLevel(previous_onnx_logger_level)
+                    onnx_schemas_logger.setLevel(previous_onnx_schemas_logger_level)
             except Exception as e:
                 print(f"Failed to export ONNX model: {e}")
             finally:

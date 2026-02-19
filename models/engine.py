@@ -92,8 +92,9 @@ class Engine(LightningModule):
         self.train_epoch_start_time = None
         self.epoch_sample_count = 0
         self.epoch_iteration_count = 0
-        self.epoch_samples_per_sec = []
-        self.epoch_it_per_sec = []
+        self.total_train_time_s = 0.0
+        self.total_train_samples = 0
+        self.total_train_steps = 0
 
     def _compile_model(self):
         if not self.use_torch_compile:
@@ -147,8 +148,9 @@ class Engine(LightningModule):
         epoch_duration = max(time.perf_counter() - self.train_epoch_start_time, 1e-12)
         samples_per_sec = self.epoch_sample_count / epoch_duration
         it_per_sec = self.epoch_iteration_count / epoch_duration
-        self.epoch_samples_per_sec.append(samples_per_sec)
-        self.epoch_it_per_sec.append(it_per_sec)
+        self.total_train_time_s += epoch_duration
+        self.total_train_samples += self.epoch_sample_count
+        self.total_train_steps += self.epoch_iteration_count
         print(
             f"Epoch {self.current_epoch} throughput - samples/s: {samples_per_sec:.2f}, it/s: {it_per_sec:.2f}"
         )
@@ -261,13 +263,14 @@ class Engine(LightningModule):
         self.plot_pr_curves(recall, precision, self.is_wandb) 
 
     def on_fit_end(self) -> None:
-        if not self.epoch_samples_per_sec or not self.epoch_it_per_sec:
+        if self.total_train_time_s <= 0:
             return
-        avg_samples_per_sec = float(np.mean(self.epoch_samples_per_sec))
-        avg_it_per_sec = float(np.mean(self.epoch_it_per_sec))
+        throughput_samples_per_s = self.total_train_samples / self.total_train_time_s
+        throughput_steps_per_s = self.total_train_steps / self.total_train_time_s
         metrics = {
-            "avg_samples_per_sec": avg_samples_per_sec,
-            "avg_it_per_sec": avg_it_per_sec,
+            "train/throughput_samples_per_s": float(throughput_samples_per_s),
+            "train/throughput_steps_per_s": float(throughput_steps_per_s),
+            "fit/total_train_time_s": float(self.total_train_time_s),
         }
         if self.logger is not None:
             self.logger.log_metrics(metrics, step=self.global_step)

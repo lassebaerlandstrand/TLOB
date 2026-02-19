@@ -42,6 +42,7 @@ class Engine(LightningModule):
         torch_compile_dynamic=False,
         torch_compile_backend="inductor",
         use_fast_attention=True,
+        weight_decay: float = 0.0,
     ):
         super().__init__()
         self.seq_size = seq_size
@@ -54,6 +55,7 @@ class Engine(LightningModule):
         self.len_test_dataloader = len_test_dataloader
         self.lr = lr
         self.optimizer = optimizer
+        self.weight_decay = weight_decay
         self.dir_ckpt = dir_ckpt
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -288,6 +290,8 @@ class Engine(LightningModule):
             eps = 1e-8
         if self.optimizer == 'Adam':
             self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, eps=eps)
+        elif self.optimizer == 'AdamW':
+            self.optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, eps=eps, weight_decay=self.weight_decay)
         elif self.optimizer == 'SGD':
             self.optimizer = torch.optim.SGD(self.parameters(), lr=self.lr, momentum=0.9)
         elif self.optimizer == 'Lion':

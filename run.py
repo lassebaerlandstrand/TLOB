@@ -337,6 +337,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
+                weight_decay=config.model.hyperparameters_fixed["weight_decay"],
             )
         elif model_type == cst.ModelType.TLOB:
             model = Engine(
@@ -361,6 +362,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
+                weight_decay=config.model.hyperparameters_fixed["weight_decay"],
             )
         elif model_type == cst.ModelType.BINCTABL:
             model = Engine(

@@ -101,8 +101,12 @@ def hydra_app(config: Config):
 
 def set_reproducibility(seed):
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def set_torch():
     torch.set_default_dtype(torch.float32)

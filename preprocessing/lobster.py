@@ -34,6 +34,34 @@ def lobster_load(path, all_features, len_smooth, h, seq_size):
     return input, labels
 
 
+def lobster_load_multi(path, all_features, len_smooth, seq_size):
+    """Load LOBSTER data returning all 4 horizon labels stacked.
+
+    .npy last 5 cols: -5=h10, -4=h20, -3=h50, -2=h100, -1=h200.
+    We use [-5, -4, -3, -2] -> [h10, h20, h50, h100].
+
+    Returns:
+        input:  FloatTensor (N, num_features)
+        labels: LongTensor  (N_valid, 4)
+    """
+    set = np.load(path)
+    label_start = seq_size - len_smooth
+    all_labels = np.stack([set[label_start:, c] for c in [-5, -4, -3, -2]], axis=1)  # h10,h20,h50,h100
+    finite_mask = np.all(np.isfinite(all_labels), axis=1)
+    all_labels = all_labels[finite_mask].astype(np.int64)
+    labels = torch.from_numpy(all_labels).long()
+    if all_features:
+        input = set[:, cst.LEN_ORDER:cst.LEN_ORDER + 40]
+        orders = set[:, :cst.LEN_ORDER]
+        input = torch.from_numpy(input).float()
+        orders = torch.from_numpy(orders).float()
+        input = torch.cat((input, orders), dim=1)
+    else:
+        input = set[:, cst.LEN_ORDER:cst.LEN_ORDER + 40]
+        input = torch.from_numpy(input).float()
+    return input, labels
+
+
 class LOBSTERDataBuilder:
     def __init__(
         self,

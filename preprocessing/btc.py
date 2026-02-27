@@ -25,6 +25,24 @@ def btc_load(path, len_smooth, h, seq_size):
     return input, labels
 
 
+def btc_load_multi(path, len_smooth, seq_size):
+    """Load BTC data returning all 4 horizon labels stacked.
+
+    .npy last 4 cols: -4=h10, -3=h20, -2=h50, -1=h100.
+    Returns:
+        input:  FloatTensor (N, num_features)
+        labels: LongTensor  (N_valid, 4)
+    """
+    set = np.load(path)
+    label_start = seq_size - len_smooth
+    all_labels = np.stack([set[label_start:, c] for c in [-4, -3, -2, -1]], axis=1)  # (N_valid, 4)
+    finite_mask = np.all(np.isfinite(all_labels), axis=1)
+    all_labels = all_labels[finite_mask].astype(np.int64)
+    labels = torch.from_numpy(all_labels).long()
+    input = torch.from_numpy(set[:, :cst.N_LOB_LEVELS*4]).float()
+    return input, labels
+
+
 class BTCDataBuilder:
     def __init__(
         self,

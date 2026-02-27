@@ -14,9 +14,10 @@ def pick_model(
     is_sin_emb=False,
     dataset_type=None,
     use_fast_attention=True,
+    num_horizons=1,
 ):
     if model_type == "MLPLOB":
-        return MLPLOB(hidden_dim, num_layers, seq_size, num_features, dataset_type)
+        return MLPLOB(hidden_dim, num_layers, seq_size, num_features, dataset_type, num_horizons=num_horizons)
     elif model_type == "TLOB":
         return TLOB(
             hidden_dim,
@@ -27,6 +28,7 @@ def pick_model(
             is_sin_emb,
             dataset_type,
             use_fast_attention=use_fast_attention,
+            num_horizons=num_horizons,
         )
     elif model_type == "BINCTABL":
         return BiN_CTABL(60, num_features, seq_size, seq_size, 120, 5, 3, 1)

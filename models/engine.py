@@ -17,6 +17,9 @@ from utils.utils_model import pick_model
 import constants as cst
 from scipy.stats import mode
 
+# Horizons in canonical order (h10, h20, h50, h100)
+HORIZONS = [10, 20, 50, 100]
+
 
 class Engine(LightningModule):
     def __init__(
@@ -43,6 +46,7 @@ class Engine(LightningModule):
         torch_compile_backend="inductor",
         use_fast_attention=True,
         weight_decay: float = 0.0,
+        multi_horizon: bool = False,
     ):
         super().__init__()
         self.seq_size = seq_size
@@ -66,6 +70,9 @@ class Engine(LightningModule):
         self.torch_compile_dynamic = torch_compile_dynamic
         self.torch_compile_backend = torch_compile_backend
         self.use_fast_attention = use_fast_attention
+        self.multi_horizon = multi_horizon
+
+        num_horizons = len(HORIZONS) if multi_horizon else 1
         self.model = pick_model(
             model_type,
             hidden_dim,
@@ -76,11 +83,20 @@ class Engine(LightningModule):
             is_sin_emb,
             dataset_type,
             use_fast_attention=use_fast_attention,
+            num_horizons=num_horizons,
         )
         self._compile_model()
         self.ema = ExponentialMovingAverage(self.parameters(), decay=0.999)
         self.ema.to(cst.DEVICE)
         self.loss_function = nn.CrossEntropyLoss()
+
+        # Learnable log-variance parameters for homoscedastic uncertainty weighting.
+        # One scalar per horizon; initialised to 0 (σ_h = 1, equal initial weights).
+        # Stored in Engine (not the backbone) so ONNX export is unaffected. 
+        # Unsure if this makes it so ONNX can be used
+        if multi_horizon:
+            self.log_vars = nn.Parameter(torch.zeros(len(HORIZONS)))
+
         self.train_losses = []
         self.val_losses = []
         self.test_losses = []
@@ -102,6 +118,16 @@ class Engine(LightningModule):
         self.total_train_samples = 0
         self.total_train_steps = 0
 
+        # Multi-horizon per-horizon accumulators
+        if multi_horizon:
+            self.train_losses_per_h = [[] for _ in HORIZONS]
+            self.test_targets_per_h = [[] for _ in HORIZONS]
+            self.test_predictions_per_h = [[] for _ in HORIZONS]
+            self.test_losses_per_h = [[] for _ in HORIZONS]
+
+    # ------------------------------------------------------------------
+    # Compile
+    # ------------------------------------------------------------------
     def _compile_model(self):
         if not self.use_torch_compile:
             return
@@ -121,27 +147,65 @@ class Engine(LightningModule):
             )
         except Exception as compile_error:
             print(f"torch.compile failed, continuing without compilation: {compile_error}")
-        
+
+    # ------------------------------------------------------------------
+    # Forward / Loss
+    # ------------------------------------------------------------------
     def forward(self, x, batch_idx=None):
-        output = self.model(x)
-        return output
-    
+        return self.model(x)
+
     def loss(self, y_hat, y):
         return self.loss_function(y_hat, y)
-        
+
+    def _multi_horizon_loss(self, y_hat_list, y_multi):
+        """Homoscedastic uncertainty-weighted multi-task loss (Kendall et al. 2018).
+
+        L = Σ_h [ CE(ŷ_h, y_h) / (2σ_h²) + log σ_h ]
+        where log σ_h² = self.log_vars[h] (log-variance parameterisation).
+
+        Vectorised: one F.cross_entropy call on (B*H, C) / (B*H) instead of H separate calls.
+        """
+        H = len(y_hat_list)
+        B = y_hat_list[0].shape[0]
+        C = y_hat_list[0].shape[1]
+        # Stack: (B, H, C) → reshape to (B*H, C); targets: (B, H) → (B*H,)
+        y_hat_stacked = torch.stack(y_hat_list, dim=1).reshape(B * H, C)
+        y_stacked = y_multi.reshape(B * H)
+        # Per-horizon mean CE via reduction='none' → (B*H,) → (H,)
+        ce_per_sample = torch.nn.functional.cross_entropy(
+            y_hat_stacked, y_stacked, reduction='none'
+        )  # (B*H,)
+        ce_per_h = ce_per_sample.reshape(B, H).mean(0)   # (H,)
+        # Uncertainty weighting (vectorised)
+        sigma2 = torch.exp(self.log_vars)  # (H,)
+        total_loss = (ce_per_h / (2.0 * sigma2) + 0.5 * self.log_vars).sum()
+        return total_loss, ce_per_h.detach()   # scalar, (H,) tensor
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
         x, y = batch
-        y_hat = self.forward(x)
-        batch_loss = self.loss(y_hat, y)
-        batch_loss_mean = torch.mean(batch_loss)
-        self.train_losses.append(batch_loss_mean.item())
+        if self.multi_horizon:
+            y_hat_list = self.forward(x)
+            batch_loss, per_h_ce = self._multi_horizon_loss(y_hat_list, y)
+            # per_h_ce is an (H,) tensor — store each horizon's CE as a scalar tensor
+            for i, ce_val in enumerate(per_h_ce.unbind()):
+                self.train_losses_per_h[i].append(ce_val)
+        else:
+            y_hat = self.forward(x)
+            batch_loss = self.loss(y_hat, y)
+
+        batch_loss_mean = batch_loss if self.multi_horizon else torch.mean(batch_loss)
+        self.train_losses.append(batch_loss_mean.detach())
         self.epoch_iteration_count += 1
         self.epoch_sample_count += int(y.shape[0])
         self.ema.update()
         if batch_idx % 1000 == 0:
-            print(f'train loss: {sum(self.train_losses) / len(self.train_losses)}')
+            avg_loss = sum(self.train_losses) / len(self.train_losses)
+            print(f'train loss: {float(avg_loss)}')
         return batch_loss_mean
-    
+
     def on_train_epoch_start(self) -> None:
         self.train_epoch_start_time = time.perf_counter()
         self.epoch_sample_count = 0
@@ -160,73 +224,108 @@ class Engine(LightningModule):
         print(
             f"Epoch {self.current_epoch} throughput - samples/s: {samples_per_sec:.2f}, it/s: {it_per_sec:.2f}"
         )
-    
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        # Validation: with EMA
         with self.ema.average_parameters():
-            y_hat = self.forward(x)
-            batch_loss = self.loss(y_hat, y)
-            self.val_targets.append(y.cpu().numpy())
-            self.val_predictions.append(y_hat.argmax(dim=1).cpu().numpy())
-            batch_loss_mean = torch.mean(batch_loss)
-            self.val_losses.append(batch_loss_mean.item())
+            if self.multi_horizon:
+                y_hat_list = self.forward(x)
+                batch_loss, _ = self._multi_horizon_loss(y_hat_list, y)
+                # For validation metrics we only track the primary (h10) horizon
+                self.val_targets.append(y[:, 0])
+                self.val_predictions.append(y_hat_list[0].argmax(dim=1))
+                batch_loss_mean = batch_loss
+            else:
+                y_hat = self.forward(x)
+                batch_loss = self.loss(y_hat, y)
+                self.val_targets.append(y)
+                self.val_predictions.append(y_hat.argmax(dim=1))
+                batch_loss_mean = torch.mean(batch_loss)
+            self.val_losses.append(batch_loss_mean.detach())
         return batch_loss_mean
-        
-    
+
+    # ------------------------------------------------------------------
+    # Test
+    # ------------------------------------------------------------------
     def test_step(self, batch, batch_idx):
         x, y = batch
         mid_prices = ((x[:, 0, 0] + x[:, 0, 2]) // 2).cpu().numpy().flatten()
         self.test_mid_prices.append(mid_prices)
-        # Test: with EMA
-        if self.experiment_type == "TRAINING":
-            with self.ema.average_parameters():
+
+        if self.multi_horizon:
+            if self.experiment_type == "TRAINING":
+                with self.ema.average_parameters():
+                    y_hat_list = self.forward(x, batch_idx)
+                    batch_loss, per_h_ce = self._multi_horizon_loss(y_hat_list, y)
+            else:
+                y_hat_list = self.forward(x, batch_idx)
+                batch_loss, per_h_ce = self._multi_horizon_loss(y_hat_list, y)
+
+            for i, y_hat in enumerate(y_hat_list):
+                self.test_targets_per_h[i].append(y[:, i])
+                self.test_predictions_per_h[i].append(y_hat.argmax(dim=1))
+                self.test_losses_per_h[i].append(per_h_ce[i])
+
+            # Also fill the primary accumulators with h10 so existing report printing works
+            self.test_targets.append(y[:, 0])
+            self.test_predictions.append(y_hat_list[0].argmax(dim=1))
+            self.test_proba.append(torch.softmax(y_hat_list[0], dim=1)[:, 1])
+            batch_loss_mean = batch_loss
+        else:
+            if self.experiment_type == "TRAINING":
+                with self.ema.average_parameters():
+                    y_hat = self.forward(x, batch_idx)
+                    batch_loss = self.loss(y_hat, y)
+                    self.test_targets.append(y)
+                    self.test_predictions.append(y_hat.argmax(dim=1))
+                    self.test_proba.append(torch.softmax(y_hat, dim=1)[:, 1])
+                    batch_loss_mean = torch.mean(batch_loss)
+            else:
                 y_hat = self.forward(x, batch_idx)
                 batch_loss = self.loss(y_hat, y)
-                self.test_targets.append(y.cpu().numpy())
-                self.test_predictions.append(y_hat.argmax(dim=1).cpu().numpy())
-                self.test_proba.append(torch.softmax(y_hat, dim=1)[:, 1].cpu().numpy())
+                self.test_targets.append(y)
+                self.test_predictions.append(y_hat.argmax(dim=1))
+                self.test_proba.append(torch.softmax(y_hat, dim=1)[:, 1])
                 batch_loss_mean = torch.mean(batch_loss)
-                self.test_losses.append(batch_loss_mean.item())
-        else:
-            y_hat = self.forward(x, batch_idx)
-            batch_loss = self.loss(y_hat, y)
-            self.test_targets.append(y.cpu().numpy())
-            self.test_predictions.append(y_hat.argmax(dim=1).cpu().numpy())
-            self.test_proba.append(torch.softmax(y_hat, dim=1)[:, 1].cpu().numpy())
-            batch_loss_mean = torch.mean(batch_loss)
-            self.test_losses.append(batch_loss_mean.item())
+
+        self.test_losses.append(batch_loss_mean.item() if isinstance(batch_loss_mean, torch.Tensor) else float(batch_loss_mean))
         return batch_loss_mean
-    
+
+    # ------------------------------------------------------------------
+    # Epoch-end callbacks
+    # ------------------------------------------------------------------
     def on_validation_epoch_start(self) -> None:
         loss = sum(self.train_losses) / len(self.train_losses)
         self.train_losses = []
-        # Store train loss for combined plotting
         self.current_train_loss = loss
         print(f'Train loss on epoch {self.current_epoch}: {loss}')
-        
+
     def on_validation_epoch_end(self) -> None:
-        self.val_loss = sum(self.val_losses) / len(self.val_losses)
+        self.val_loss = float(sum(self.val_losses) / len(self.val_losses))
         self.val_losses = []
-        
+
         # model checkpointing
         if self.val_loss < self.min_loss:
-            # if the improvement is less than 0.0002, we halve the learning rate
             if self.val_loss - self.min_loss > -0.002:
-                self.optimizer.param_groups[0]["lr"] /= 2  
+                self.optimizer.param_groups[0]["lr"] /= 2
             self.min_loss = self.val_loss
             self.model_checkpointing(self.val_loss)
         else:
             self.optimizer.param_groups[0]["lr"] /= 2
-        
-        # Log losses to wandb (both individually and in the same plot)
+
+        # W&B logging: combined losses (train/val) + optional per-horizon train CE + σ_h
         self.log_losses_to_wandb(self.current_train_loss, self.val_loss)
-        
-        # Continue with regular Lightning logging for compatibility
+
+        # Lightning monitoring (EarlyStopping watches val_loss)
         self.log("val_loss", self.val_loss)
         print(f'Validation loss on epoch {self.current_epoch}: {self.val_loss}')
-        targets = np.concatenate(self.val_targets)    
-        predictions = np.concatenate(self.val_predictions)
+
+        # Classification report on primary horizon (always h10 for multi, full for single)
+        targets = torch.cat(self.val_targets).cpu().numpy()
+        predictions = torch.cat(self.val_predictions).cpu().numpy()
         class_report = classification_report(targets, predictions, digits=4, output_dict=True)
         print(classification_report(targets, predictions, digits=4))
         self.log("val_f1_score", class_report["macro avg"]["f1-score"])
@@ -234,39 +333,49 @@ class Engine(LightningModule):
         self.log("val_precision", class_report["macro avg"]["precision"])
         self.log("val_recall", class_report["macro avg"]["recall"])
         self.val_targets = []
-        self.val_predictions = [] 
-    
-    def log_losses_to_wandb(self, train_loss, val_loss):
-        """Log training and validation losses to wandb in the same plot."""
-        if self.is_wandb:   
-            # Log combined losses for a single plot
-            wandb.log({
-                "losses": {
-                    "train": train_loss,
-                    "validation": val_loss
-                },
-                "epoch": self.global_step
-            })
-    
+        self.val_predictions = []
+
+        # Reset per-horizon train accumulators
+        if self.multi_horizon:
+            self.train_losses_per_h = [[] for _ in HORIZONS]
+
     def on_test_epoch_end(self) -> None:
-        targets = np.concatenate(self.test_targets)    
-        predictions = np.concatenate(self.test_predictions)
+        targets = torch.cat(self.test_targets).cpu().numpy()
+        predictions = torch.cat(self.test_predictions).cpu().numpy()
         predictions_path = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "predictions")
         np.save(predictions_path, predictions)
-        class_report = classification_report(targets, predictions, digits=4, output_dict=True)
-        print(classification_report(targets, predictions, digits=4))
-        self.log("test_loss", sum(self.test_losses) / len(self.test_losses))
-        self.log("f1_score", class_report["macro avg"]["f1-score"])
-        self.log("accuracy", class_report["accuracy"])
-        self.log("precision", class_report["macro avg"]["precision"])
-        self.log("recall", class_report["macro avg"]["recall"])
+
+        if self.multi_horizon:
+            # Report per-horizon metrics in console and log only F1 to W&B
+            for i, h in enumerate(HORIZONS):
+                h_targets = torch.cat(self.test_targets_per_h[i]).cpu().numpy()
+                h_preds = torch.cat(self.test_predictions_per_h[i]).cpu().numpy()
+                h_report = classification_report(h_targets, h_preds, digits=4, output_dict=True)
+                print(f"\n--- Horizon h={h} ---")
+                print(classification_report(h_targets, h_preds, digits=4))
+                # Only log F1 per horizon to W&B
+                self.log(f"f1_score_h{h}", h_report["macro avg"]["f1-score"])
+            # Reset per-horizon accumulators
+            self.test_targets_per_h = [[] for _ in HORIZONS]
+            self.test_predictions_per_h = [[] for _ in HORIZONS]
+            self.test_losses_per_h = [[] for _ in HORIZONS]
+        else:
+            class_report = classification_report(targets, predictions, digits=4, output_dict=True)
+            print(classification_report(targets, predictions, digits=4))
+            self.log("test_loss", sum(self.test_losses) / len(self.test_losses))
+            self.log("f1_score", class_report["macro avg"]["f1-score"])
+            self.log("accuracy", class_report["accuracy"])
+            self.log("precision", class_report["macro avg"]["precision"])
+            self.log("recall", class_report["macro avg"]["recall"])
+
         self.test_targets = []
         self.test_predictions = []
-        self.test_losses = []  
+        self.test_losses = []
         self.first_test = False
-        test_proba = np.concatenate(self.test_proba)
+        test_proba = torch.cat(self.test_proba).cpu().numpy()
         precision, recall, _ = precision_recall_curve(targets, test_proba, pos_label=1)
-        self.plot_pr_curves(recall, precision, self.is_wandb) 
+        self.plot_pr_curves(recall, precision, self.is_wandb)
+        self.test_proba = []
 
     def on_fit_end(self) -> None:
         if self.total_train_time_s <= 0:
@@ -282,7 +391,10 @@ class Engine(LightningModule):
             self.logger.log_metrics(metrics, step=self.global_step)
         if self.is_wandb and wandb.run is not None:
             wandb.log(metrics)
-        
+
+    # ------------------------------------------------------------------
+    # Optimizer
+    # ------------------------------------------------------------------
     def configure_optimizers(self):
         if self.model_type == "DEEPLOB":
             eps = 1
@@ -297,78 +409,105 @@ class Engine(LightningModule):
         elif self.optimizer == 'Lion':
             self.optimizer = Lion(self.parameters(), lr=self.lr)
         return self.optimizer
-    
+
+    # ------------------------------------------------------------------
+    # Logging helpers
+    # ------------------------------------------------------------------
     def _define_log_metrics(self):
         wandb.define_metric("val_loss", summary="min")
+        if self.multi_horizon:
+            for h in HORIZONS:
+                wandb.define_metric(f"f1_score_h{h}", summary="max")
 
-    def model_checkpointing(self, loss):        
+    def log_losses_to_wandb(self, train_loss, val_loss):
+        """Log training and validation losses (and per-horizon σ_h in multi-horizon mode)."""
+        if not self.is_wandb:
+            return
+        log_dict = {
+            "losses": {"train": train_loss, "validation": val_loss},
+            "epoch": self.global_step,
+        }
+        if self.multi_horizon:
+            # Per-horizon training CE and learned uncertainty σ_h
+            for i, h in enumerate(HORIZONS):
+                if self.train_losses_per_h[i]:
+                    mean_val = float(torch.stack(self.train_losses_per_h[i]).mean())
+                    log_dict[f"losses/train_h{h}"] = mean_val
+                sigma_h = float(torch.exp(0.5 * self.log_vars[i]).detach().cpu())
+                log_dict[f"uncertainty/sigma_h{h}"] = sigma_h
+        wandb.log(log_dict)
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+    def model_checkpointing(self, loss):
         if self.last_path_ckpt is not None:
             os.remove(self.last_path_ckpt)
-        filename_ckpt = ("val_loss=" + str(round(loss, 3)) +
-                             "_epoch=" + str(self.current_epoch) +
-                             ".pt"
-                             )
+        filename_ckpt = (
+            "val_loss=" + str(round(loss, 3))
+            + "_epoch=" + str(self.current_epoch)
+            + ".pt"
+        )
         path_ckpt = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "pt", filename_ckpt)
-        
-        # Save PyTorch checkpoint
+
         with self.ema.average_parameters():
             self.trainer.save_checkpoint(path_ckpt)
-            
-            # Save ONNX model
-            onnx_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "onnx")
-            os.makedirs(onnx_dir, exist_ok=True)
-            
-            onnx_filename = ("val_loss=" + str(round(loss, 3)) +
-                             "_epoch=" + str(self.current_epoch) +
-                             ".onnx"
-                            )
-            onnx_path = os.path.join(onnx_dir, onnx_filename)
-            
-            # Create dummy input with appropriate shape
-            dummy_input = torch.randn(1, self.seq_size, self.num_features, device=self.device)
-            
-            # Export to ONNX
-            export_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
-            previous_fast_attention_state = None
-            try:
-                if hasattr(export_model, "set_fast_attention"):
-                    previous_fast_attention_state = export_model.use_fast_attention
-                    export_model.set_fast_attention(False)
-                onnx_logger = logging.getLogger("torch.onnx")
-                onnx_schemas_logger = logging.getLogger("torch.onnx._internal.exporter._schemas")
-                previous_onnx_logger_level = onnx_logger.level
-                previous_onnx_schemas_logger_level = onnx_schemas_logger.level
-                onnx_logger.setLevel(logging.ERROR)
-                onnx_schemas_logger.setLevel(logging.ERROR)
+
+            # ONNX export — single-head only (multi-horizon output is a list, not yet ONNX-friendly)
+            if not self.multi_horizon:
+                onnx_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "onnx")
+                os.makedirs(onnx_dir, exist_ok=True)
+                onnx_filename = (
+                    "val_loss=" + str(round(loss, 3))
+                    + "_epoch=" + str(self.current_epoch)
+                    + ".onnx"
+                )
+                onnx_path = os.path.join(onnx_dir, onnx_filename)
+                dummy_input = torch.randn(1, self.seq_size, self.num_features, device=self.device)
+                export_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+                previous_fast_attention_state = None
                 try:
-                    with warnings.catch_warnings(), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                        warnings.simplefilter("ignore")
-                        torch.onnx.export(
-                            export_model,
-                            dummy_input,
-                            onnx_path,
-                            dynamo=True,
-                            export_params=True,
-                            opset_version=25,
-                            do_constant_folding=True,
-                            input_names=['input'],
-                            output_names=['output'],
-                            dynamic_shapes={'input': {0: torch.export.Dim('batch_size')}},
-                        )
+                    if hasattr(export_model, "set_fast_attention"):
+                        previous_fast_attention_state = export_model.use_fast_attention
+                        export_model.set_fast_attention(False)
+                    onnx_logger = logging.getLogger("torch.onnx")
+                    onnx_schemas_logger = logging.getLogger("torch.onnx._internal.exporter._schemas")
+                    previous_onnx_logger_level = onnx_logger.level
+                    previous_onnx_schemas_logger_level = onnx_schemas_logger.level
+                    onnx_logger.setLevel(logging.ERROR)
+                    onnx_schemas_logger.setLevel(logging.ERROR)
+                    try:
+                        with warnings.catch_warnings(), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                            warnings.simplefilter("ignore")
+                            torch.onnx.export(
+                                export_model,
+                                dummy_input,
+                                onnx_path,
+                                dynamo=True,
+                                export_params=True,
+                                opset_version=25,
+                                do_constant_folding=True,
+                                input_names=['input'],
+                                output_names=['output'],
+                                dynamic_shapes={'input': {0: torch.export.Dim('batch_size')}},
+                            )
+                    finally:
+                        onnx_logger.setLevel(previous_onnx_logger_level)
+                        onnx_schemas_logger.setLevel(previous_onnx_schemas_logger_level)
+                except Exception as e:
+                    print(f"Failed to export ONNX model: {e}")
                 finally:
-                    onnx_logger.setLevel(previous_onnx_logger_level)
-                    onnx_schemas_logger.setLevel(previous_onnx_schemas_logger_level)
-            except Exception as e:
-                print(f"Failed to export ONNX model: {e}")
-            finally:
-                if (
-                    hasattr(export_model, "set_fast_attention")
-                    and previous_fast_attention_state is not None
-                ):
-                    export_model.set_fast_attention(previous_fast_attention_state)
-        
-        self.last_path_ckpt = path_ckpt  
-        
+                    if (
+                        hasattr(export_model, "set_fast_attention")
+                        and previous_fast_attention_state is not None
+                    ):
+                        export_model.set_fast_attention(previous_fast_attention_state)
+
+        self.last_path_ckpt = path_ckpt
+
+    # ------------------------------------------------------------------
+    # PR Curve
+    # ------------------------------------------------------------------
     def plot_pr_curves(self, recall, precision, is_wandb):
         plt.figure(figsize=(20, 10), dpi=80)
         plt.plot(recall, precision, label='Precision-Recall', color='black')
@@ -376,15 +515,16 @@ class Engine(LightningModule):
         plt.ylabel('Precision')
         plt.title('Precision-Recall Curve')
         if is_wandb:
-            wandb.log({f"precision_recall_curve_{self.dataset_type}": wandb.Image(plt)})
-        plt.savefig(cst.DIR_SAVED_MODEL + "/" + str(self.model_type) + "/" +f"precision_recall_curve_{self.dataset_type}.svg")
-        #plt.show()
+            tag = "multi_horizon" if self.multi_horizon else self.dataset_type
+            wandb.log({f"precision_recall_curve_{tag}": wandb.Image(plt)})
+        plt.savefig(cst.DIR_SAVED_MODEL + "/" + str(self.model_type) + "/" + f"precision_recall_curve_{self.dataset_type}.svg")
         plt.close()
-        
+
+
 def compute_most_attended(att_feature):
     ''' att_feature: list of tensors of shape (num_samples, num_layers, 2, num_heads, num_features) '''
     att_feature = np.stack(att_feature)
-    att_feature = att_feature.transpose(1, 3, 0, 2, 4)  # Use transpose instead of permute
+    att_feature = att_feature.transpose(1, 3, 0, 2, 4)
     ''' att_feature: shape (num_layers, num_heads, num_samples, 2, num_features) '''
     indices = att_feature[:, :, :, 1]
     values = att_feature[:, :, :, 0]
@@ -393,18 +533,10 @@ def compute_most_attended(att_feature):
     for layer in range(indices.shape[0]):
         for head in range(indices.shape[1]):
             for seq in range(indices.shape[3]):
-                # Extract the indices for the current layer and sequence element
                 current_indices = indices[layer, head, :, seq]
                 current_values = values[layer, head, :, seq]
-                # Find the most frequent index
                 most_frequent_index = mode(current_indices, keepdims=False)[0]
-                # Store the result
                 most_frequent_indices[layer, head, seq] = most_frequent_index
-                # Compute the average value for the most frequent index
                 avg_value = np.mean(current_values[current_indices == most_frequent_index])
-                # Store the average value
                 average_values[layer, head, seq] = avg_value
     return most_frequent_indices, average_values
-
-
-

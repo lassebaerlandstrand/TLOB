@@ -32,9 +32,10 @@ class TransformerLayer(nn.Module):
         self.use_fast_attention = use_fast_attention
         self.norm = nn.RMSNorm(hidden_dim)
         self.qkv = ComputeQKV(hidden_dim, num_heads)
-        self.attention = nn.MultiheadAttention(hidden_dim*num_heads, num_heads, batch_first=True, device=cst.DEVICE)
+        self.attention = nn.MultiheadAttention(hidden_dim*num_heads, num_heads, batch_first=True)
         self.mlp = MLP(hidden_dim, hidden_dim*4, final_dim)
         self.w0 = nn.Linear(hidden_dim*num_heads, hidden_dim)
+        self.use_residual = (final_dim == hidden_dim)
 
     def set_fast_attention(self, use_fast_attention: bool):
         self.use_fast_attention = use_fast_attention
@@ -67,9 +68,21 @@ class TransformerLayer(nn.Module):
         x = x + res
         x = self.norm(x)
         x = self.mlp(x)
-        if x.shape[-1] == res.shape[-1]:
+        if self.use_residual:
             x = x + res
         return x, att
+
+
+def _build_head(total_dim: int) -> nn.ModuleList:
+    """Build the classification head (shrink-to-3) matching the original design."""
+    layers = nn.ModuleList()
+    dim = total_dim
+    while dim > 128:
+        layers.append(nn.Linear(dim, dim // 4))
+        layers.append(nn.GELU())
+        dim = dim // 4
+    layers.append(nn.Linear(dim, 3))
+    return layers
 
 
 class TLOB(nn.Module):
@@ -81,7 +94,8 @@ class TLOB(nn.Module):
                  num_heads: int,
                  is_sin_emb: bool,
                  dataset_type: str,
-                 use_fast_attention: bool = True
+                 use_fast_attention: bool = True,
+                 num_horizons: int = 1,
                  ) -> None:
         super().__init__()
         
@@ -92,6 +106,7 @@ class TLOB(nn.Module):
         self.num_heads = num_heads
         self.dataset_type = dataset_type
         self.use_fast_attention = use_fast_attention
+        self.num_horizons = num_horizons
         self.layers = nn.ModuleList()
         self.first_branch = nn.ModuleList()
         self.second_branch = nn.ModuleList()
@@ -99,7 +114,8 @@ class TLOB(nn.Module):
         self.norm_layer = BiN(num_features, seq_size)
         self.emb_layer = nn.Linear(num_features, hidden_dim)
         if is_sin_emb:
-            self.pos_encoder = sinusoidal_positional_embedding(seq_size, hidden_dim)
+            pos_emb = sinusoidal_positional_embedding(seq_size, hidden_dim).unsqueeze(0)
+            self.register_buffer("pos_encoder", pos_emb)
         else:
             self.pos_encoder = nn.Parameter(torch.randn(1, seq_size, hidden_dim))
         
@@ -114,12 +130,17 @@ class TLOB(nn.Module):
         self.att_feature = []
         self.mean_att_distance_temporal = []
         total_dim = (hidden_dim//4)*(seq_size//4)
-        self.final_layers = nn.ModuleList()
-        while total_dim > 128:
-            self.final_layers.append(nn.Linear(total_dim, total_dim//4))
-            self.final_layers.append(nn.GELU())
-            total_dim = total_dim//4
-        self.final_layers.append(nn.Linear(total_dim, 3))
+
+        if num_horizons == 1:
+            # Original single head (backward-compatible)
+            self.final_layers = _build_head(total_dim)
+            self.heads = None
+        else:
+            # One independent head per horizon, all sharing the encoder above
+            self.final_layers = None
+            self.heads = nn.ModuleList([
+                nn.ModuleList(_build_head(total_dim)) for _ in range(num_horizons)
+            ])
 
     def set_fast_attention(self, use_fast_attention: bool):
         self.use_fast_attention = use_fast_attention
@@ -127,8 +148,8 @@ class TLOB(nn.Module):
             if isinstance(layer, TransformerLayer):
                 layer.set_fast_attention(use_fast_attention)
         
-    
-    def forward(self, input, store_att=False):
+    def _encode(self, input, store_att=False):
+        """Shared encoder: input → flat representation."""
         if self.dataset_type == "LOBSTER":
             continuous_features = torch.cat([input[:, :, :41], input[:, :, 42:]], dim=2)
             order_type = input[:, :, 41].long()
@@ -146,11 +167,27 @@ class TLOB(nn.Module):
             if store_att and att is not None:
                 att = att.detach()
             x = x.permute(0, 2, 1)
-        x = rearrange(x, 'b s f -> b (f s) 1')              
+        x = rearrange(x, 'b s f -> b (f s) 1')
         x = x.reshape(x.shape[0], -1)
-        for layer in self.final_layers:
-            x = layer(x)
         return x
+
+    def forward(self, input, store_att=False):
+        x = self._encode(input, store_att=store_att)
+
+        if self.num_horizons == 1:
+            # Original path — single tensor output
+            for layer in self.final_layers:
+                x = layer(x)
+            return x
+        else:
+            # Multi-horizon path — list of tensors, one per horizon
+            outputs = []
+            for head in self.heads:
+                h = x
+                for layer in head:
+                    h = layer(h)
+                outputs.append(h)
+            return outputs
     
     
 def sinusoidal_positional_embedding(token_sequence_size, token_embedding_dim, n=10000.0):
@@ -168,7 +205,7 @@ def sinusoidal_positional_embedding(token_sequence_size, token_embedding_dim, n=
     embeddings[:, 0::2] = torch.sin(positions/denominators) # sin(pos/10000^(2i/d_model))
     embeddings[:, 1::2] = torch.cos(positions/denominators) # cos(pos/10000^(2i/d_model))
 
-    return embeddings.to(cst.DEVICE, non_blocking=True)
+    return embeddings
 
 
 def count_parameters(layer):
@@ -184,5 +221,3 @@ def compute_mean_att_distance(att):
                 att_distances[h, key] += torch.abs(att[h, query, key]).cpu().item()*distance
     mean_distances = att_distances.mean(axis=1)
     return mean_distances
-    
-    

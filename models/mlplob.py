@@ -2,19 +2,34 @@ from torch import nn
 import torch
 from models.bin import BiN
 
+
+def _build_head(total_dim: int) -> nn.ModuleList:
+    """Build the classification head (shrink-to-3) matching the original design."""
+    layers = nn.ModuleList()
+    dim = total_dim
+    while dim > 128:
+        layers.append(nn.Linear(dim, dim // 4))
+        layers.append(nn.GELU())
+        dim = dim // 4
+    layers.append(nn.Linear(dim, 3))
+    return layers
+
+
 class MLPLOB(nn.Module):
     def __init__(self, 
                  hidden_dim: int,
                  num_layers: int,
                  seq_size: int,
                  num_features: int,
-                 dataset_type: str
+                 dataset_type: str,
+                 num_horizons: int = 1,
                  ) -> None:
         super().__init__()
         
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.dataset_type = dataset_type
+        self.num_horizons = num_horizons
         self.layers = nn.ModuleList()
         self.order_type_embedder = nn.Embedding(3, 1)
         self.first_layer = nn.Linear(num_features, hidden_dim)
@@ -30,14 +45,19 @@ class MLPLOB(nn.Module):
                 self.layers.append(MLP(seq_size, seq_size*2, seq_size//4))
                 
         total_dim = (hidden_dim//4)*(seq_size//4)
-        self.final_layers = nn.ModuleList()
-        while total_dim > 128:
-            self.final_layers.append(nn.Linear(total_dim, total_dim//4))
-            self.final_layers.append(nn.GELU())
-            total_dim = total_dim//4
-        self.final_layers.append(nn.Linear(total_dim, 3))
-    
-    def forward(self, input):
+
+        if num_horizons == 1:
+            # Original single head (backward-compatible)
+            self.final_layers = _build_head(total_dim)
+            self.heads = None
+        else:
+            self.final_layers = None
+            self.heads = nn.ModuleList([
+                nn.ModuleList(_build_head(total_dim)) for _ in range(num_horizons)
+            ])
+
+    def _encode(self, input):
+        """Shared encoder body producing a flat representation."""
         if self.dataset_type == "LOBSTER":
             continuous_features = torch.cat([input[:, :, :41], input[:, :, 42:]], dim=2)
             order_type = input[:, :, 41].long()
@@ -52,9 +72,23 @@ class MLPLOB(nn.Module):
             x = layer(x)
             x = x.permute(0, 2, 1)
         x = x.reshape(x.shape[0], -1)
-        for layer in self.final_layers:
-            x = layer(x)
         return x
+
+    def forward(self, input):
+        x = self._encode(input)
+
+        if self.num_horizons == 1:
+            for layer in self.final_layers:
+                x = layer(x)
+            return x
+        else:
+            outputs = []
+            for head in self.heads:
+                h = x
+                for layer in head:
+                    h = layer(h)
+                outputs.append(h)
+            return outputs
         
         
 class MLP(nn.Module):
@@ -80,4 +114,3 @@ class MLP(nn.Module):
         x = self.layer_norm(x)
         x = self.gelu(x)
         return x
-    

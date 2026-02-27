@@ -48,6 +48,32 @@ def battery_load(path, all_features, len_smooth, h, seq_size):
     return input_, labels
 
 
+def battery_load_multi(path, all_features, len_smooth, seq_size):
+    """Load battery data returning all 4 horizon labels stacked.
+
+    .npy last 4 cols: -4=h10, -3=h20, -2=h50, -1=h100.
+    Returns:
+        input_:  FloatTensor (N, num_features)
+        labels:  LongTensor  (N_valid, 4)
+    """
+    set_ = np.load(path)
+    label_start = seq_size - len_smooth
+    all_labels = np.stack([set_[label_start:, c] for c in [-4, -3, -2, -1]], axis=1)  # (N_valid, 4)
+    finite_mask = np.all(np.isfinite(all_labels), axis=1)
+    all_labels = all_labels[finite_mask].astype(np.int64)
+    labels = torch.from_numpy(all_labels).long()
+
+    if all_features:
+        orderbook = set_[:, cst.LEN_ORDER : cst.LEN_ORDER + cst.N_LOB_LEVELS * cst.LEN_LEVEL]
+        messages = set_[:, : cst.LEN_ORDER]
+        input_ = np.concatenate([orderbook, messages], axis=1)
+    else:
+        input_ = set_[:, cst.LEN_ORDER : cst.LEN_ORDER + cst.N_LOB_LEVELS * cst.LEN_LEVEL]
+
+    input_ = torch.from_numpy(input_).float()
+    return input_, labels
+
+
 class BatteryDataBuilder:
     def __init__(
         self,

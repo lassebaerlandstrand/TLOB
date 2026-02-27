@@ -9,11 +9,11 @@ from lightning.pytorch.callbacks import TQDMProgressBar
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from config.config import Config
 from models.engine import Engine
-from preprocessing.fi_2010 import fi_2010_load
-from preprocessing.lobster import lobster_load
-from preprocessing.btc import btc_load
-from preprocessing.battery import battery_load
-from preprocessing.dataset import Dataset, DataModule
+from preprocessing.fi_2010 import fi_2010_load, fi_2010_load_multi
+from preprocessing.lobster import lobster_load, lobster_load_multi
+from preprocessing.btc import btc_load, btc_load_multi
+from preprocessing.battery import battery_load, battery_load_multi
+from preprocessing.dataset import Dataset, DataModule, MultiHorizonDataset
 import constants as cst
 from constants import SamplingType
 torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
@@ -23,11 +23,13 @@ def run(config: Config, accelerator):
     seq_size = config.model.hyperparameters_fixed["seq_size"]
     dataset = config.dataset.type.value
     horizon = config.experiment.horizon
+    multi_horizon = config.experiment.multi_horizon
+    mh_suffix = "_multi_horizon" if multi_horizon else ""
     if dataset == "LOBSTER":
         training_stocks = config.dataset.training_stocks
-        config.experiment.dir_ckpt = f"{dataset}_{training_stocks}_seq_size_{seq_size}_horizon_{horizon}_seed_{config.experiment.seed}"
+        config.experiment.dir_ckpt = f"{dataset}_{training_stocks}_seq_size_{seq_size}_horizon_{horizon}_seed_{config.experiment.seed}{mh_suffix}"
     else:
-        config.experiment.dir_ckpt = f"{dataset}_seq_size_{seq_size}_horizon_{horizon}_seed_{config.experiment.seed}"
+        config.experiment.dir_ckpt = f"{dataset}_seq_size_{seq_size}_horizon_{horizon}_seed_{config.experiment.seed}{mh_suffix}"
 
     trainer = L.Trainer(
         accelerator=accelerator,
@@ -50,24 +52,33 @@ def train(config: Config, trainer: L.Trainer, run=None):
     dataset_type = config.dataset.type.value
     seq_size = config.model.hyperparameters_fixed["seq_size"]
     horizon = config.experiment.horizon
+    multi_horizon = config.experiment.multi_horizon
     model_type = config.model.type
     checkpoint_ref = config.experiment.checkpoint_reference
     checkpoint_path = os.path.join(cst.DIR_SAVED_MODEL, model_type.value, checkpoint_ref)
     dataset_type = config.dataset.type.value
     if dataset_type == "FI_2010":
         path = cst.DATA_DIR + "/FI_2010"
-        train_input, train_labels, val_input, val_labels, test_input, test_labels = fi_2010_load(path, seq_size, horizon, config.model.hyperparameters_fixed["all_features"])
-        train_set = Dataset(train_input, train_labels, seq_size)
-        val_set = Dataset(val_input, val_labels, seq_size)
-        test_set = Dataset(test_input, test_labels, seq_size)
+        if multi_horizon:
+            train_input, train_labels, val_input, val_labels, test_input, test_labels = fi_2010_load_multi(
+                path, seq_size, config.model.hyperparameters_fixed["all_features"]
+            )
+            train_set = MultiHorizonDataset(train_input, train_labels, seq_size)
+            val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
+            test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
+        else:
+            train_input, train_labels, val_input, val_labels, test_input, test_labels = fi_2010_load(path, seq_size, horizon, config.model.hyperparameters_fixed["all_features"])
+            train_set = Dataset(train_input, train_labels, seq_size)
+            val_set = Dataset(val_input, val_labels, seq_size)
+            test_set = Dataset(test_input, test_labels, seq_size)
         if config.experiment.is_debug:
             train_set.length = 1000
             val_set.length = 1000
             test_set.length = 10000
         data_module = DataModule(
-            train_set=Dataset(train_input, train_labels, seq_size),
-            val_set=Dataset(val_input, val_labels, seq_size),
-            test_set=Dataset(test_input, test_labels, seq_size),
+            train_set=train_set,
+            val_set=val_set,
+            test_set=test_set,
             batch_size=config.dataset.batch_size,
             test_batch_size=config.dataset.batch_size*4,
             num_workers=4
@@ -75,12 +86,20 @@ def train(config: Config, trainer: L.Trainer, run=None):
         test_loaders = [data_module.test_dataloader()]
     
     elif dataset_type == "BTC":
-        train_input, train_labels = btc_load(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, horizon, seq_size)
-        val_input, val_labels = btc_load(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, horizon, seq_size)  
-        test_input, test_labels = btc_load(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, horizon, seq_size)
-        train_set = Dataset(train_input, train_labels, seq_size)
-        val_set = Dataset(val_input, val_labels, seq_size)
-        test_set = Dataset(test_input, test_labels, seq_size)
+        if multi_horizon:
+            train_input, train_labels = btc_load_multi(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, seq_size)
+            val_input, val_labels = btc_load_multi(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, seq_size)
+            test_input, test_labels = btc_load_multi(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, seq_size)
+            train_set = MultiHorizonDataset(train_input, train_labels, seq_size)
+            val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
+            test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
+        else:
+            train_input, train_labels = btc_load(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, horizon, seq_size)
+            val_input, val_labels = btc_load(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, horizon, seq_size)
+            test_input, test_labels = btc_load(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, horizon, seq_size)
+            train_set = Dataset(train_input, train_labels, seq_size)
+            val_set = Dataset(val_input, val_labels, seq_size)
+            test_set = Dataset(test_input, test_labels, seq_size)
         if config.experiment.is_debug:
             train_set.length = 1000
             val_set.length = 1000
@@ -98,30 +117,53 @@ def train(config: Config, trainer: L.Trainer, run=None):
 
     elif dataset_type == "BATTERY":
         stock = config.dataset.training_stocks[0]
-        train_input, train_labels = battery_load(
-            cst.DATA_DIR + f"/{stock}/train.npy",
-            config.model.hyperparameters_fixed["all_features"],
-            cst.LEN_SMOOTH,
-            horizon,
-            seq_size,
-        )
-        val_input, val_labels = battery_load(
-            cst.DATA_DIR + f"/{stock}/val.npy",
-            config.model.hyperparameters_fixed["all_features"],
-            cst.LEN_SMOOTH,
-            horizon,
-            seq_size,
-        )
-        test_input, test_labels = battery_load(
-            cst.DATA_DIR + f"/{stock}/test.npy",
-            config.model.hyperparameters_fixed["all_features"],
-            cst.LEN_SMOOTH,
-            horizon,
-            seq_size,
-        )
-        train_set = Dataset(train_input, train_labels, seq_size)
-        val_set = Dataset(val_input, val_labels, seq_size)
-        test_set = Dataset(test_input, test_labels, seq_size)
+        if multi_horizon:
+            train_input, train_labels = battery_load_multi(
+                cst.DATA_DIR + f"/{stock}/train.npy",
+                config.model.hyperparameters_fixed["all_features"],
+                cst.LEN_SMOOTH,
+                seq_size,
+            )
+            val_input, val_labels = battery_load_multi(
+                cst.DATA_DIR + f"/{stock}/val.npy",
+                config.model.hyperparameters_fixed["all_features"],
+                cst.LEN_SMOOTH,
+                seq_size,
+            )
+            test_input, test_labels = battery_load_multi(
+                cst.DATA_DIR + f"/{stock}/test.npy",
+                config.model.hyperparameters_fixed["all_features"],
+                cst.LEN_SMOOTH,
+                seq_size,
+            )
+            train_set = MultiHorizonDataset(train_input, train_labels, seq_size)
+            val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
+            test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
+        else:
+            train_input, train_labels = battery_load(
+                cst.DATA_DIR + f"/{stock}/train.npy",
+                config.model.hyperparameters_fixed["all_features"],
+                cst.LEN_SMOOTH,
+                horizon,
+                seq_size,
+            )
+            val_input, val_labels = battery_load(
+                cst.DATA_DIR + f"/{stock}/val.npy",
+                config.model.hyperparameters_fixed["all_features"],
+                cst.LEN_SMOOTH,
+                horizon,
+                seq_size,
+            )
+            test_input, test_labels = battery_load(
+                cst.DATA_DIR + f"/{stock}/test.npy",
+                config.model.hyperparameters_fixed["all_features"],
+                cst.LEN_SMOOTH,
+                horizon,
+                seq_size,
+            )
+            train_set = Dataset(train_input, train_labels, seq_size)
+            val_set = Dataset(val_input, val_labels, seq_size)
+            test_set = Dataset(test_input, test_labels, seq_size)
         if config.experiment.is_debug:
             train_set.length = 1000
             val_set.length = 1000
@@ -144,29 +186,47 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 for j in range(2):
                     if j == 0:
                         path = cst.DATA_DIR + "/" + training_stocks[i] + "/train.npy"
-                        train_input, train_labels = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
+                        if multi_horizon:
+                            train_input, train_labels = lobster_load_multi(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size)
+                        else:
+                            train_input, train_labels = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
                     if j == 1:
                         path = cst.DATA_DIR + "/" + training_stocks[i] + "/val.npy"
-                        val_input, val_labels = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
+                        if multi_horizon:
+                            val_input, val_labels = lobster_load_multi(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size)
+                        else:
+                            val_input, val_labels = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
             else:
                 for j in range(2):
                     if j == 0:
                         path = cst.DATA_DIR + "/" + training_stocks[i] + "/train.npy"
-                        train_labels = torch.cat((train_labels, torch.zeros(seq_size+horizon-1, dtype=torch.long)), 0)
-                        train_input_tmp, train_labels_tmp = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
+                        pad = torch.zeros(seq_size+horizon-1, len(cst.LOBSTER_HORIZONS) if multi_horizon else 1, dtype=torch.long) if multi_horizon else torch.zeros(seq_size+horizon-1, dtype=torch.long)
+                        train_labels = torch.cat((train_labels, pad), 0)
+                        if multi_horizon:
+                            train_input_tmp, train_labels_tmp = lobster_load_multi(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size)
+                        else:
+                            train_input_tmp, train_labels_tmp = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
                         train_input = torch.cat((train_input, train_input_tmp), 0)
                         train_labels = torch.cat((train_labels, train_labels_tmp), 0)
                     if j == 1:
                         path = cst.DATA_DIR + "/" + training_stocks[i] + "/val.npy"
-                        val_labels = torch.cat((val_labels, torch.zeros(seq_size+horizon-1, dtype=torch.long)), 0)
-                        val_input_tmp, val_labels_tmp = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
+                        pad = torch.zeros(seq_size+horizon-1, len(cst.LOBSTER_HORIZONS) if multi_horizon else 1, dtype=torch.long) if multi_horizon else torch.zeros(seq_size+horizon-1, dtype=torch.long)
+                        val_labels = torch.cat((val_labels, pad), 0)
+                        if multi_horizon:
+                            val_input_tmp, val_labels_tmp = lobster_load_multi(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size)
+                        else:
+                            val_input_tmp, val_labels_tmp = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
                         val_input = torch.cat((val_input, val_input_tmp), 0)
                         val_labels = torch.cat((val_labels, val_labels_tmp), 0)
         test_loaders = []
         for i in range(len(testing_stocks)):
             path = cst.DATA_DIR + "/" + testing_stocks[i] + "/test.npy"
-            test_input, test_labels = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
-            test_set = Dataset(test_input, test_labels, seq_size)
+            if multi_horizon:
+                test_input, test_labels = lobster_load_multi(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size)
+                test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
+            else:
+                test_input, test_labels = lobster_load(path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size)
+                test_set = Dataset(test_input, test_labels, seq_size)
             test_dataloader = DataLoader(
                 dataset=test_set,
                 batch_size=config.dataset.batch_size*4,
@@ -339,6 +399,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
                 weight_decay=config.model.hyperparameters_fixed["weight_decay"],
+                multi_horizon=multi_horizon,
             )
         elif model_type == cst.ModelType.TLOB:
             model = Engine(
@@ -364,6 +425,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
                 weight_decay=config.model.hyperparameters_fixed["weight_decay"],
+                multi_horizon=multi_horizon,
             )
         elif model_type == cst.ModelType.BINCTABL:
             model = Engine(
@@ -478,11 +540,12 @@ def run_wandb(config: Config, accelerator):
         horizon = config.experiment.horizon
         dataset = config.dataset.type.value
         seed = config.experiment.seed
+        mh_suffix = "_multi_horizon" if config.experiment.multi_horizon else ""
         if dataset == "LOBSTER":
             training_stocks = config.dataset.training_stocks
-            config.experiment.dir_ckpt = f"{dataset}_{training_stocks}_seq_size_{seq_size}_horizon_{horizon}_seed_{seed}"
+            config.experiment.dir_ckpt = f"{dataset}_{training_stocks}_seq_size_{seq_size}_horizon_{horizon}_seed_{seed}{mh_suffix}"
         else:
-            config.experiment.dir_ckpt = f"{dataset}_seq_size_{seq_size}_horizon_{horizon}_seed_{seed}"
+            config.experiment.dir_ckpt = f"{dataset}_seq_size_{seq_size}_horizon_{horizon}_seed_{seed}{mh_suffix}"
         wandb_instance_name = config.experiment.dir_ckpt
             
         trainer = L.Trainer(
@@ -504,6 +567,7 @@ def run_wandb(config: Config, accelerator):
         run.log({"dataset": config.dataset.type.value}, commit=False)
         run.log({"seed": config.experiment.seed}, commit=False)
         run.log({"all_features": config.model.hyperparameters_fixed["all_features"]}, commit=False)
+        run.log({"multi_horizon": config.experiment.multi_horizon}, commit=False)
         if config.dataset.type == cst.DatasetType.LOBSTER:
             for i in range(len(config.dataset.training_stocks)):
                 run.log({f"training stock{i}": config.dataset.training_stocks[i]}, commit=False)

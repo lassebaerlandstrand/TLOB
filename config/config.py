@@ -99,6 +99,7 @@ class Experiment:
     torch_compile_backend: str = "inductor"
     precision: str = "32-true"
     use_fast_attention: bool = True
+    multi_horizon: bool = False
     
 defaults = [Model, Experiment, Dataset]
 

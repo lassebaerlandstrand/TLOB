@@ -492,18 +492,20 @@ def train(config: Config, trainer: L.Trainer, run=None):
         for i in range(len(test_loaders)):
             test_dataloader = test_loaders[i]
             output = trainer.test(best_model, test_dataloader)
+            f1 = output[0].get("f1_score", output[0].get("f1_score_h10"))
             if run is not None and dataset_type == "LOBSTER":
-                run.log({f"f1 {testing_stocks[i]} best": output[0]["f1_score"]}, commit=False)
+                run.log({f"f1 {testing_stocks[i]} best": f1}, commit=False)
             elif run is not None and dataset_type == "FI_2010":
-                run.log({f"f1 FI_2010 ": output[0]["f1_score"]}, commit=False)
+                run.log({f"f1 FI_2010 ": f1}, commit=False)
     else:
         for i in range(len(test_loaders)):
             test_dataloader = test_loaders[i]
             output = trainer.test(model, test_dataloader)
+            f1 = output[0].get("f1_score", output[0].get("f1_score_h10"))
             if run is not None and dataset_type == "LOBSTER":
-                run.log({f"f1 {testing_stocks[i]} best": output[0]["f1_score"]}, commit=False)
+                run.log({f"f1 {testing_stocks[i]} best": f1}, commit=False)
             elif run is not None and dataset_type == "FI_2010":
-                run.log({f"f1 FI_2010 ": output[0]["f1_score"]}, commit=False)
+                run.log({f"f1 FI_2010 ": f1}, commit=False)
             
     
 

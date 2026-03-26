@@ -115,7 +115,7 @@ python run_experiments.py --mode single --model tlob --dataset btc --horizon 10
 ### Multi-horizon joint run
 
 ```sh
-python run_experiments.py --mode multi-horizon --model tlob --dataset btc
+python run_experiments.py --mode multi-horizons --model tlob --dataset btc
 ```
 
 Additional flags: `--epochs`, `--rebuild-data`, `--dry-run`.  

@@ -236,6 +236,8 @@ TLOB_SETUP.md
 diagnose_tests/
 notebooks/dataset_analysis.ipynb
 notebooks/dataset_analysis_with_crossing.ipynb
+notebooks/battery_checks_per_product.ipynb
+notebooks/battery_checks_concat.ipynb
 
 # Large local archive
 data/battery_market.zip
@@ -286,3 +288,4 @@ data/checkpoints/**/*.svg
 
 # Agent files
 AGENTS.md
+ccswitch.sh

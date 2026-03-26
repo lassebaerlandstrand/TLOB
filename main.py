@@ -31,8 +31,10 @@ def hydra_app(config: Config):
         if config.model.type.value == "MLPLOB" or config.model.type.value == "TLOB":
             config.model.hyperparameters_fixed["hidden_dim"] = 40
     elif config.dataset.type == DatasetType.BATTERY:
-        if config.model.type.value == "MLPLOB" or config.model.type.value == "TLOB":
-            config.model.hyperparameters_fixed["hidden_dim"] = 40
+        all_features = config.dataset.all_features
+        config.model.hyperparameters_fixed["all_features"] = all_features  # sync to model
+        if config.model.type.value in ("MLPLOB", "TLOB"):
+            config.model.hyperparameters_fixed["hidden_dim"] = 46 if all_features else 40
     elif config.dataset.type == DatasetType.LOBSTER:
         if config.model.type.value == "MLPLOB" or config.model.type.value == "TLOB":
             config.model.hyperparameters_fixed["hidden_dim"] = 46
@@ -76,12 +78,19 @@ def hydra_app(config: Config):
 
     elif config.dataset.type == cst.DatasetType.BATTERY and not config.experiment.is_data_preprocessed:
         data_builder = BatteryDataBuilder(
-        data_dir=cst.DATA_DIR,
-        date_trading_days=config.dataset.dates,
-        split_rates=cst.SPLIT_RATES,
-        sampling_type=config.dataset.sampling_type,
-        sampling_time=config.dataset.sampling_time,
-        sampling_quantity=config.dataset.sampling_quantity,
+            data_dir=cst.DATA_DIR,
+            date_trading_days=config.dataset.dates,
+            split_rates=cst.SPLIT_RATES,
+            sampling_type=config.dataset.sampling_type,
+            sampling_time=config.dataset.sampling_time,
+            sampling_quantity=config.dataset.sampling_quantity,
+            product_mode=config.dataset.product_mode,
+            market_type=config.dataset.market_type,
+            raw_data_path=config.dataset.raw_data_path,
+            parsed_data_path=config.dataset.parsed_data_path,
+            max_lob_depth=config.dataset.max_lob_depth,
+            all_features=config.dataset.all_features,
+            force_rebuild=True,
         )
         data_builder.prepare_save_datasets()
 

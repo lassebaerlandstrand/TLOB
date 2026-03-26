@@ -11,13 +11,13 @@ class Dataset(data.Dataset):
     def __init__(self, x, y, seq_size):
         """Initialization""" 
         self.seq_size = seq_size
-        self.length = y.shape[0]
         self.x = x
         self.y = y
         if type(self.x) == np.ndarray:
             self.x = torch.from_numpy(x).float()
         if type(self.y) == np.ndarray:
             self.y = torch.from_numpy(y).long()
+        self.length = min(y.shape[0], self.x.shape[0] - seq_size + 1)
         self.data = self.x
 
     def __len__(self):
@@ -41,7 +41,7 @@ class MultiHorizonDataset(data.Dataset):
         self.seq_size = seq_size
         self.x = x if isinstance(x, torch.Tensor) else torch.from_numpy(x).float()
         self.y_multi = y_multi if isinstance(y_multi, torch.Tensor) else torch.from_numpy(y_multi).long()
-        self.length = self.y_multi.shape[0]
+        self.length = min(self.y_multi.shape[0], self.x.shape[0] - seq_size + 1)
         self.data = self.x
 
     def __len__(self):
@@ -63,10 +63,11 @@ class DataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.test_batch_size = test_batch_size
         self.is_shuffle_train = is_shuffle_train
-        if train_set.data.device.type != cst.DEVICE:       #this is true only when we are using a GPU but the data is still on the CPU
-            self.pin_memory = True
+        if hasattr(train_set, 'data'):
+            self.pin_memory = train_set.data.device.type != cst.DEVICE
         else:
-            self.pin_memory = False
+            # ConcatDataset: data lives on CPU, pin when using GPU
+            self.pin_memory = cst.DEVICE != "cpu"
         self.num_workers = num_workers
 
     def train_dataloader(self):

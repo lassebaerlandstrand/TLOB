@@ -1,10 +1,11 @@
+import json
 import lightning as L
 import omegaconf
 import torch
 import os
 from lightning.pytorch.loggers import WandbLogger
 import wandb
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from lightning.pytorch.callbacks import TQDMProgressBar
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 from config.config import Config
@@ -15,7 +16,7 @@ from preprocessing.btc import btc_load, btc_load_multi
 from preprocessing.battery import battery_load, battery_load_multi
 from preprocessing.dataset import Dataset, DataModule, MultiHorizonDataset
 import constants as cst
-from constants import SamplingType
+from constants import SamplingType, ProductMode
 torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
 
 
@@ -117,66 +118,106 @@ def train(config: Config, trainer: L.Trainer, run=None):
 
     elif dataset_type == "BATTERY":
         stock = config.dataset.training_stocks[0]
-        if multi_horizon:
-            train_input, train_labels = battery_load_multi(
-                cst.DATA_DIR + f"/{stock}/train.npy",
-                config.model.hyperparameters_fixed["all_features"],
-                cst.LEN_SMOOTH,
-                seq_size,
+        all_features = config.model.hyperparameters_fixed["all_features"]
+        base_dir = cst.DATA_DIR + f"/{stock}"
+        _pm = getattr(config.dataset, "product_mode", "concat")
+        product_mode = ProductMode(_pm) if isinstance(_pm, str) else _pm
+
+        if product_mode == ProductMode.PER_PRODUCT:
+            with open(os.path.join(base_dir, "per_product", "products.json")) as f:
+                products = json.load(f)
+
+            train_datasets = []
+            val_datasets = []
+            test_datasets = []
+
+            for product in products:
+                product_dir = os.path.join(base_dir, "per_product", "products", product)
+
+                for split in ("train", "val", "test"):
+                    path = os.path.join(product_dir, f"{split}.npy")
+                    if not os.path.exists(path):
+                        continue
+                    try:
+                        if multi_horizon:
+                            inp, lab = battery_load_multi(path, all_features, cst.LEN_SMOOTH, seq_size)
+                        else:
+                            inp, lab = battery_load(path, all_features, cst.LEN_SMOOTH, horizon, seq_size)
+                    except ValueError:
+                        continue  # product too small for seq_size / horizon
+                    if inp.shape[0] == 0:
+                        continue
+
+                    ds = (MultiHorizonDataset(inp, lab, seq_size) if multi_horizon
+                          else Dataset(inp, lab, seq_size))
+
+                    if split == "train":
+                        train_datasets.append(ds)
+                    elif split == "val":
+                        val_datasets.append(ds)
+                    else:
+                        test_datasets.append(ds)
+
+            if not train_datasets:
+                raise RuntimeError("[BATTERY] No training data found in per_product mode")
+            if not val_datasets:
+                raise RuntimeError("[BATTERY] No validation data found in per_product mode")
+            if not test_datasets:
+                raise RuntimeError("[BATTERY] No test data found in per_product mode")
+
+            test_loaders = [DataLoader(
+                dataset=ConcatDataset(test_datasets),
+                batch_size=config.dataset.batch_size * 4,
+                shuffle=False,
+                pin_memory=True,
+                drop_last=False,
+                num_workers=4,
+                persistent_workers=True,
+                multiprocessing_context="spawn",
+            )]
+
+            train_set = ConcatDataset(train_datasets)
+            val_set = ConcatDataset(val_datasets)
+            # Expose train_input for num_features used by model instantiation
+            train_input = train_datasets[0].x
+            data_module = DataModule(
+                train_set=train_set,
+                val_set=val_set,
+                batch_size=config.dataset.batch_size,
+                test_batch_size=config.dataset.batch_size * 4,
+                num_workers=4,
             )
-            val_input, val_labels = battery_load_multi(
-                cst.DATA_DIR + f"/{stock}/val.npy",
-                config.model.hyperparameters_fixed["all_features"],
-                cst.LEN_SMOOTH,
-                seq_size,
-            )
-            test_input, test_labels = battery_load_multi(
-                cst.DATA_DIR + f"/{stock}/test.npy",
-                config.model.hyperparameters_fixed["all_features"],
-                cst.LEN_SMOOTH,
-                seq_size,
-            )
-            train_set = MultiHorizonDataset(train_input, train_labels, seq_size)
-            val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
-            test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
+
         else:
-            train_input, train_labels = battery_load(
-                cst.DATA_DIR + f"/{stock}/train.npy",
-                config.model.hyperparameters_fixed["all_features"],
-                cst.LEN_SMOOTH,
-                horizon,
-                seq_size,
+            # concat mode (default)
+            concat_dir = base_dir + "/concat"
+            if multi_horizon:
+                train_input, train_labels = battery_load_multi(concat_dir + "/train.npy", all_features, cst.LEN_SMOOTH, seq_size)
+                val_input, val_labels = battery_load_multi(concat_dir + "/val.npy", all_features, cst.LEN_SMOOTH, seq_size)
+                test_input, test_labels = battery_load_multi(concat_dir + "/test.npy", all_features, cst.LEN_SMOOTH, seq_size)
+                train_set = MultiHorizonDataset(train_input, train_labels, seq_size)
+                val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
+                test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
+            else:
+                train_input, train_labels = battery_load(concat_dir + "/train.npy", all_features, cst.LEN_SMOOTH, horizon, seq_size)
+                val_input, val_labels = battery_load(concat_dir + "/val.npy", all_features, cst.LEN_SMOOTH, horizon, seq_size)
+                test_input, test_labels = battery_load(concat_dir + "/test.npy", all_features, cst.LEN_SMOOTH, horizon, seq_size)
+                train_set = Dataset(train_input, train_labels, seq_size)
+                val_set = Dataset(val_input, val_labels, seq_size)
+                test_set = Dataset(test_input, test_labels, seq_size)
+            if config.experiment.is_debug:
+                train_set.length = 1000
+                val_set.length = 1000
+                test_set.length = 10000
+            data_module = DataModule(
+                train_set=train_set,
+                val_set=val_set,
+                test_set=test_set,
+                batch_size=config.dataset.batch_size,
+                test_batch_size=config.dataset.batch_size * 4,
+                num_workers=4,
             )
-            val_input, val_labels = battery_load(
-                cst.DATA_DIR + f"/{stock}/val.npy",
-                config.model.hyperparameters_fixed["all_features"],
-                cst.LEN_SMOOTH,
-                horizon,
-                seq_size,
-            )
-            test_input, test_labels = battery_load(
-                cst.DATA_DIR + f"/{stock}/test.npy",
-                config.model.hyperparameters_fixed["all_features"],
-                cst.LEN_SMOOTH,
-                horizon,
-                seq_size,
-            )
-            train_set = Dataset(train_input, train_labels, seq_size)
-            val_set = Dataset(val_input, val_labels, seq_size)
-            test_set = Dataset(test_input, test_labels, seq_size)
-        if config.experiment.is_debug:
-            train_set.length = 1000
-            val_set.length = 1000
-            test_set.length = 10000
-        data_module = DataModule(
-            train_set=train_set,
-            val_set=val_set,
-            test_set=test_set,
-            batch_size=config.dataset.batch_size,
-            test_batch_size=config.dataset.batch_size * 4,
-            num_workers=4,
-        )
-        test_loaders = [data_module.test_dataloader()]
+            test_loaders = [data_module.test_dataloader()]
         
     elif dataset_type == "LOBSTER":
         training_stocks = config.dataset.training_stocks
@@ -255,17 +296,22 @@ def train(config: Config, trainer: L.Trainer, run=None):
     else:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
     
-    counts_train = torch.unique(train_labels, return_counts=True)
-    counts_val = torch.unique(val_labels, return_counts=True)
-    counts_test = torch.unique(test_labels, return_counts=True)
-    print()
-    print("Train set shape: ", train_input.shape)
-    print("Val set shape: ", val_input.shape)
-    print("Test set shape: ", test_input.shape)
-    print(f"Classes distribution in train set: up {(counts_train[1][0].item()/train_labels.shape[0]):.2f} stat {(counts_train[1][1].item()/train_labels.shape[0]):.2f} down {(counts_train[1][2].item()/train_labels.shape[0]):.2f} ", )
-    print(f"Classes distribution in val set: up {(counts_val[1][0].item()/val_labels.shape[0]):.2f} stat {(counts_val[1][1].item()/val_labels.shape[0]):.2f} down {(counts_val[1][2].item()/val_labels.shape[0]):.2f} ", )
-    print(f"Classes distribution in test set: up {(counts_test[1][0].item()/test_labels.shape[0]):.2f} stat {(counts_test[1][1].item()/test_labels.shape[0]):.2f} down {(counts_test[1][2].item()/test_labels.shape[0]):.2f} ", )
-    print()
+    if isinstance(train_set, ConcatDataset):
+        print(f"\nTrain set: {len(train_set)} samples ({len(train_set.datasets)} products)")
+        print(f"Val set:   {len(val_set)} samples ({len(val_set.datasets)} products)")
+        print(f"Test:      {len(test_loaders)} product DataLoaders\n")
+    else:
+        counts_train = torch.unique(train_labels, return_counts=True)
+        counts_val = torch.unique(val_labels, return_counts=True)
+        counts_test = torch.unique(test_labels, return_counts=True)
+        print()
+        print("Train set shape: ", train_input.shape)
+        print("Val set shape: ", val_input.shape)
+        print("Test set shape: ", test_input.shape)
+        print(f"Classes distribution in train set: up {(counts_train[1][0].item()/train_labels.shape[0]):.2f} stat {(counts_train[1][1].item()/train_labels.shape[0]):.2f} down {(counts_train[1][2].item()/train_labels.shape[0]):.2f} ", )
+        print(f"Classes distribution in val set: up {(counts_val[1][0].item()/val_labels.shape[0]):.2f} stat {(counts_val[1][1].item()/val_labels.shape[0]):.2f} down {(counts_val[1][2].item()/val_labels.shape[0]):.2f} ", )
+        print(f"Classes distribution in test set: up {(counts_test[1][0].item()/test_labels.shape[0]):.2f} stat {(counts_test[1][1].item()/test_labels.shape[0]):.2f} down {(counts_test[1][2].item()/test_labels.shape[0]):.2f} ", )
+        print()
     
     experiment_type = config.experiment.type
     if "FINETUNING" in experiment_type or "EVALUATION" in experiment_type:
@@ -580,6 +626,8 @@ def run_wandb(config: Config, accelerator):
                 run.log({"sampling_time": config.dataset.sampling_time}, commit=False)
             elif config.dataset.sampling_type == SamplingType.QUANTITY:
                 run.log({"sampling_quantity": config.dataset.sampling_quantity}, commit=False)
+        if config.dataset.type == cst.DatasetType.BATTERY:
+            run.log({"product_mode": config.dataset.product_mode.value}, commit=False)
         train(config, trainer, run)
         run.finish()
 

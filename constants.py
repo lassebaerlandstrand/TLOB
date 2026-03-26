@@ -19,6 +19,10 @@ class SamplingType(Enum):
     QUANTITY = "quantity"
     NONE = "none"
 
+class ProductMode(Enum):
+    CONCAT = "concat"
+    PER_PRODUCT = "per_product"
+
 
 
 # for 15 days of TSLA

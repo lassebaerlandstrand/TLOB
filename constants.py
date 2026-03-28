@@ -16,6 +16,7 @@ class ModelType(Enum):
     
 class SamplingType(Enum):
     TIME = "time"
+    TIME_DEDUP = "time_dedup"
     QUANTITY = "quantity"
     NONE = "none"
 

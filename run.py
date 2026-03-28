@@ -675,7 +675,7 @@ def run_wandb(config: Config, accelerator):
         run.log({"num_dates": f"{num_days} ({dates[0]} - {dates[1]})"}, commit=False)
         if hasattr(config.dataset, "sampling_type"):
             run.log({"sampling_type": config.dataset.sampling_type.value}, commit=False)
-            if config.dataset.sampling_type == SamplingType.TIME:
+            if config.dataset.sampling_type in (SamplingType.TIME, SamplingType.TIME_DEDUP):
                 run.log({"sampling_time": config.dataset.sampling_time}, commit=False)
             elif config.dataset.sampling_type == SamplingType.QUANTITY:
                 run.log({"sampling_quantity": config.dataset.sampling_quantity}, commit=False)

@@ -33,7 +33,7 @@ import torch
 from tqdm import tqdm
 
 import constants as cst
-from constants import ProductMode
+from constants import ProductMode, SamplingType
 from utils.utils_data import labeling, normalize_messages, z_score_orderbook
 
 log = logging.getLogger(__name__)
@@ -231,6 +231,8 @@ class BatteryDataBuilder:
         self.max_lob_depth = max_lob_depth
         self.all_features = all_features
         self.force_rebuild = force_rebuild
+        self.sampling_type = sampling_type
+        self.dedup = (sampling_type == SamplingType.TIME_DEDUP)
         self.n_lob_levels = cst.N_LOB_LEVELS  # 10
 
     # ── Public entry point ────────────────────────────────────────────────────
@@ -242,6 +244,7 @@ class BatteryDataBuilder:
         print(f"  Sampling   : {self.sampling_seconds}s")
         print(f"  Mode       : {self.product_mode}")
         print(f"  Features   : {'LOB + messages (50 cols)' if self.all_features else 'LOB only (44 cols)'}")
+        print(f"  Dedup      : {self.dedup}")
 
         # ── Stage 1: Parse raw EPEX zips to CSV ──────────────────────────────
         print(f"\n[BATTERY] Stage 1/4: Parsing raw EPEX data to CSV...")
@@ -355,7 +358,8 @@ class BatteryDataBuilder:
         import hashlib
         key = (
             f"{self.start_date}_{self.end_date}"
-            f"_{self.sampling_seconds}_{self.max_lob_depth}_{self.all_features}"
+            f"_{self.sampling_seconds}_{self.max_lob_depth}"
+            f"_{self.all_features}_{self.sampling_type.value}"
         )
         return hashlib.md5(key.encode()).hexdigest()[:12]
 
@@ -499,13 +503,20 @@ class BatteryDataBuilder:
                         if lob_row is None:
                             continue
 
+                        prev_lob = prev_lob_per_product.get(delivery_time)
+                        prev_ts  = prev_time_per_product.get(delivery_time, current_time)
+
+                        # Dedup: skip if LOB unchanged since last kept snapshot
+                        if self.dedup and prev_lob is not None and np.array_equal(lob_row, prev_lob):
+                            continue
+
                         msg_row = None
                         if self.all_features:
-                            prev_lob = prev_lob_per_product.get(delivery_time)
-                            prev_ts  = prev_time_per_product.get(delivery_time, current_time)
-                            msg_row  = self._synthesize_message_features(lob_row, prev_lob, prev_ts, current_time)
-                            prev_lob_per_product[delivery_time] = lob_row
-                            prev_time_per_product[delivery_time] = current_time
+                            msg_row = self._synthesize_message_features(lob_row, prev_lob, prev_ts, current_time)
+
+                        # Always update tracking (for both dedup and message features)
+                        prev_lob_per_product[delivery_time] = lob_row
+                        prev_time_per_product[delivery_time] = current_time
 
                         day_buffer.append({
                             "snapshot_time": current_time,

@@ -112,9 +112,9 @@ class BTC(Dataset):
 @dataclass
 class BATTERY(Dataset):
     type: DatasetType = DatasetType.BATTERY
-    dates: list = field(default_factory=lambda: ["2021-01-11", "2021-01-22"])
-    sampling_type: SamplingType = SamplingType.TIME
-    sampling_time: str = "10s"
+    dates: list = field(default_factory=lambda: ["2021-01-11", "2021-04-09"])
+    sampling_type: SamplingType = SamplingType.TIME_DEDUP
+    sampling_time: str = "20s"
     sampling_quantity: int = 0
     batch_size: int = 128
     training_stocks: list = field(default_factory=lambda: ["battery_markets"])

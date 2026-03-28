@@ -1,3 +1,4 @@
+from datetime import datetime
 import json
 import lightning as L
 import omegaconf
@@ -13,7 +14,7 @@ from models.engine import Engine
 from preprocessing.fi_2010 import fi_2010_load, fi_2010_load_multi
 from preprocessing.lobster import lobster_load, lobster_load_multi
 from preprocessing.btc import btc_load, btc_load_multi
-from preprocessing.battery import battery_load, battery_load_multi
+from preprocessing.battery import battery_load, battery_load_multi, battery_cache_subdir
 from preprocessing.dataset import Dataset, DataModule, MultiHorizonDataset
 import constants as cst
 from constants import SamplingType, ProductMode
@@ -122,9 +123,17 @@ def train(config: Config, trainer: L.Trainer, run=None):
         base_dir = cst.DATA_DIR + f"/{stock}"
         _pm = getattr(config.dataset, "product_mode", "concat")
         product_mode = ProductMode(_pm) if isinstance(_pm, str) else _pm
+        cache_sub = battery_cache_subdir(config.dataset.sampling_time, config.dataset.dates)
 
         if product_mode == ProductMode.PER_PRODUCT:
-            with open(os.path.join(base_dir, "per_product", "products.json")) as f:
+            pp_dir = os.path.join(base_dir, "per_product", cache_sub)
+            if not os.path.isdir(pp_dir):
+                raise FileNotFoundError(
+                    f"[BATTERY] No preprocessed data for sampling_time={config.dataset.sampling_time}, "
+                    f"dates={config.dataset.dates} at {pp_dir}. "
+                    f"Run with is_data_preprocessed=False to build it."
+                )
+            with open(os.path.join(pp_dir, "products.json")) as f:
                 products = json.load(f)
 
             train_datasets = []
@@ -132,7 +141,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
             test_datasets = []
 
             for product in products:
-                product_dir = os.path.join(base_dir, "per_product", "products", product)
+                product_dir = os.path.join(pp_dir, "products", product)
 
                 for split in ("train", "val", "test"):
                     path = os.path.join(product_dir, f"{split}.npy")
@@ -145,7 +154,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                             inp, lab = battery_load(path, all_features, cst.LEN_SMOOTH, horizon, seq_size)
                     except ValueError:
                         continue  # product too small for seq_size / horizon
-                    if inp.shape[0] == 0:
+                    if inp.shape[0] < seq_size:
                         continue
 
                     ds = (MultiHorizonDataset(inp, lab, seq_size) if multi_horizon
@@ -190,7 +199,13 @@ def train(config: Config, trainer: L.Trainer, run=None):
 
         else:
             # concat mode (default)
-            concat_dir = base_dir + "/concat"
+            concat_dir = os.path.join(base_dir, "concat", cache_sub)
+            if not os.path.isdir(concat_dir):
+                raise FileNotFoundError(
+                    f"[BATTERY] No preprocessed data for sampling_time={config.dataset.sampling_time}, "
+                    f"dates={config.dataset.dates} at {concat_dir}. "
+                    f"Run with is_data_preprocessed=False to build it."
+                )
             if multi_horizon:
                 train_input, train_labels = battery_load_multi(concat_dir + "/train.npy", all_features, cst.LEN_SMOOTH, seq_size)
                 val_input, val_labels = battery_load_multi(concat_dir + "/val.npy", all_features, cst.LEN_SMOOTH, seq_size)
@@ -313,6 +328,45 @@ def train(config: Config, trainer: L.Trainer, run=None):
         print(f"Classes distribution in test set: up {(counts_test[1][0].item()/test_labels.shape[0]):.2f} stat {(counts_test[1][1].item()/test_labels.shape[0]):.2f} down {(counts_test[1][2].item()/test_labels.shape[0]):.2f} ", )
         print()
     
+    # Log dataset stats to wandb
+    if run is not None:
+        n_train = len(train_set)
+        run.log({"n_train_rows": n_train}, commit=False)
+
+        # Gather all test labels
+        if isinstance(train_set, ConcatDataset):
+            test_concat = test_loaders[0].dataset
+            all_test_labels = []
+            for ds in test_concat.datasets:
+                y = ds.y_multi if hasattr(ds, "y_multi") else ds.y
+                all_test_labels.append(y[:len(ds)])
+            all_test_labels = torch.cat(all_test_labels, dim=0)
+        else:
+            all_test_labels = test_labels
+
+        # Compute average label distribution across horizons
+        if all_test_labels.dim() == 2:
+            up_pcts, stat_pcts, down_pcts = [], [], []
+            for h_idx in range(all_test_labels.shape[1]):
+                col = all_test_labels[:, h_idx].float()
+                n = col.shape[0]
+                up_pcts.append((col == 0).sum().item() / n)
+                stat_pcts.append((col == 1).sum().item() / n)
+                down_pcts.append((col == 2).sum().item() / n)
+            test_up = sum(up_pcts) / len(up_pcts)
+            test_stat = sum(stat_pcts) / len(stat_pcts)
+            test_down = sum(down_pcts) / len(down_pcts)
+        else:
+            n = all_test_labels.shape[0]
+            test_up = (all_test_labels == 0).sum().item() / n
+            test_stat = (all_test_labels == 1).sum().item() / n
+            test_down = (all_test_labels == 2).sum().item() / n
+
+        run.log({"test_label_up_pct": test_up}, commit=False)
+        run.log({"test_label_stat_pct": test_stat}, commit=False)
+        run.log({"test_label_down_pct": test_down}, commit=False)
+        print(f"Logged to wandb: n_train_rows={n_train}, test_labels: up={test_up:.3f} stat={test_stat:.3f} down={test_down:.3f}")
+
     experiment_type = config.experiment.type
     if "FINETUNING" in experiment_type or "EVALUATION" in experiment_type:
         if checkpoint_ref != "":
@@ -616,16 +670,20 @@ def run_wandb(config: Config, accelerator):
         run.log({"seed": config.experiment.seed}, commit=False)
         run.log({"all_features": config.model.hyperparameters_fixed["all_features"]}, commit=False)
         run.log({"multi_horizon": config.experiment.multi_horizon}, commit=False)
-        if config.dataset.type == cst.DatasetType.LOBSTER:
-            for i in range(len(config.dataset.training_stocks)):
-                run.log({f"training stock{i}": config.dataset.training_stocks[i]}, commit=False)
-            for i in range(len(config.dataset.testing_stocks)):
-                run.log({f"testing stock{i}": config.dataset.testing_stocks[i]}, commit=False)
+        dates = config.dataset.dates
+        num_days = (datetime.strptime(dates[1], "%Y-%m-%d") - datetime.strptime(dates[0], "%Y-%m-%d")).days
+        run.log({"num_dates": f"{num_days} ({dates[0]} - {dates[1]})"}, commit=False)
+        if hasattr(config.dataset, "sampling_type"):
             run.log({"sampling_type": config.dataset.sampling_type.value}, commit=False)
             if config.dataset.sampling_type == SamplingType.TIME:
                 run.log({"sampling_time": config.dataset.sampling_time}, commit=False)
             elif config.dataset.sampling_type == SamplingType.QUANTITY:
                 run.log({"sampling_quantity": config.dataset.sampling_quantity}, commit=False)
+        if config.dataset.type == cst.DatasetType.LOBSTER:
+            for i in range(len(config.dataset.training_stocks)):
+                run.log({f"training stock{i}": config.dataset.training_stocks[i]}, commit=False)
+            for i in range(len(config.dataset.testing_stocks)):
+                run.log({f"testing stock{i}": config.dataset.testing_stocks[i]}, commit=False)
         if config.dataset.type == cst.DatasetType.BATTERY:
             run.log({"product_mode": config.dataset.product_mode.value}, commit=False)
         train(config, trainer, run)

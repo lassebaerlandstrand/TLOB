@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Run TLOB/MLPLOB experiments with three modes:
 
-single       - one run for a single --horizon value
-all-horizons - four sequential runs, one per horizon (default)
-multi-horizons- one joint run training all horizons simultaneously
+single         - one run for a single --horizon value
+all-horizons   - four sequential runs, one per horizon (default)
+multi-horizons - one joint run training all horizons simultaneously
+
+Examples:
+  python run_experiments.py --mode multi-horizons --model tlob --dataset battery
+  python run_experiments.py --dataset battery --sampling-time 5s --rebuild-data
+  python run_experiments.py --dataset battery --sampling-time 10s --dates 2021-01-11 2021-01-15
+  python run_experiments.py --dataset battery --mode all-horizons --sampling-time 5s --dry-run
 """
 
 import subprocess
@@ -16,6 +22,7 @@ HORIZONS = [10, 20, 50, 100]
 SEED = 1
 MAX_EPOCHS = 20
 IS_WANDB = "True"
+
 
 def run_command(command, dry_run=False):
     print(f"\nExecuting: {' '.join(command)}")
@@ -45,10 +52,15 @@ def base_command(args, is_preprocessed="True"):
 
 
 def battery_extras(args):
-    return [
+    extras = [
         "dataset.training_stocks=[battery_markets]",
         "dataset.testing_stocks=[battery_markets]",
     ]
+    if args.sampling_time is not None:
+        extras.append(f"dataset.sampling_time={args.sampling_time}")
+    if args.dates is not None:
+        extras.append(f"dataset.dates=[{args.dates[0]},{args.dates[1]}]")
+    return extras
 
 
 def main():
@@ -76,6 +88,10 @@ def main():
     parser.add_argument("--epochs", type=int, default=MAX_EPOCHS, help=f"Max epochs per run (default: {MAX_EPOCHS})")
     parser.add_argument("--rebuild-data", action="store_true", help="Force data preprocessing on the first run.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
+    parser.add_argument("--sampling-time", type=str, default=None,
+                        help="Battery sampling interval (e.g. '5s', '10s')")
+    parser.add_argument("--dates", type=str, nargs=2, default=None, metavar=("START", "END"),
+                        help="Date range (YYYY-MM-DD)")
 
     args = parser.parse_args()
 

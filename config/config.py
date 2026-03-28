@@ -119,7 +119,7 @@ class BATTERY(Dataset):
     batch_size: int = 128
     training_stocks: list = field(default_factory=lambda: ["battery_markets"])
     testing_stocks: list = field(default_factory=lambda: ["battery_markets"])
-    product_mode: ProductMode = ProductMode.CONCAT
+    product_mode: ProductMode = ProductMode.PER_PRODUCT
     market_type: str = "EPEX"
     raw_data_path: str = "data/battery_markets"
     parsed_data_path: str = "data/battery_markets/parsed"

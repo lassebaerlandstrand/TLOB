@@ -146,6 +146,16 @@ def _select_features(msg_cols, lob_cols, all_features: bool, path: str) -> np.nd
     return lob_cols.astype(np.float32)  # (N, 40)
 
 
+def battery_cache_subdir(sampling_time: str, dates: list[str]) -> str:
+    """Return a human-readable subdirectory name encoding sampling_time and dates.
+
+    Example: battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"]) -> "10s_20210111_20210122"
+    """
+    start = dates[0].replace("-", "")
+    end = dates[1].replace("-", "")
+    return f"{sampling_time}_{start}_{end}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BatteryDataBuilder — preprocessing
 # ─────────────────────────────────────────────────────────────────────────────
@@ -204,6 +214,8 @@ class BatteryDataBuilder:
         force_rebuild: bool = False,
     ):
         self.data_dir = data_dir
+        self.sampling_time_str = sampling_time
+        self.date_strs = list(date_trading_days)
         self.start_date = pd.Timestamp(date_trading_days[0], tz="UTC")
         self.end_date   = pd.Timestamp(date_trading_days[1], tz="UTC")
         self.split_rates = split_rates
@@ -239,26 +251,27 @@ class BatteryDataBuilder:
         print(f"\n[BATTERY] Stage 2/4: Converting CSVs to binary format...")
         bin_path = self._convert_csv_to_bins(csv_path)
 
-        # ── Stage 3: Extract LOB snapshots via simulation (cached) ───────────
+        # ── Stage 3: Extract LOB snapshots via simulation (per-day cached) ──
         print(f"\n[BATTERY] Stage 3/4: Extracting LOB snapshots...")
-        cache_path = self._snapshot_cache_path(bin_path)
-        if self.force_rebuild and cache_path.exists():
-            cache_path.unlink()
-            print(f"  [BATTERY] force_rebuild: deleted cached snapshots {cache_path.name}")
-        if cache_path.exists():
-            import pickle
-            print(f"  [BATTERY] Using cached snapshots from {cache_path.name}")
-            with open(cache_path, "rb") as f:
-                snapshots = pickle.load(f)
-            print(f"  Loaded {len(snapshots):,} cached (snapshot, product) pairs")
+        cache_hash = self._snapshot_cache_hash()
+        days = list(pd.date_range(self.start_date, self.end_date, freq="D"))
+        day_paths = [self._day_cache_path(bin_path, d.date(), cache_hash) for d in days]
+
+        if self.force_rebuild:
+            snap_dir = bin_path.parent / "snap_cache" / cache_hash
+            if snap_dir.exists():
+                shutil.rmtree(snap_dir)
+                print(f"  [BATTERY] force_rebuild: deleted cache dir {snap_dir}")
+
+        all_cached = all(p.exists() for p in day_paths)
+        if all_cached:
+            print(f"  [BATTERY] Using cached per-day snapshots (hash={cache_hash})")
+            snapshots = self._load_day_caches(day_paths)
         else:
-            snapshots = self._extract_all_snapshots(bin_path)
-            if not snapshots:
-                raise ValueError("No LOB snapshots extracted. Check raw data and date range.")
-            import pickle
-            with open(cache_path, "wb") as f:
-                pickle.dump(snapshots, f)
-            print(f"  Extracted and cached {len(snapshots):,} (snapshot, product) pairs → {cache_path.name}")
+            snapshots = self._extract_all_snapshots(bin_path, cache_hash)
+
+        if snapshots["lobs"].shape[0] == 0:
+            raise ValueError("No LOB snapshots extracted. Check raw data and date range.")
 
         # ── Stage 4: Split, label, normalise, save ────────────────────────────
         print(f"\n[BATTERY] Stage 4/4: Building datasets...")
@@ -337,31 +350,80 @@ class BatteryDataBuilder:
 
     # ── Stage 3: Extract LOB snapshots ───────────────────────────────────────
 
-    def _snapshot_cache_path(self, bin_path: Path) -> Path:
-        """Return a deterministic path for the Stage 3 snapshot cache.
-
-        Key includes all parameters that affect snapshot content so that changing
-        sampling_seconds, max_lob_depth, or all_features invalidates the cache.
-        """
+    def _snapshot_cache_hash(self) -> str:
+        """Return deterministic hash for Stage 3 per-day cache keying."""
         import hashlib
         key = (
             f"{self.start_date}_{self.end_date}"
             f"_{self.sampling_seconds}_{self.max_lob_depth}_{self.all_features}"
         )
-        h = hashlib.md5(key.encode()).hexdigest()[:12]
-        return bin_path.parent / f"snapshots_cache_{h}.pkl"
+        return hashlib.md5(key.encode()).hexdigest()[:12]
 
-    def _extract_all_snapshots(self, bin_path: Path) -> list[dict]:
-        """Run bitepy Simulation over the date range, extracting LOB snapshots.
+    def _day_cache_path(self, bin_path: Path, day_date, cache_hash: str) -> Path:
+        """Return path for a single observation day's snapshot cache."""
+        snap_dir = bin_path.parent / "snap_cache" / cache_hash
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        return snap_dir / f"{day_date}.npz"
+
+    def _flush_day_buffer(self, day_buffer: list[dict], path: Path) -> None:
+        """Convert a day's snapshot dicts to numpy arrays and save to .npz."""
+        if not day_buffer:
+            return
+        lobs = np.array([s["lob"] for s in day_buffer], dtype=np.float32)
+        snap_times = np.array([s["snapshot_time"].value for s in day_buffer], dtype=np.int64)
+        deliv_times = np.array([s["delivery_time"].value for s in day_buffer], dtype=np.int64)
+        deliv_dates = np.array(
+            [s["delivery_date"].toordinal() for s in day_buffer], dtype=np.int32
+        )
+        save_kw: dict[str, np.ndarray] = dict(
+            lobs=lobs, snap_times=snap_times,
+            deliv_times=deliv_times, deliv_dates=deliv_dates,
+        )
+        if day_buffer[0].get("msg") is not None:
+            save_kw["msgs"] = np.array(
+                [s["msg"] for s in day_buffer], dtype=np.float32
+            )
+        np.savez(path, **save_kw)
+
+    def _load_day_caches(self, day_paths: list[Path]) -> dict[str, np.ndarray]:
+        """Load and concatenate all per-day .npz cache files."""
+        all_lobs, all_snap, all_deliv, all_dd, all_msgs = [], [], [], [], []
+        has_msgs = False
+        for p in day_paths:
+            data = np.load(p)
+            all_lobs.append(data["lobs"])
+            all_snap.append(data["snap_times"])
+            all_deliv.append(data["deliv_times"])
+            all_dd.append(data["deliv_dates"])
+            if "msgs" in data:
+                all_msgs.append(data["msgs"])
+                has_msgs = True
+        result: dict[str, np.ndarray] = {
+            "lobs": np.concatenate(all_lobs) if all_lobs else np.empty((0, self.n_lob_levels * 4), dtype=np.float32),
+            "snap_times": np.concatenate(all_snap) if all_snap else np.empty(0, dtype=np.int64),
+            "deliv_times": np.concatenate(all_deliv) if all_deliv else np.empty(0, dtype=np.int64),
+            "deliv_dates": np.concatenate(all_dd) if all_dd else np.empty(0, dtype=np.int32),
+        }
+        if has_msgs:
+            result["msgs"] = np.concatenate(all_msgs)
+        n = result["lobs"].shape[0]
+        print(f"  Loaded {n:,} cached (snapshot, product) pairs from {len(day_paths)} day files")
+        return result
+
+    def _extract_all_snapshots(self, bin_path: Path, cache_hash: str) -> dict[str, np.ndarray]:
+        """Run bitepy Simulation, flushing snapshots to per-day .npz files.
+
+        Each observation day's snapshots are converted to numpy arrays and saved
+        to disk immediately, keeping peak memory bounded to one day's data.
 
         Returns
         -------
-        list of dicts, each with keys:
-            snapshot_time  : pd.Timestamp (UTC) — when the snapshot was taken
-            delivery_time  : pd.Timestamp (UTC) — delivery start of the product
-            delivery_date  : datetime.date       — date of delivery (for splitting)
-            lob            : list[float] length 40 — [sell1,vsell1,buy1,vbuy1,...]
-            msg            : list[float] length 6 or None — synthesised message features
+        dict with keys:
+            snap_times  : int64 (N,) — nanoseconds since epoch
+            deliv_times : int64 (N,)
+            deliv_dates : int32 (N,) — date ordinals
+            lobs        : float32 (N, 40)
+            msgs        : float32 (N, 6) — only present when all_features=True
         """
         import bitepy
 
@@ -394,17 +456,21 @@ class BatteryDataBuilder:
         sim.add_bin_to_orderqueue(all_bins[bin_idx])
         bin_idx += 1
 
-        snapshots = []
         current_time = self.start_date
         interval = pd.Timedelta(seconds=self.sampling_seconds)
         _GATE_CLOSURE = pd.Timedelta(minutes=5)  # EPEX gate closure before delivery
+
+        # Per-day buffer — flushed to disk at each day boundary to bound memory
+        day_buffer: list[dict] = []
+        day_paths = [self._day_cache_path(bin_path, d.date(), cache_hash) for d in days]
+        total_flushed = 0
 
         # Outer tqdm: one step per calendar day
         day_bar = tqdm(days, desc="Extracting LOB snapshots", unit="day")
         day_idx = 0
 
         # Pre-track prev_lob per delivery product for message feature synthesis
-        prev_lob_per_product: dict[pd.Timestamp, list[float]] = {}
+        prev_lob_per_product: dict[pd.Timestamp, np.ndarray] = {}
         prev_time_per_product: dict[pd.Timestamp, pd.Timestamp] = {}
 
         while current_time < actual_end:
@@ -441,7 +507,7 @@ class BatteryDataBuilder:
                             prev_lob_per_product[delivery_time] = lob_row
                             prev_time_per_product[delivery_time] = current_time
 
-                        snapshots.append({
+                        day_buffer.append({
                             "snapshot_time": current_time,
                             "delivery_time": delivery_time,
                             "delivery_date": delivery_time.date(),
@@ -457,14 +523,25 @@ class BatteryDataBuilder:
                 else:
                     break  # All bins exhausted; end early
 
-            # Advance day bar when we cross into a new calendar day
+            # Advance day bar when we cross into a new calendar day;
+            # flush the day buffer to disk at each boundary to bound memory.
             next_day_boundary = self.start_date + pd.Timedelta(days=day_idx + 1)
             while day_idx < len(days) and stop_at >= next_day_boundary:
+                if day_buffer:
+                    self._flush_day_buffer(day_buffer, day_paths[day_idx])
+                    total_flushed += len(day_buffer)
+                    day_buffer = []
                 day_bar.update(1)
                 day_idx += 1
                 next_day_boundary = self.start_date + pd.Timedelta(days=day_idx + 1)
 
             current_time = stop_at
+
+        # Flush any remaining snapshots (last day)
+        if day_buffer and day_idx < len(day_paths):
+            self._flush_day_buffer(day_buffer, day_paths[min(day_idx, len(day_paths) - 1)])
+            total_flushed += len(day_buffer)
+            day_buffer = []
 
         # Flush remaining day bar ticks
         while day_idx < len(days):
@@ -472,13 +549,15 @@ class BatteryDataBuilder:
             day_idx += 1
         day_bar.close()
 
-        print(f"  Extracted {len(snapshots):,} snapshots (post-gate-closure snapshots skipped inline)")
+        print(f"  Extracted and saved {total_flushed:,} snapshots across {len(days)} day files")
 
-        return snapshots
+        # Load all per-day files and return concatenated arrays
+        existing_paths = [p for p in day_paths if p.exists()]
+        return self._load_day_caches(existing_paths)
 
     # ── Helpers: LOB aggregation ──────────────────────────────────────────────
 
-    def _aggregate_to_levels_numpy(self, product_data: dict) -> list[float] | None:
+    def _aggregate_to_levels_numpy(self, product_data: dict) -> np.ndarray | None:
         """Aggregate individual orders into top-N price levels using numpy.
 
         Accepts the per-product dict from get_limit_order_book_state(return_dict=True).
@@ -486,7 +565,7 @@ class BatteryDataBuilder:
         We use np.add.reduceat to aggregate consecutive same-price entries in O(N),
         avoiding pandas groupby overhead.
 
-        Returns flat list [sell1, vsell1, buy1, vbuy1, ...] of length 40,
+        Returns float32 ndarray [sell1, vsell1, buy1, vbuy1, ...] of length 40,
         or None if either side is empty at level 1.
         """
         sell_prices  = np.asarray(product_data["sell_prices"],  dtype=np.float64)
@@ -523,7 +602,7 @@ class BatteryDataBuilder:
         if row[1] == 0.0 or row[3] == 0.0:  # vsell1 or vbuy1 == 0
             return None
 
-        return row
+        return np.array(row, dtype=np.float32)
 
     @staticmethod
     def _reduceat_aggregate(
@@ -579,40 +658,62 @@ class BatteryDataBuilder:
 
     # ── Stage 4a: Concat mode ─────────────────────────────────────────────────
 
-    def _build_concat_datasets(self, snapshots: list[dict]):
+    def _build_concat_datasets(self, snapshots: dict[str, np.ndarray]):
         """Build train/val/test.npy with all products interleaved chronologically."""
-        # Sort by snapshot_time then delivery_time
-        snapshots = sorted(snapshots, key=lambda s: (s["snapshot_time"], s["delivery_time"]))
+        import datetime as _dt
+
+        snap_times  = snapshots["snap_times"]
+        deliv_times = snapshots["deliv_times"]
+        lobs        = snapshots["lobs"]
+        msgs        = snapshots.get("msgs")
+
+        # Sort by (snapshot_time, delivery_time)
+        sort_idx = np.lexsort((deliv_times, snap_times))
+        snap_times  = snap_times[sort_idx]
+        deliv_times = deliv_times[sort_idx]
+        lobs        = lobs[sort_idx]
+        if msgs is not None:
+            msgs = msgs[sort_idx]
+
+        # Derive observation day ordinals from snap_times (int64 ns since epoch)
+        _EPOCH_ORD = _dt.date(1970, 1, 1).toordinal()
+        _NS_PER_DAY = 86400 * 10**9
+        obs_date_ord = (snap_times // _NS_PER_DAY + _EPOCH_ORD).astype(np.int32)
 
         # Determine split by observation day
-        obs_days = sorted({s["snapshot_time"].date() for s in snapshots})
+        unique_obs_ord = np.unique(obs_date_ord)
+        obs_days = sorted([_dt.date.fromordinal(int(o)) for o in unique_obs_ord])
         train_days, val_days, test_days = self._split_day_list(obs_days)
-        train_set = set(train_days)
-        val_set   = set(val_days)
-        test_set  = set(test_days)
 
         print(f"  Concat split — train: {len(train_days)} days, val: {len(val_days)} days, test: {len(test_days)} days")
 
-        splits = {"train": [], "val": [], "test": []}
-        for s in snapshots:
-            day = s["snapshot_time"].date()
-            if day in train_set:
-                splits["train"].append(s)
-            elif day in val_set:
-                splits["val"].append(s)
-            elif day in test_set:
-                splits["test"].append(s)
+        train_ord = np.array([d.toordinal() for d in train_days], dtype=np.int32)
+        val_ord   = np.array([d.toordinal() for d in val_days], dtype=np.int32)
+        test_ord  = np.array([d.toordinal() for d in test_days], dtype=np.int32)
 
-        for split_name, count in [(k, len(v)) for k, v in splits.items()]:
-            print(f"  {split_name}: {count:,} snapshots")
+        train_mask = np.isin(obs_date_ord, train_ord)
+        val_mask   = np.isin(obs_date_ord, val_ord)
+        test_mask  = np.isin(obs_date_ord, test_ord)
 
-        out_dir = Path(self.data_dir) / "battery_markets" / "concat"
+        print(f"  train: {train_mask.sum():,} snapshots")
+        print(f"  val: {val_mask.sum():,} snapshots")
+        print(f"  test: {test_mask.sum():,} snapshots")
+
+        subdir = battery_cache_subdir(self.sampling_time_str, self.date_strs)
+        out_dir = Path(self.data_dir) / "battery_markets" / "concat" / subdir
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build feature arrays
-        train_features, train_raw_lob = self._snapshots_to_arrays(splits["train"])
-        val_features,   val_raw_lob   = self._snapshots_to_arrays(splits["val"])
-        test_features,  test_raw_lob  = self._snapshots_to_arrays(splits["test"])
+        # Build feature arrays directly from numpy slices
+        def _make_features(mask):
+            raw_lob = lobs[mask].astype(np.float32)
+            if self.all_features and msgs is not None:
+                m = msgs[mask].astype(np.float32)
+                return np.concatenate([m, raw_lob], axis=1), raw_lob
+            return raw_lob, raw_lob
+
+        train_features, train_raw_lob = _make_features(train_mask)
+        val_features,   val_raw_lob   = _make_features(val_mask)
+        test_features,  test_raw_lob  = _make_features(test_mask)
 
         # Compute labels on raw LOB (before normalisation)
         print("  Computing labels...")
@@ -635,31 +736,37 @@ class BatteryDataBuilder:
 
     # ── Stage 4b: Per-product mode ────────────────────────────────────────────
 
-    def _build_per_product_datasets(self, snapshots: list[dict]):
-        """Build one .npy per unique delivery contract, plus concat backward-compat files."""
-        # Group by delivery contract key (e.g. "2021-01-05_H14")
-        by_product: dict[str, list[dict]] = {}
-        for s in snapshots:
-            key = self._delivery_key(s["delivery_time"])
-            by_product.setdefault(key, []).append(s)
+    def _build_per_product_datasets(self, snapshots: dict[str, np.ndarray]):
+        """Build one .npy per unique delivery contract from numpy arrays."""
+        import datetime as _dt
+
+        snap_times  = snapshots["snap_times"]     # int64 (N,)
+        deliv_times = snapshots["deliv_times"]    # int64 (N,)
+        deliv_dates = snapshots["deliv_dates"]    # int32 (N,) ordinals
+        lobs        = snapshots["lobs"]           # float32 (N, 40)
+        msgs        = snapshots.get("msgs")       # float32 (N, 6) or None
+
+        # Group by unique delivery contract (one per delivery_time)
+        unique_dt, inverse = np.unique(deliv_times, return_inverse=True)
 
         # Determine split assignment by delivery date
-        delivery_dates = sorted({s["delivery_date"] for s in snapshots})
-        train_days, val_days, test_days = self._split_day_list(delivery_dates)
-        train_set = set(train_days)
-        val_set   = set(val_days)
-        test_set  = set(test_days)
+        unique_dd_ord = np.unique(deliv_dates)
+        unique_dd = sorted([_dt.date.fromordinal(int(o)) for o in unique_dd_ord])
+        train_days, val_days, test_days = self._split_day_list(unique_dd)
+        train_ord_set = {d.toordinal() for d in train_days}
+        val_ord_set   = {d.toordinal() for d in val_days}
+        test_ord_set  = {d.toordinal() for d in test_days}
 
         print(f"  Per-product split — train: {len(train_days)} delivery days, "
               f"val: {len(val_days)}, test: {len(test_days)}")
-        print(f"  Total unique delivery contracts: {len(by_product)}")
+        print(f"  Total unique delivery contracts: {len(unique_dt)}")
 
-        out_root = Path(self.data_dir) / "battery_markets" / "per_product"
+        subdir = battery_cache_subdir(self.sampling_time_str, self.date_strs)
+        out_root = Path(self.data_dir) / "battery_markets" / "per_product" / subdir
         out_root.mkdir(parents=True, exist_ok=True)
         products_dir = out_root / "products"
 
-        # Remove stale outputs from previous runs so re-split or changed
-        # all_features does not leave behind conflicting .npy files.
+        # Remove stale outputs from previous runs
         if products_dir.exists():
             shutil.rmtree(products_dir)
             print("  Cleaned stale products directory")
@@ -670,109 +777,92 @@ class BatteryDataBuilder:
 
         products_dir.mkdir(parents=True, exist_ok=True)
 
-        product_keys = sorted(by_product.keys())
-        all_train: list[dict] = []
-        all_val:   list[dict] = []
-        all_test:  list[dict] = []
-
-        # Pass 1: assign products to splits, collect all_train/val/test
-        product_splits: dict[str, dict] = {}  # key -> {split_name: snaps}
-        for key in product_keys:
-            snaps = sorted(by_product[key], key=lambda s: s["snapshot_time"])
-            delivery_date = snaps[0]["delivery_date"]
-            if delivery_date in train_set:
-                product_splits[key] = {"train": snaps, "val": [], "test": []}
-                all_train.extend(snaps)
-            elif delivery_date in val_set:
-                product_splits[key] = {"train": [], "val": snaps, "test": []}
-                all_val.extend(snaps)
-            elif delivery_date in test_set:
-                product_splits[key] = {"train": [], "val": [], "test": snaps}
-                all_test.extend(snaps)
-            # else: skip products outside requested date range
-
-        # Compute global train normalization stats (so all per-product files share the same scale)
+        # Compute global train normalization stats using a single numpy mask
         print("  Computing global train normalization stats...")
-        all_train_sorted = sorted(all_train, key=lambda s: (s["snapshot_time"], s["delivery_time"]))
-        train_f_global, _ = self._snapshots_to_arrays(all_train_sorted)
-        _, global_stats = self._normalise_features(train_f_global, stats=None)
+        train_ord_arr = np.array(sorted(train_ord_set), dtype=np.int32)
+        train_mask = np.isin(deliv_dates, train_ord_arr)
+        train_lobs_global = lobs[train_mask]  # direct slice — no dict copies
+        if self.all_features and msgs is not None:
+            train_msgs_global = msgs[train_mask]
+            train_features_global = np.concatenate(
+                [train_msgs_global.astype(np.float32), train_lobs_global.astype(np.float32)], axis=1
+            )
+        else:
+            train_features_global = train_lobs_global.astype(np.float32)
+        _, global_stats = self._normalise_features(train_features_global, stats=None)
+        del train_features_global  # free memory
 
-        # Pass 2: save per-product files using global stats
-        for key in tqdm(product_keys, desc="Saving products", unit="contract"):
-            if key not in product_splits:
+        # Save per-product files
+        product_keys_saved: list[str] = []
+        for i in tqdm(range(len(unique_dt)), desc="Saving products", unit="contract"):
+            mask = inverse == i
+            prod_snap_t = snap_times[mask]
+            prod_lobs   = lobs[mask]
+            prod_msgs   = msgs[mask] if msgs is not None else None
+            dd_ord      = int(deliv_dates[mask][0])
+
+            # Determine split
+            if dd_ord in train_ord_set:
+                split_name = "train"
+            elif dd_ord in val_ord_set:
+                split_name = "val"
+            elif dd_ord in test_ord_set:
+                split_name = "test"
+            else:
                 continue
+
+            # Sort by snapshot time (should be in order, but ensure)
+            sort_idx = np.argsort(prod_snap_t, kind="stable")
+            prod_lobs = prod_lobs[sort_idx]
+            if prod_msgs is not None:
+                prod_msgs = prod_msgs[sort_idx]
+
+            delivery_time = pd.Timestamp(int(unique_dt[i]), unit="ns", tz="UTC")
+            key = self._delivery_key(delivery_time)
+
             prod_dir = products_dir / key
             prod_dir.mkdir(exist_ok=True)
-            self._save_product(product_splits[key], prod_dir, global_stats=global_stats)
+            self._save_product_arrays(split_name, prod_lobs, prod_msgs, prod_dir, global_stats)
+            product_keys_saved.append(key)
 
         # Save manifest at root level (read by run.py)
-        manifest = sorted(product_splits.keys())
+        manifest = sorted(product_keys_saved)
         with open(out_root / "products.json", "w") as f:
             json.dump(manifest, f, indent=2)
 
-        print(f"  Saved {len(product_splits)} product directories under {products_dir}")
+        print(f"  Saved {len(product_keys_saved)} product directories under {products_dir}")
 
-        # Build and save backward-compat concat files using the same global train stats
-        print("  Building backward-compat concat files...")
-        all_val_sorted  = sorted(all_val,  key=lambda s: (s["snapshot_time"], s["delivery_time"]))
-        all_test_sorted = sorted(all_test, key=lambda s: (s["snapshot_time"], s["delivery_time"]))
-
-        val_f,  val_raw  = self._snapshots_to_arrays(all_val_sorted)
-        test_f, test_raw = self._snapshots_to_arrays(all_test_sorted)
-        _, train_raw_global = self._snapshots_to_arrays(all_train_sorted)
-
-        print("  Computing labels for concat files...")
-        train_labels = self._build_labels(train_raw_global)
-        val_labels   = self._build_labels(val_raw)
-        test_labels  = self._build_labels(test_raw)
-
-        print("  Normalising concat files...")
-        train_norm, _ = self._normalise_features(train_f_global, stats=global_stats)
-        val_norm,   _ = self._normalise_features(val_f,          stats=global_stats)
-        test_norm,  _ = self._normalise_features(test_f,         stats=global_stats)
-
-        self._save_split(train_norm, train_labels, out_root / "train.npy")
-        self._save_split(val_norm,   val_labels,   out_root / "val.npy")
-        self._save_split(test_norm,  test_labels,  out_root / "test.npy")
-
-        self._validate_and_report(out_root)
-
-    def _save_product(
+    def _save_product_arrays(
         self,
-        split_snaps: dict[str, list[dict]],
+        split_name: str,
+        lobs: np.ndarray,
+        msgs: np.ndarray | None,
         prod_dir: Path,
         global_stats: dict | None = None,
     ):
-        """Build and save train/val/test.npy for one delivery contract.
-
-        Parameters
-        ----------
-        global_stats : dict or None
-            Normalization stats from the global train set. When provided, all
-            per-product files are normalized on the same scale (recommended).
-            When None, each product is normalized independently (legacy behaviour).
-        """
-        # Find which split has data (only one will be non-empty)
-        populated = {k: v for k, v in split_snaps.items() if v}
-        if not populated:
+        """Build and save train/val/test.npy for one delivery contract from arrays."""
+        if lobs.shape[0] == 0:
             return
 
-        ref_split = list(populated.keys())[0]
-        ref_features, ref_raw_lob = self._snapshots_to_arrays(populated[ref_split])
-
-        labels = self._build_labels(ref_raw_lob)
-        if global_stats:
-            norm_features, _ = self._normalise_features(ref_features, stats=global_stats)
+        if self.all_features and msgs is not None:
+            features = np.concatenate(
+                [msgs.astype(np.float32), lobs.astype(np.float32)], axis=1
+            )
         else:
-            norm_features, _, _ = self._normalise_single(ref_features)
-        self._save_split(norm_features, labels, prod_dir / f"{ref_split}.npy")
+            features = lobs.astype(np.float32)
+
+        labels = self._build_labels(lobs.astype(np.float32))
+        if global_stats:
+            norm_features, _ = self._normalise_features(features, stats=global_stats)
+        else:
+            norm_features, _, _ = self._normalise_single(features)
+        self._save_split(norm_features, labels, prod_dir / f"{split_name}.npy")
 
         # Save empty placeholders for the other two splits
-        for split_name in ("train", "val", "test"):
-            path = prod_dir / f"{split_name}.npy"
+        ncols = _NCOLS_FULL if self.all_features else _NCOLS_LOB
+        for sname in ("train", "val", "test"):
+            path = prod_dir / f"{sname}.npy"
             if not path.exists():
-                # Empty array with correct column count
-                ncols = _NCOLS_FULL if self.all_features else _NCOLS_LOB
                 np.save(path, np.zeros((0, ncols), dtype=np.float32))
 
     # ── Feature / label / normalisation helpers ───────────────────────────────
@@ -797,26 +887,6 @@ class BatteryDataBuilder:
             n_train = max(1, n_train - 1)
             n_test  = n - n_train - n_val
         return days[:n_train], days[n_train:n_train + n_val], days[n_train + n_val:]
-
-    def _snapshots_to_arrays(self, snapshots: list[dict]) -> tuple[np.ndarray, np.ndarray]:
-        """Convert snapshots to (feature_array, raw_lob_array).
-
-        feature_array : (N, 40) if not all_features, (N, 46) if all_features
-        raw_lob_array : (N, 40) — un-normalised LOB for label computation
-        """
-        if not snapshots:
-            ncols = cst.LEN_ORDER + _N_LOB if self.all_features else _N_LOB
-            return np.zeros((0, ncols), dtype=np.float32), np.zeros((0, _N_LOB), dtype=np.float32)
-
-        lob_rows = np.array([s["lob"] for s in snapshots], dtype=np.float32)  # (N, 40)
-
-        if self.all_features:
-            msg_rows = np.array([s["msg"] for s in snapshots], dtype=np.float32)  # (N, 6)
-            features = np.concatenate([msg_rows, lob_rows], axis=1)  # (N, 46)
-        else:
-            features = lob_rows  # (N, 40)
-
-        return features, lob_rows
 
     def _build_labels(self, raw_lob: np.ndarray) -> np.ndarray:
         """Compute multi-horizon labels from raw (un-normalised) LOB array.

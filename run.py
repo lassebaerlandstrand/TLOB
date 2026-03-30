@@ -2,6 +2,7 @@ from datetime import datetime
 import json
 import lightning as L
 import omegaconf
+import numpy as np
 import torch
 import os
 from lightning.pytorch.loggers import WandbLogger
@@ -19,6 +20,64 @@ from preprocessing.dataset import Dataset, DataModule, MultiHorizonDataset
 import constants as cst
 from constants import SamplingType, ProductMode
 torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
+
+
+def _fmt_int_space(value: int) -> str:
+    return f"{int(value):,}"
+
+
+def _fmt_float_space(value: float, decimals: int = 1) -> str:
+    return f"{float(value):,.{decimals}f}"
+
+
+def _dataset_labels(dataset):
+    if hasattr(dataset, "y_multi"):
+        return dataset.y_multi[:len(dataset)]
+    return dataset.y[:len(dataset)]
+
+
+def _aggregate_split_counts(datasets, multi_horizon: bool):
+    if multi_horizon:
+        counts = torch.zeros((len(cst.LOBSTER_HORIZONS), 3), dtype=torch.long)
+        for ds in datasets:
+            labels = _dataset_labels(ds)
+            for h_idx in range(min(labels.shape[1], len(cst.LOBSTER_HORIZONS))):
+                counts[h_idx] += torch.bincount(labels[:, h_idx], minlength=3)[:3]
+        return counts
+
+    counts = torch.zeros((1, 3), dtype=torch.long)
+    for ds in datasets:
+        labels = _dataset_labels(ds)
+        counts[0] += torch.bincount(labels, minlength=3)[:3]
+    return counts
+
+
+def _print_per_product_split_diagnostics(split_name: str, datasets, multi_horizon: bool, horizon: int):
+    sizes = np.asarray([len(ds) for ds in datasets], dtype=np.float64)
+    print(
+        f"{split_name} product sizes: min={_fmt_int_space(int(sizes.min()))} "
+        f"max={_fmt_int_space(int(sizes.max()))} "
+        f"mean={_fmt_float_space(sizes.mean(), 1)} std={_fmt_float_space(sizes.std(), 1)}"
+    )
+
+    counts = _aggregate_split_counts(datasets, multi_horizon)
+    horizons = cst.LOBSTER_HORIZONS if multi_horizon else [horizon]
+
+    for h_idx, h in enumerate(horizons):
+        class_counts = counts[h_idx].cpu().numpy()
+        total = max(int(class_counts.sum()), 1)
+        up = class_counts[0] / total
+        stat = class_counts[1] / total
+        down = class_counts[2] / total
+
+        non_zero = class_counts[class_counts > 0]
+        imbalance_ratio = float(class_counts.max() / non_zero.min()) if non_zero.size else float("inf")
+        imbalance_text = f"{imbalance_ratio:.2f}x" if np.isfinite(imbalance_ratio) else "inf"
+
+        print(
+            f"  h{h}: up={up:.3f} stat={stat:.3f} down={down:.3f} "
+            f"(N={_fmt_int_space(total)}, imbalance max/min={imbalance_text})"
+        )
 
 
 def run(config: Config, accelerator):
@@ -312,9 +371,38 @@ def train(config: Config, trainer: L.Trainer, run=None):
         raise ValueError(f"Unknown dataset type: {dataset_type}")
     
     if isinstance(train_set, ConcatDataset):
-        print(f"\nTrain set: {len(train_set)} samples ({len(train_set.datasets)} products)")
-        print(f"Val set:   {len(val_set)} samples ({len(val_set.datasets)} products)")
-        print(f"Test:      {len(test_loaders)} product DataLoaders\n")
+        test_total_samples = sum(len(loader.dataset) for loader in test_loaders)
+        test_total_products = 0
+        for loader in test_loaders:
+            if isinstance(loader.dataset, ConcatDataset):
+                test_total_products += len(loader.dataset.datasets)
+            else:
+                test_total_products += 1
+        product_label = "product" if test_total_products == 1 else "products"
+        loader_label = "DataLoader" if len(test_loaders) == 1 else "DataLoaders"
+
+        print(
+            f"\nTrain set: {_fmt_int_space(len(train_set))} samples "
+            f"({len(train_set.datasets)} products)"
+        )
+        print(
+            f"Val set:   {_fmt_int_space(len(val_set))} samples "
+            f"({len(val_set.datasets)} products)"
+        )
+        print(
+            f"Test:      {_fmt_int_space(test_total_samples)} samples "
+            f"({test_total_products} {product_label}, {len(test_loaders)} {loader_label})\n"
+        )
+
+        if dataset_type == "BATTERY":
+            print("Per-product aggregated diagnostics")
+            _print_per_product_split_diagnostics("train", train_set.datasets, multi_horizon, horizon)
+            _print_per_product_split_diagnostics("val", val_set.datasets, multi_horizon, horizon)
+
+            test_concat = test_loaders[0].dataset
+            if isinstance(test_concat, ConcatDataset):
+                _print_per_product_split_diagnostics("test", test_concat.datasets, multi_horizon, horizon)
+            print()
     else:
         counts_train = torch.unique(train_labels, return_counts=True)
         counts_val = torch.unique(val_labels, return_counts=True)

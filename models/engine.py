@@ -14,6 +14,14 @@ import wandb
 from lion_pytorch import Lion
 from torch_ema import ExponentialMovingAverage
 from utils.utils_model import pick_model
+from utils.metrics import (
+    compute_baselines,
+    compute_metrics,
+    format_confidence_stats,
+    format_horizon_table,
+    format_prediction_distribution,
+    plot_confusion_matrices,
+)
 import constants as cst
 from scipy.stats import mode
 
@@ -121,9 +129,31 @@ class Engine(LightningModule):
         # Multi-horizon per-horizon accumulators
         if multi_horizon:
             self.train_losses_per_h = [[] for _ in HORIZONS]
+            self.val_targets_per_h = [[] for _ in HORIZONS]
+            self.val_predictions_per_h = [[] for _ in HORIZONS]
             self.test_targets_per_h = [[] for _ in HORIZONS]
             self.test_predictions_per_h = [[] for _ in HORIZONS]
+            self.test_proba_per_h = [[] for _ in HORIZONS]
             self.test_losses_per_h = [[] for _ in HORIZONS]
+
+    def _console(self, *message) -> None:
+        # Before trainer attachment (e.g., in __init__), LightningModule.print raises.
+        trainer = getattr(self, "_trainer", None)
+        if trainer is None:
+            print(*message)
+            return
+        try:
+            # LightningModule.print integrates better with tqdm/progress bars.
+            self.print(*message)
+        except RuntimeError:
+            print(*message)
+
+    def _section(self, title: str) -> None:
+        rule = "=" * 92
+        self._console("")
+        self._console(rule)
+        self._console(title)
+        self._console(rule)
 
     # ------------------------------------------------------------------
     # Compile
@@ -140,13 +170,13 @@ class Engine(LightningModule):
                 dynamic=self.torch_compile_dynamic,
                 backend=self.torch_compile_backend,
             )
-            print(
+            self._console(
                 "torch.compile enabled for",
                 self.model_type,
                 f"(backend={self.torch_compile_backend}, mode={self.torch_compile_mode}, dynamic={self.torch_compile_dynamic})",
             )
         except Exception as compile_error:
-            print(f"torch.compile failed, continuing without compilation: {compile_error}")
+            self._console(f"torch.compile failed, continuing without compilation: {compile_error}")
 
     # ------------------------------------------------------------------
     # Forward / Loss
@@ -201,16 +231,12 @@ class Engine(LightningModule):
         self.epoch_iteration_count += 1
         self.epoch_sample_count += int(y.shape[0])
         self.ema.update()
-        if batch_idx % 1000 == 0:
-            avg_loss = sum(self.train_losses) / len(self.train_losses)
-            print(f'train loss: {float(avg_loss)}')
         return batch_loss_mean
 
     def on_train_epoch_start(self) -> None:
         self.train_epoch_start_time = time.perf_counter()
         self.epoch_sample_count = 0
         self.epoch_iteration_count = 0
-        print(f'learning rate: {self.optimizer.param_groups[0]["lr"]}')
 
     def on_train_epoch_end(self) -> None:
         if self.train_epoch_start_time is None:
@@ -221,7 +247,7 @@ class Engine(LightningModule):
         self.total_train_time_s += epoch_duration
         self.total_train_samples += self.epoch_sample_count
         self.total_train_steps += self.epoch_iteration_count
-        print(
+        self._console(
             f"Epoch {self.current_epoch} throughput - samples/s: {samples_per_sec:.2f}, it/s: {it_per_sec:.2f}"
         )
 
@@ -234,7 +260,10 @@ class Engine(LightningModule):
             if self.multi_horizon:
                 y_hat_list = self.forward(x)
                 batch_loss, _ = self._multi_horizon_loss(y_hat_list, y)
-                # For validation metrics we only track the primary (h10) horizon
+                for i, y_hat in enumerate(y_hat_list):
+                    self.val_targets_per_h[i].append(y[:, i])
+                    self.val_predictions_per_h[i].append(y_hat.argmax(dim=1))
+                # Keep primary horizon tracking for early-stopping compatibility.
                 self.val_targets.append(y[:, 0])
                 self.val_predictions.append(y_hat_list[0].argmax(dim=1))
                 batch_loss_mean = batch_loss
@@ -267,12 +296,12 @@ class Engine(LightningModule):
             for i, y_hat in enumerate(y_hat_list):
                 self.test_targets_per_h[i].append(y[:, i])
                 self.test_predictions_per_h[i].append(y_hat.argmax(dim=1))
+                self.test_proba_per_h[i].append(torch.softmax(y_hat, dim=1))
                 self.test_losses_per_h[i].append(per_h_ce[i])
 
-            # Also fill the primary accumulators with h10 so existing report printing works
+            # Keep h10 in primary accumulators for compatibility with downstream logic.
             self.test_targets.append(y[:, 0])
             self.test_predictions.append(y_hat_list[0].argmax(dim=1))
-            self.test_proba.append(torch.softmax(y_hat_list[0], dim=1)[:, 1])
             batch_loss_mean = batch_loss
         else:
             if self.experiment_type == "TRAINING":
@@ -301,7 +330,22 @@ class Engine(LightningModule):
         loss = sum(self.train_losses) / len(self.train_losses)
         self.train_losses = []
         self.current_train_loss = loss
-        print(f'Train loss on epoch {self.current_epoch}: {loss}')
+        self._section(f"Epoch {self.current_epoch} - Train/Validation Diagnostics")
+        self._console(f'Learning rate: {self.optimizer.param_groups[0]["lr"]}')
+        self._console(f'Train loss on epoch {self.current_epoch}: {loss}')
+        if self.multi_horizon:
+            ce_chunks = []
+            sigma_chunks = []
+            for i, h in enumerate(HORIZONS):
+                if self.train_losses_per_h[i]:
+                    mean_ce = float(torch.stack(self.train_losses_per_h[i]).mean())
+                    ce_chunks.append(f"h{h}={mean_ce:.3f}")
+                else:
+                    ce_chunks.append(f"h{h}=n/a")
+                sigma_h = float(torch.exp(0.5 * self.log_vars[i]).detach().cpu())
+                sigma_chunks.append(f"h{h}={sigma_h:.2f}")
+            self._console(f"Per-horizon train CE:  {'  '.join(ce_chunks)}")
+            self._console(f"Uncertainty sigma_h:   {'  '.join(sigma_chunks)}")
 
     def on_validation_epoch_end(self) -> None:
         self.val_loss = float(sum(self.val_losses) / len(self.val_losses))
@@ -321,19 +365,46 @@ class Engine(LightningModule):
 
         # Lightning monitoring (EarlyStopping watches val_loss)
         self.log("val_loss", self.val_loss)
-        print(f'Validation loss on epoch {self.current_epoch}: {self.val_loss}')
+        self._console(f'Validation loss on epoch {self.current_epoch}: {self.val_loss}')
 
         # Classification report on primary horizon (always h10 for multi, full for single)
         targets = torch.cat(self.val_targets).cpu().numpy()
         predictions = torch.cat(self.val_predictions).cpu().numpy()
         class_report = classification_report(targets, predictions, digits=4, output_dict=True)
-        print(classification_report(targets, predictions, digits=4))
+        if self.multi_horizon:
+            self._console("Primary horizon (h10) classification report")
+        self._console(classification_report(targets, predictions, digits=4))
         self.log("val_f1_score", class_report["macro avg"]["f1-score"])
         self.log("val_accuracy", class_report["accuracy"])
         self.log("val_precision", class_report["macro avg"]["precision"])
         self.log("val_recall", class_report["macro avg"]["recall"])
+
+        if self.multi_horizon and all(len(self.val_targets_per_h[i]) > 0 for i in range(len(HORIZONS))):
+            val_metrics = []
+            val_baselines = []
+            for i in range(len(HORIZONS)):
+                h_targets = torch.cat(self.val_targets_per_h[i]).cpu().numpy()
+                h_predictions = torch.cat(self.val_predictions_per_h[i]).cpu().numpy()
+                val_metrics.append(compute_metrics(h_targets, h_predictions))
+                val_baselines.append(compute_baselines(h_targets))
+
+            self._console("Validation summary by horizon")
+            self._console(format_horizon_table(val_metrics, HORIZONS, val_baselines))
+
+            low_mcc_horizons = [
+                f"h{HORIZONS[i]}" for i, metrics in enumerate(val_metrics) if metrics["mcc"] < 0.15
+            ]
+            if low_mcc_horizons:
+                self._console(
+                    "Warning: near-random validation behaviour (MCC < 0.15) at "
+                    + ", ".join(low_mcc_horizons)
+                )
+
         self.val_targets = []
         self.val_predictions = []
+        if self.multi_horizon:
+            self.val_targets_per_h = [[] for _ in HORIZONS]
+            self.val_predictions_per_h = [[] for _ in HORIZONS]
 
         # Reset per-horizon train accumulators
         if self.multi_horizon:
@@ -342,26 +413,94 @@ class Engine(LightningModule):
     def on_test_epoch_end(self) -> None:
         targets = torch.cat(self.test_targets).cpu().numpy()
         predictions = torch.cat(self.test_predictions).cpu().numpy()
-        predictions_path = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "predictions")
+        save_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt)
+        os.makedirs(save_dir, exist_ok=True)
+        predictions_path = os.path.join(save_dir, "predictions")
         np.save(predictions_path, predictions)
+        self._section("Test Diagnostics")
 
         if self.multi_horizon:
-            # Report per-horizon metrics in console and log only F1 to W&B
+            metrics_per_h = []
+            baselines_per_h = []
+            targets_per_h = []
+            predictions_per_h = []
+            proba_per_h = []
+
             for i, h in enumerate(HORIZONS):
                 h_targets = torch.cat(self.test_targets_per_h[i]).cpu().numpy()
                 h_preds = torch.cat(self.test_predictions_per_h[i]).cpu().numpy()
+                h_proba = torch.cat(self.test_proba_per_h[i]).cpu().numpy()
+                h_metrics = compute_metrics(h_targets, h_preds)
+                h_baselines = compute_baselines(h_targets)
+
+                metrics_per_h.append(h_metrics)
+                baselines_per_h.append(h_baselines)
+                targets_per_h.append(h_targets)
+                predictions_per_h.append(h_preds)
+                proba_per_h.append(h_proba)
+
                 h_report = classification_report(h_targets, h_preds, digits=4, output_dict=True)
-                print(f"\n--- Horizon h={h} ---")
-                print(classification_report(h_targets, h_preds, digits=4))
-                # Only log F1 per horizon to W&B
                 self.log(f"f1_score_h{h}", h_report["macro avg"]["f1-score"])
+
+            self._console("Test summary by horizon")
+            self._console(format_horizon_table(metrics_per_h, HORIZONS, baselines_per_h))
+
+            self._console("")
+            self._console("Prediction distribution by horizon")
+            for i, h in enumerate(HORIZONS):
+                self._console(f"[h{h}]")
+                self._console(format_prediction_distribution(targets_per_h[i], predictions_per_h[i]))
+
+            self._console("")
+            self._console("Confidence diagnostics by horizon")
+            for i, h in enumerate(HORIZONS):
+                self._console(f"[h{h}]")
+                self._console(format_confidence_stats(proba_per_h[i], targets_per_h[i], predictions_per_h[i]))
+
+            saved_paths = plot_confusion_matrices(metrics_per_h, HORIZONS, save_dir)
+            self._console("")
+            self._console("Saved confusion matrix plots:")
+            for path in saved_paths:
+                self._console(path)
+
+            macro_f1_values = [metrics["macro_f1"] for metrics in metrics_per_h]
+            mcc_values = [metrics["mcc"] for metrics in metrics_per_h]
+            best_idx = int(np.argmax(macro_f1_values))
+            worst_idx = int(np.argmin(macro_f1_values))
+            near_random = [f"h{HORIZONS[i]}" for i, value in enumerate(mcc_values) if value < 0.15]
+
+            self._console("")
+            self._console("Final summary")
+            self._console(
+                f"Best horizon: h{HORIZONS[best_idx]} "
+                f"(F1(mac)={macro_f1_values[best_idx]:.4f}, MCC={mcc_values[best_idx]:.4f})"
+            )
+            self._console(
+                f"Worst horizon: h{HORIZONS[worst_idx]} "
+                f"(F1(mac)={macro_f1_values[worst_idx]:.4f}, MCC={mcc_values[worst_idx]:.4f})"
+            )
+            if near_random:
+                self._console(
+                    "Warning: near-random test performance (MCC < 0.15) at "
+                    + ", ".join(near_random)
+                )
+
+            self._console("")
+            self._console("Detailed classification reports")
+            for i, h in enumerate(HORIZONS):
+                self._console(f"--- Horizon h={h} ---")
+                self._console(classification_report(targets_per_h[i], predictions_per_h[i], digits=4))
+
+            self.log("test_loss", sum(self.test_losses) / len(self.test_losses))
+
             # Reset per-horizon accumulators
             self.test_targets_per_h = [[] for _ in HORIZONS]
             self.test_predictions_per_h = [[] for _ in HORIZONS]
+            self.test_proba_per_h = [[] for _ in HORIZONS]
             self.test_losses_per_h = [[] for _ in HORIZONS]
         else:
             class_report = classification_report(targets, predictions, digits=4, output_dict=True)
-            print(classification_report(targets, predictions, digits=4))
+            self._console(classification_report(targets, predictions, digits=4))
             self.log("test_loss", sum(self.test_losses) / len(self.test_losses))
             self.log("f1_score", class_report["macro avg"]["f1-score"])
             self.log("accuracy", class_report["accuracy"])
@@ -372,9 +511,12 @@ class Engine(LightningModule):
         self.test_predictions = []
         self.test_losses = []
         self.first_test = False
-        test_proba = torch.cat(self.test_proba).cpu().numpy()
-        precision, recall, _ = precision_recall_curve(targets, test_proba, pos_label=1)
-        self.plot_pr_curves(recall, precision, self.is_wandb)
+
+        if not self.multi_horizon and self.test_proba:
+            test_proba = torch.cat(self.test_proba).cpu().numpy()
+            precision, recall, _ = precision_recall_curve(targets, test_proba, pos_label=1)
+            self.plot_pr_curves(recall, precision, self.is_wandb)
+
         self.test_proba = []
 
     def on_fit_end(self) -> None:
@@ -495,7 +637,7 @@ class Engine(LightningModule):
                         onnx_logger.setLevel(previous_onnx_logger_level)
                         onnx_schemas_logger.setLevel(previous_onnx_schemas_logger_level)
                 except Exception as e:
-                    print(f"Failed to export ONNX model: {e}")
+                    self._console(f"Failed to export ONNX model: {e}")
                 finally:
                     if (
                         hasattr(export_model, "set_fast_attention")

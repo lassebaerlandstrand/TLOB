@@ -123,7 +123,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
         base_dir = cst.DATA_DIR + f"/{stock}"
         _pm = getattr(config.dataset, "product_mode", "concat")
         product_mode = ProductMode(_pm) if isinstance(_pm, str) else _pm
-        cache_sub = battery_cache_subdir(config.dataset.sampling_time, config.dataset.dates)
+        cache_sub = battery_cache_subdir(config.dataset.sampling_time, config.dataset.dates, config.dataset.sampling_type.value, all_features)
 
         if product_mode == ProductMode.PER_PRODUCT:
             pp_dir = os.path.join(base_dir, "per_product", cache_sub)

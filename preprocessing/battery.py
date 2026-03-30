@@ -12,7 +12,7 @@ day and closes ~5 minutes before delivery.
   all_features=False → 44 columns: [40 LOB | 4 labels]
 
 Message columns (synthesised from LOB state at sampling time):
-  [time_delta_s, event_type, total_volume, mid_price, direction, spread_ticks]
+  [log1p(time_delta_s), event_type, total_volume, mid_price, direction, spread_ticks]
 
 LOB columns (10 levels, interleaved ask/bid):
   [sell1, vsell1, buy1, vbuy1, sell2, vsell2, buy2, vbuy2, ..., sell10, vsell10, buy10, vbuy10]
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import shutil
 from pathlib import Path
 
@@ -146,14 +147,23 @@ def _select_features(msg_cols, lob_cols, all_features: bool, path: str) -> np.nd
     return lob_cols.astype(np.float32)  # (N, 40)
 
 
-def battery_cache_subdir(sampling_time: str, dates: list[str]) -> str:
-    """Return a human-readable subdirectory name encoding sampling_time and dates.
+def battery_cache_subdir(sampling_time: str, dates: list[str], sampling_type: str = "time", all_features: bool = False) -> str:
+    """Return a human-readable subdirectory name encoding sampling_time, dates, sampling_type, and all_features.
 
-    Example: battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"]) -> "10s_20210111_20210122"
+    Examples:
+        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"])                        -> "10s_20210111_20210122"
+        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"], "time_dedup")          -> "10s_20210111_20210122_dedup"
+        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"], "time", True)          -> "10s_20210111_20210122_msg"
+        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"], "time_dedup", True)    -> "10s_20210111_20210122_dedup_msg"
     """
     start = dates[0].replace("-", "")
     end = dates[1].replace("-", "")
-    return f"{sampling_time}_{start}_{end}"
+    base = f"{sampling_time}_{start}_{end}"
+    if sampling_type == "time_dedup":
+        base += "_dedup"
+    if all_features:
+        base += "_msg"
+    return base
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -645,7 +655,12 @@ class BatteryDataBuilder:
         """Synthesise 6 message columns from LOB state.
 
         Columns (matching LOBSTER convention):
-          [time_delta_s, event_type, total_volume, mid_price, direction, spread_ticks]
+          [log1p(time_delta_s), event_type, total_volume, mid_price, direction, spread_ticks]
+
+        time_delta_s is log-transformed before storage to compress the extreme range between
+        active-trading gaps (10–60s → log1p ≈ 2.4–4.1) and overnight gaps (17h → log1p ≈ 11.0).
+        Without this, z-scoring is dominated by the overnight outliers and active-period values
+        collapse to a near-constant near zero.
 
         direction: sign of mid-price change since last snapshot (0 if first).
         spread_ticks: (sell1 - buy1) / 0.1 (EPEX tick = 0.01 EUR/MWh, but we use 0.1 as
@@ -655,7 +670,7 @@ class BatteryDataBuilder:
         mid = (sell1 + buy1) / 2.0
         spread_ticks = max((sell1 - buy1) / 0.1, 0.0)
         total_vol = sum(lob_row[1::2])  # sum of all volume columns (odd indices in lob_row)
-        time_delta = max((curr_time - prev_time).total_seconds(), 0.0)
+        time_delta = math.log1p(max((curr_time - prev_time).total_seconds(), 0.0))
 
         if prev_lob is not None:
             prev_mid = (prev_lob[0] + prev_lob[2]) / 2.0
@@ -710,7 +725,7 @@ class BatteryDataBuilder:
         print(f"  val: {val_mask.sum():,} snapshots")
         print(f"  test: {test_mask.sum():,} snapshots")
 
-        subdir = battery_cache_subdir(self.sampling_time_str, self.date_strs)
+        subdir = battery_cache_subdir(self.sampling_time_str, self.date_strs, self.sampling_type.value, self.all_features)
         out_dir = Path(self.data_dir) / "battery_markets" / "concat" / subdir
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -772,7 +787,7 @@ class BatteryDataBuilder:
               f"val: {len(val_days)}, test: {len(test_days)}")
         print(f"  Total unique delivery contracts: {len(unique_dt)}")
 
-        subdir = battery_cache_subdir(self.sampling_time_str, self.date_strs)
+        subdir = battery_cache_subdir(self.sampling_time_str, self.date_strs, self.sampling_type.value, self.all_features)
         out_root = Path(self.data_dir) / "battery_markets" / "per_product" / subdir
         out_root.mkdir(parents=True, exist_ok=True)
         products_dir = out_root / "products"

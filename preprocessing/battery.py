@@ -1116,7 +1116,6 @@ class BatteryDataBuilder:
             return
         arr = np.concatenate([features, labels], axis=1).astype(np.float32)
         np.save(path, arr)
-        print(f"  Saved {path.name}: shape {arr.shape}")
 
     # ── Validation ────────────────────────────────────────────────────────────
 

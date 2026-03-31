@@ -12,10 +12,10 @@ class ComputeQKV(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-        self.q = nn.Linear(hidden_dim, hidden_dim*num_heads)
-        self.k = nn.Linear(hidden_dim, hidden_dim*num_heads)
-        self.v = nn.Linear(hidden_dim, hidden_dim*num_heads)
-        
+        self.q = nn.Linear(hidden_dim, hidden_dim * num_heads)
+        self.k = nn.Linear(hidden_dim, hidden_dim * num_heads)
+        self.v = nn.Linear(hidden_dim, hidden_dim * num_heads)
+
     def forward(self, x):
         q = self.q(x)
         k = self.k(x)
@@ -40,10 +40,10 @@ class TransformerLayer(nn.Module):
         self.resid_dropout = nn.Dropout(dropout)
         self.norm = nn.RMSNorm(hidden_dim)
         self.qkv = ComputeQKV(hidden_dim, num_heads)
-        self.attention = nn.MultiheadAttention(hidden_dim*num_heads, num_heads, batch_first=True)
-        self.mlp = MLP(hidden_dim, hidden_dim*4, final_dim, dropout=dropout)
-        self.w0 = nn.Linear(hidden_dim*num_heads, hidden_dim)
-        self.use_residual = (final_dim == hidden_dim)
+        self.attention = nn.MultiheadAttention(hidden_dim * num_heads, num_heads, batch_first=True)
+        self.mlp = MLP(hidden_dim, hidden_dim * 4, final_dim, dropout=dropout)
+        self.w0 = nn.Linear(hidden_dim * num_heads, hidden_dim)
+        self.use_residual = final_dim == hidden_dim
 
     def set_fast_attention(self, use_fast_attention: bool):
         self.use_fast_attention = use_fast_attention
@@ -63,15 +63,12 @@ class TransformerLayer(nn.Module):
         )
         x = x.transpose(1, 2).contiguous().reshape(bsz, seq_len, embed_dim)
         return x
-        
+
     def forward(self, x, need_weights=False):
         res = x
         q, k, v = self.qkv(x)
         use_fast_path = (
-            self.use_fast_attention
-            and not need_weights
-            and x.is_cuda
-            and not torch.onnx.is_in_onnx_export()
+            self.use_fast_attention and not need_weights and x.is_cuda and not torch.onnx.is_in_onnx_export()
         )
         if use_fast_path:
             x = self._fast_attention(q, k, v)
@@ -102,20 +99,21 @@ def _build_head(total_dim: int, dropout: float = 0.0) -> nn.ModuleList:
 
 
 class TLOB(nn.Module):
-    def __init__(self, 
-                 hidden_dim: int,
-                 num_layers: int,
-                 seq_size: int,
-                 num_features: int,
-                 num_heads: int,
-                 is_sin_emb: bool,
-                 dataset_type: str,
-                 use_fast_attention: bool = True,
-                 num_horizons: int = 1,
-                 dropout: float = 0.0,
-                 ) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_layers: int,
+        seq_size: int,
+        num_features: int,
+        num_heads: int,
+        is_sin_emb: bool,
+        dataset_type: str,
+        use_fast_attention: bool = True,
+        num_horizons: int = 1,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.is_sin_emb = is_sin_emb
@@ -136,9 +134,9 @@ class TLOB(nn.Module):
             self.register_buffer("pos_encoder", pos_emb)
         else:
             self.pos_encoder = nn.Parameter(torch.randn(1, seq_size, hidden_dim))
-        
+
         for i in range(num_layers):
-            if i != num_layers-1:
+            if i != num_layers - 1:
                 self.layers.append(
                     TransformerLayer(
                         hidden_dim,
@@ -162,7 +160,7 @@ class TLOB(nn.Module):
                     TransformerLayer(
                         hidden_dim,
                         num_heads,
-                        hidden_dim//4,
+                        hidden_dim // 4,
                         use_fast_attention=use_fast_attention,
                         dropout=dropout,
                     )
@@ -171,7 +169,7 @@ class TLOB(nn.Module):
                     TransformerLayer(
                         seq_size,
                         num_heads,
-                        seq_size//4,
+                        seq_size // 4,
                         use_fast_attention=use_fast_attention,
                         dropout=dropout,
                     )
@@ -179,7 +177,7 @@ class TLOB(nn.Module):
         self.att_temporal = []
         self.att_feature = []
         self.mean_att_distance_temporal = []
-        total_dim = (hidden_dim//4)*(seq_size//4)
+        total_dim = (hidden_dim // 4) * (seq_size // 4)
 
         if num_horizons == 1:
             # Original single head (backward-compatible)
@@ -188,16 +186,16 @@ class TLOB(nn.Module):
         else:
             # One independent head per horizon, all sharing the encoder above
             self.final_layers = None
-            self.heads = nn.ModuleList([
-                nn.ModuleList(_build_head(total_dim, dropout=dropout)) for _ in range(num_horizons)
-            ])
+            self.heads = nn.ModuleList(
+                [nn.ModuleList(_build_head(total_dim, dropout=dropout)) for _ in range(num_horizons)]
+            )
 
     def set_fast_attention(self, use_fast_attention: bool):
         self.use_fast_attention = use_fast_attention
         for layer in self.layers:
             if isinstance(layer, TransformerLayer):
                 layer.set_fast_attention(use_fast_attention)
-        
+
     def _encode(self, input, store_att=False):
         """Shared encoder: input → flat representation."""
         if self.dataset_type == "LOBSTER":
@@ -207,9 +205,9 @@ class TLOB(nn.Module):
             x = torch.cat([continuous_features, order_type_emb], dim=2)
         else:
             x = input
-        x = rearrange(x, 'b s f -> b f s')
+        x = rearrange(x, "b s f -> b f s")
         x = self.norm_layer(x)
-        x = rearrange(x, 'b f s -> b s f')
+        x = rearrange(x, "b f s -> b s f")
         x = self.emb_layer(x)
         x = x[:] + self.pos_encoder
         for i in range(len(self.layers)):
@@ -217,7 +215,7 @@ class TLOB(nn.Module):
             if store_att and att is not None:
                 att = att.detach()
             x = x.permute(0, 2, 1)
-        x = rearrange(x, 'b s f -> b (f s) 1')
+        x = rearrange(x, "b s f -> b (f s) 1")
         x = x.reshape(x.shape[0], -1)
         return x
 
@@ -238,12 +236,16 @@ class TLOB(nn.Module):
                     h = layer(h)
                 outputs.append(h)
             return outputs
-    
-    
+
+
 def sinusoidal_positional_embedding(token_sequence_size, token_embedding_dim, n=10000.0):
 
     if token_embedding_dim % 2 != 0:
-        raise ValueError("Sinusoidal positional embedding cannot apply to odd token embedding dim (got dim={:d})".format(token_embedding_dim))
+        raise ValueError(
+            "Sinusoidal positional embedding cannot apply to odd token embedding dim (got dim={:d})".format(
+                token_embedding_dim
+            )
+        )
 
     T = token_sequence_size
     d = token_embedding_dim
@@ -251,23 +253,23 @@ def sinusoidal_positional_embedding(token_sequence_size, token_embedding_dim, n=
     positions = torch.arange(0, T).unsqueeze_(1)
     embeddings = torch.zeros(T, d)
 
-    denominators = torch.pow(n, 2*torch.arange(0, d//2)/d) # 10000^(2i/d_model), i is the index of embedding
-    embeddings[:, 0::2] = torch.sin(positions/denominators) # sin(pos/10000^(2i/d_model))
-    embeddings[:, 1::2] = torch.cos(positions/denominators) # cos(pos/10000^(2i/d_model))
+    denominators = torch.pow(n, 2 * torch.arange(0, d // 2) / d)  # 10000^(2i/d_model), i is the index of embedding
+    embeddings[:, 0::2] = torch.sin(positions / denominators)  # sin(pos/10000^(2i/d_model))
+    embeddings[:, 1::2] = torch.cos(positions / denominators)  # cos(pos/10000^(2i/d_model))
 
     return embeddings
 
 
 def count_parameters(layer):
     print(f"Number of parameters: {sum(p.numel() for p in layer.parameters() if p.requires_grad)}")
-    
+
 
 def compute_mean_att_distance(att):
     att_distances = np.zeros((att.shape[0], att.shape[1]))
     for h in range(att.shape[0]):
         for key in range(att.shape[2]):
             for query in range(att.shape[1]):
-                distance = abs(query-key)
-                att_distances[h, key] += torch.abs(att[h, query, key]).cpu().item()*distance
+                distance = abs(query - key)
+                att_distances[h, key] += torch.abs(att[h, query, key]).cpu().item() * distance
     mean_distances = att_distances.mean(axis=1)
     return mean_distances

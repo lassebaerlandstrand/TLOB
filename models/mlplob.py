@@ -16,16 +16,17 @@ def _build_head(total_dim: int) -> nn.ModuleList:
 
 
 class MLPLOB(nn.Module):
-    def __init__(self, 
-                 hidden_dim: int,
-                 num_layers: int,
-                 seq_size: int,
-                 num_features: int,
-                 dataset_type: str,
-                 num_horizons: int = 1,
-                 ) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_layers: int,
+        seq_size: int,
+        num_features: int,
+        dataset_type: str,
+        num_horizons: int = 1,
+    ) -> None:
         super().__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.dataset_type = dataset_type
@@ -37,14 +38,14 @@ class MLPLOB(nn.Module):
         self.layers.append(self.first_layer)
         self.layers.append(nn.GELU())
         for i in range(num_layers):
-            if i != num_layers-1:
-                self.layers.append(MLP(hidden_dim, hidden_dim*4, hidden_dim))
-                self.layers.append(MLP(seq_size, seq_size*4, seq_size))
+            if i != num_layers - 1:
+                self.layers.append(MLP(hidden_dim, hidden_dim * 4, hidden_dim))
+                self.layers.append(MLP(seq_size, seq_size * 4, seq_size))
             else:
-                self.layers.append(MLP(hidden_dim, hidden_dim*2, hidden_dim//4))
-                self.layers.append(MLP(seq_size, seq_size*2, seq_size//4))
-                
-        total_dim = (hidden_dim//4)*(seq_size//4)
+                self.layers.append(MLP(hidden_dim, hidden_dim * 2, hidden_dim // 4))
+                self.layers.append(MLP(seq_size, seq_size * 2, seq_size // 4))
+
+        total_dim = (hidden_dim // 4) * (seq_size // 4)
 
         if num_horizons == 1:
             # Original single head (backward-compatible)
@@ -52,9 +53,7 @@ class MLPLOB(nn.Module):
             self.heads = None
         else:
             self.final_layers = None
-            self.heads = nn.ModuleList([
-                nn.ModuleList(_build_head(total_dim)) for _ in range(num_horizons)
-            ])
+            self.heads = nn.ModuleList([nn.ModuleList(_build_head(total_dim)) for _ in range(num_horizons)])
 
     def _encode(self, input):
         """Shared encoder body producing a flat representation."""
@@ -89,23 +88,24 @@ class MLPLOB(nn.Module):
                     h = layer(h)
                 outputs.append(h)
             return outputs
-        
-        
+
+
 class MLP(nn.Module):
-    def __init__(self, 
-                 start_dim: int,
-                 hidden_dim: int,
-                 final_dim: int,
-                 dropout: float = 0.0,
-                 ) -> None:
+    def __init__(
+        self,
+        start_dim: int,
+        hidden_dim: int,
+        final_dim: int,
+        dropout: float = 0.0,
+    ) -> None:
         super().__init__()
-        
+
         self.layer_norm = nn.RMSNorm(final_dim)
         self.fc = nn.Linear(start_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, final_dim)
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout)
-        
+
     def forward(self, x):
         residual = x
         x = self.fc(x)

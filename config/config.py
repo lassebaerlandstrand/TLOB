@@ -130,7 +130,7 @@ class BATTERY(Dataset):
     parsed_data_path: str = "data/battery_markets/parsed"
     max_lob_depth: float = 1000.0
     all_features: bool = True
-    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 46, "dropout": 0.1})
+    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 64, "num_heads": 4, "dropout": 0.1})
 
 
 @dataclass
@@ -145,7 +145,7 @@ class Experiment:
     horizon: int = 10
     max_epochs: int = 50
     dir_ckpt: str = "model.ckpt"
-    optimizer: str = "Adam"
+    optimizer: str = "AdamW"
     use_torch_compile: bool = True
     torch_compile_mode: str = "reduce-overhead"
     torch_compile_dynamic: bool = False

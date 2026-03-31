@@ -76,6 +76,7 @@ class Dataset:
     type: DatasetType = MISSING
     dates: list = MISSING
     batch_size: int = MISSING
+    model_overrides: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -83,6 +84,7 @@ class FI_2010(Dataset):
     type: DatasetType = DatasetType.FI_2010
     dates: list = field(default_factory=lambda: ["2010-01-01", "2010-12-31"])
     batch_size: int = 32
+    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 144})
 
 
 @dataclass
@@ -95,6 +97,7 @@ class LOBSTER(Dataset):
     training_stocks: list = field(default_factory=lambda: ["INTC"])
     testing_stocks: list = field(default_factory=lambda: ["INTC"])
     batch_size: int = 128
+    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 46})
 
 
 @dataclass
@@ -107,6 +110,7 @@ class BTC(Dataset):
     batch_size: int = 128
     training_stocks: list = field(default_factory=lambda: ["BTC"])
     testing_stocks: list = field(default_factory=lambda: ["BTC"])
+    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 40})
 
 
 @dataclass
@@ -125,6 +129,7 @@ class BATTERY(Dataset):
     parsed_data_path: str = "data/battery_markets/parsed"
     max_lob_depth: float = 1000.0
     all_features: bool = True
+    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 46})
 
 
 @dataclass

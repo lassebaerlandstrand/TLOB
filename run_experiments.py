@@ -20,7 +20,7 @@ MODEL = "tlob"
 DATASET = "fi_2010"
 HORIZONS = [10, 20, 50, 100]
 SEED = 1
-MAX_EPOCHS = 20
+MAX_EPOCHS = 50
 IS_WANDB = "True"
 
 
@@ -88,10 +88,10 @@ def main():
     parser.add_argument("--epochs", type=int, default=MAX_EPOCHS, help=f"Max epochs per run (default: {MAX_EPOCHS})")
     parser.add_argument("--rebuild-data", action="store_true", help="Force data preprocessing on the first run.")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
-    parser.add_argument("--sampling-time", type=str, default=None,
-                        help="Battery sampling interval (e.g. '5s', '10s')")
-    parser.add_argument("--dates", type=str, nargs=2, default=None, metavar=("START", "END"),
-                        help="Date range (YYYY-MM-DD)")
+    parser.add_argument("--sampling-time", type=str, default=None, help="Battery sampling interval (e.g. '5s', '10s')")
+    parser.add_argument(
+        "--dates", type=str, nargs=2, default=None, metavar=("START", "END"), help="Date range (YYYY-MM-DD)"
+    )
 
     args = parser.parse_args()
 

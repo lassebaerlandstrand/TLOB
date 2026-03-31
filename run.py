@@ -100,7 +100,7 @@ def run(config: Config, accelerator):
         precision=config.experiment.precision,
         max_epochs=config.experiment.max_epochs,
         callbacks=[
-            EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=True, min_delta=0.001),
+            EarlyStopping(monitor="val_loss", mode="min", patience=3, verbose=True, min_delta=0.0005),
             TQDMProgressBar(refresh_rate=100),
         ],
         num_sanity_val_steps=0,
@@ -825,7 +825,7 @@ def run_wandb(config: Config, accelerator):
             precision=config.experiment.precision,
             max_epochs=config.experiment.max_epochs,
             callbacks=[
-                EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=True, min_delta=0.001),
+                EarlyStopping(monitor="val_loss", mode="min", patience=3, verbose=True, min_delta=0.0005),
                 TQDMProgressBar(refresh_rate=1000),
             ],
             num_sanity_val_steps=0,

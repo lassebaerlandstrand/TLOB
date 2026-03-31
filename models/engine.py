@@ -543,11 +543,28 @@ class Engine(LightningModule):
             self.optimizer = torch.optim.SGD(self.parameters(), lr=self.lr, momentum=0.9)
         elif self.optimizer == "Lion":
             self.optimizer = Lion(self.parameters(), lr=self.lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=self.max_epochs,
-            eta_min=1e-6,
-        )
+
+        # TLOB benefits from validation-aware LR drops when the larger model plateaus early.
+        if self.model_type == "TLOB":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=0.5,
+                patience=1,
+                threshold=0.001,
+                threshold_mode="abs",
+                min_lr=1e-6,
+            )
+            return {
+                "optimizer": self.optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",
+                    "monitor": "val_loss",
+                },
+            }
+
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.max_epochs, eta_min=1e-6)
         return {
             "optimizer": self.optimizer,
             "lr_scheduler": {

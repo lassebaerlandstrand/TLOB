@@ -56,6 +56,7 @@ class Engine(LightningModule):
         weight_decay: float = 0.0,
         dropout: float = 0.0,
         multi_horizon: bool = False,
+        class_weights: torch.Tensor | None = None,
     ):
         super().__init__()
         self.seq_size = seq_size
@@ -99,7 +100,29 @@ class Engine(LightningModule):
         self._compile_model()
         self.ema = ExponentialMovingAverage(self.parameters(), decay=0.999)
         self.ema.to(cst.DEVICE)
-        self.loss_function = nn.CrossEntropyLoss()
+        if class_weights is not None:
+            class_weights = class_weights.detach().float()
+            if self.multi_horizon:
+                if class_weights.ndim == 1:
+                    class_weights = class_weights.unsqueeze(0).repeat(len(HORIZONS), 1)
+                if class_weights.ndim != 2:
+                    raise ValueError("class_weights must have shape (H, C) or (C,) in multi_horizon mode")
+                if class_weights.shape[0] != len(HORIZONS):
+                    raise ValueError(
+                        f"Expected class_weights for {len(HORIZONS)} horizons, got {class_weights.shape[0]}"
+                    )
+                self.register_buffer("class_weights", class_weights)
+                self.loss_function = nn.CrossEntropyLoss()
+            else:
+                if class_weights.ndim == 2:
+                    class_weights = class_weights[0]
+                if class_weights.ndim != 1:
+                    raise ValueError("class_weights must have shape (C,) in single-horizon mode")
+                self.register_buffer("class_weights", class_weights)
+                self.loss_function = nn.CrossEntropyLoss(weight=self.class_weights)
+        else:
+            self.class_weights = None
+            self.loss_function = nn.CrossEntropyLoss()
 
         # Learnable log-variance parameters for homoscedastic uncertainty weighting.
         # One scalar per horizon; initialised to 0 (σ_h = 1, equal initial weights).
@@ -195,18 +218,24 @@ class Engine(LightningModule):
 
         L = Σ_h [ CE(ŷ_h, y_h) / (2σ_h²) + log σ_h ]
         where log σ_h² = self.log_vars[h] (log-variance parameterisation).
-
-        Vectorised: one F.cross_entropy call on (B*H, C) / (B*H) instead of H separate calls.
         """
-        H = len(y_hat_list)
-        B = y_hat_list[0].shape[0]
-        C = y_hat_list[0].shape[1]
-        # Stack: (B, H, C) → reshape to (B*H, C); targets: (B, H) → (B*H,)
-        y_hat_stacked = torch.stack(y_hat_list, dim=1).reshape(B * H, C)
-        y_stacked = y_multi.reshape(B * H)
-        # Per-horizon mean CE via reduction='none' → (B*H,) → (H,)
-        ce_per_sample = torch.nn.functional.cross_entropy(y_hat_stacked, y_stacked, reduction="none")  # (B*H,)
-        ce_per_h = ce_per_sample.reshape(B, H).mean(0)  # (H,)
+        horizon_losses = []
+        for horizon_index, y_hat_h in enumerate(y_hat_list):
+            horizon_weight = None
+            if self.class_weights is not None:
+                if self.class_weights.ndim == 2:
+                    horizon_weight = self.class_weights[horizon_index]
+                else:
+                    horizon_weight = self.class_weights
+            ce_h = torch.nn.functional.cross_entropy(
+                y_hat_h,
+                y_multi[:, horizon_index],
+                weight=horizon_weight,
+                reduction="mean",
+            )
+            horizon_losses.append(ce_h)
+
+        ce_per_h = torch.stack(horizon_losses)  # (H,)
         # Uncertainty weighting (vectorised)
         sigma2 = torch.exp(self.log_vars)  # (H,)
         total_loss = (ce_per_h / (2.0 * sigma2) + 0.5 * self.log_vars).sum()

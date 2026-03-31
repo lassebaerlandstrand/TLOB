@@ -53,6 +53,18 @@ def _aggregate_split_counts(datasets, multi_horizon: bool):
     return counts
 
 
+def _inverse_sqrt_class_weights(class_counts: torch.Tensor) -> torch.Tensor:
+    num_classes = int(class_counts.numel())
+    total_count = class_counts.sum()
+    if total_count <= 0:
+        return torch.ones(num_classes, dtype=torch.float32)
+
+    frequencies = class_counts.float() / total_count.float()
+    frequencies = torch.clamp(frequencies, min=1e-8)
+    weights = 1.0 / torch.sqrt(frequencies)
+    return weights * (float(num_classes) / weights.sum())
+
+
 def _print_per_product_split_diagnostics(split_name: str, datasets, multi_horizon: bool, horizon: int):
     sizes = np.asarray([len(ds) for ds in datasets], dtype=np.float64)
     print(
@@ -488,6 +500,34 @@ def train(config: Config, trainer: L.Trainer, run=None):
         )
         print()
 
+    counts_source = train_set.datasets if isinstance(train_set, ConcatDataset) else [train_set]
+    train_counts = _aggregate_split_counts(counts_source, multi_horizon).float()
+    class_weights = None
+    if multi_horizon:
+        per_horizon_weights = []
+        for horizon_index, horizon_value in enumerate(cst.LOBSTER_HORIZONS):
+            horizon_counts = train_counts[horizon_index]
+            horizon_weights = _inverse_sqrt_class_weights(horizon_counts)
+            per_horizon_weights.append(horizon_weights)
+            print(
+                f"Using class weights (h{horizon_value}): "
+                f"counts={horizon_counts.to(torch.long).tolist()} "
+                f"weights={[round(weight, 4) for weight in horizon_weights.tolist()]}"
+            )
+
+        class_weights = torch.stack(per_horizon_weights, dim=0)
+    else:
+        horizon_counts = train_counts[0]
+        if horizon_counts.sum() > 0:
+            class_weights = _inverse_sqrt_class_weights(horizon_counts)
+            print(
+                "Using class weights (h10): "
+                f"counts={horizon_counts.to(torch.long).tolist()} "
+                f"weights={[round(weight, 4) for weight in class_weights.tolist()]}"
+            )
+        else:
+            print("Skipping class weights: unable to compute non-empty h10 class counts.")
+
     # Log dataset stats to wandb
     if run is not None:
         n_train = len(train_set)
@@ -560,6 +600,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_layers=num_layers,
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
+                class_weights=class_weights,
                 map_location=cst.DEVICE,
                 weights_only=False,
                 use_torch_compile=config.experiment.use_torch_compile,
@@ -586,6 +627,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dataset_type=dataset_type,
                 num_heads=checkpoint["hyper_parameters"]["num_heads"],
                 is_sin_emb=checkpoint["hyper_parameters"]["is_sin_emb"],
+                class_weights=class_weights,
                 map_location=cst.DEVICE,
                 weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
@@ -609,6 +651,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dir_ckpt=dir_ckpt,
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
+                class_weights=class_weights,
                 map_location=cst.DEVICE,
                 weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
@@ -632,6 +675,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dir_ckpt=dir_ckpt,
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
+                class_weights=class_weights,
                 map_location=cst.DEVICE,
                 weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
@@ -666,6 +710,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 use_fast_attention=config.experiment.use_fast_attention,
                 weight_decay=config.model.hyperparameters_fixed["weight_decay"],
                 multi_horizon=multi_horizon,
+                class_weights=class_weights,
             )
         elif model_type == cst.ModelType.TLOB:
             model = Engine(
@@ -693,6 +738,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 weight_decay=config.model.hyperparameters_fixed["weight_decay"],
                 dropout=config.model.hyperparameters_fixed.get("dropout", 0.0),
                 multi_horizon=multi_horizon,
+                class_weights=class_weights,
             )
         elif model_type == cst.ModelType.BINCTABL:
             model = Engine(
@@ -713,6 +759,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
+                class_weights=class_weights,
             )
         elif model_type == cst.ModelType.DEEPLOB:
             model = Engine(
@@ -733,6 +780,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
+                class_weights=class_weights,
             )
 
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))
@@ -752,6 +800,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
+                class_weights=class_weights,
             )
         except Exception as checkpoint_error:
             print(f"failed to load best checkpoint ({best_model_path}): {checkpoint_error}")

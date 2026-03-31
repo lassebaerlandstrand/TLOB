@@ -97,7 +97,7 @@ def run(config: Config, accelerator):
         precision=config.experiment.precision,
         max_epochs=config.experiment.max_epochs,
         callbacks=[
-            EarlyStopping(monitor="val_loss", mode="min", patience=1, verbose=True, min_delta=0.002),
+            EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=True, min_delta=0.001),
             TQDMProgressBar(refresh_rate=100)
             ],
         num_sanity_val_steps=0,
@@ -458,7 +458,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
     experiment_type = config.experiment.type
     if "FINETUNING" in experiment_type or "EVALUATION" in experiment_type:
         if checkpoint_ref != "":
-            checkpoint = torch.load(checkpoint_path, map_location=cst.DEVICE, weights_only=True)
+            checkpoint = torch.load(checkpoint_path, map_location=cst.DEVICE, weights_only=False)
             
         print("Loading model from checkpoint: ", config.experiment.checkpoint_reference) 
         lr = checkpoint["hyper_parameters"]["lr"]
@@ -487,6 +487,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 map_location=cst.DEVICE,
+                weights_only=False,
                 use_torch_compile=config.experiment.use_torch_compile,
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
@@ -512,6 +513,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_heads=checkpoint["hyper_parameters"]["num_heads"],
                 is_sin_emb=checkpoint["hyper_parameters"]["is_sin_emb"],
                 map_location=cst.DEVICE,
+                weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
                 use_torch_compile=config.experiment.use_torch_compile,
                 torch_compile_mode=config.experiment.torch_compile_mode,
@@ -534,6 +536,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 map_location=cst.DEVICE,
+                weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
                 use_torch_compile=config.experiment.use_torch_compile,
                 torch_compile_mode=config.experiment.torch_compile_mode,
@@ -556,6 +559,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 map_location=cst.DEVICE,
+                weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
                 use_torch_compile=config.experiment.use_torch_compile,
                 torch_compile_mode=config.experiment.torch_compile_mode,
@@ -667,14 +671,16 @@ def train(config: Config, trainer: L.Trainer, run=None):
             best_model = Engine.load_from_checkpoint(
                 best_model_path,
                 map_location=cst.DEVICE,
+                weights_only=False,
                 use_torch_compile=config.experiment.use_torch_compile,
                 torch_compile_mode=config.experiment.torch_compile_mode,
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
             )
-        except: 
-            print("no checkpoints has been saved, selecting the last model")
+        except Exception as checkpoint_error:
+            print(f"failed to load best checkpoint ({best_model_path}): {checkpoint_error}")
+            print("selecting the last model")
             best_model = model
         best_model.experiment_type = "EVALUATION"
         for i in range(len(test_loaders)):
@@ -743,7 +749,7 @@ def run_wandb(config: Config, accelerator):
             precision=config.experiment.precision,
             max_epochs=config.experiment.max_epochs,
             callbacks=[
-            EarlyStopping(monitor="val_loss", mode="min", patience=1, verbose=True, min_delta=0.002),
+            EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=True, min_delta=0.001),
                 TQDMProgressBar(refresh_rate=1000)
             ],
             num_sanity_val_steps=0,

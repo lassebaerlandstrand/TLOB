@@ -100,7 +100,7 @@ class Engine(LightningModule):
 
         # Learnable log-variance parameters for homoscedastic uncertainty weighting.
         # One scalar per horizon; initialised to 0 (σ_h = 1, equal initial weights).
-        # Stored in Engine (not the backbone) so ONNX export is unaffected. 
+        # Stored in Engine (not the backbone) so ONNX export is unaffected.
         # Unsure if this makes it so ONNX can be used
         if multi_horizon:
             self.log_vars = nn.Parameter(torch.zeros(len(HORIZONS)))
@@ -202,14 +202,12 @@ class Engine(LightningModule):
         y_hat_stacked = torch.stack(y_hat_list, dim=1).reshape(B * H, C)
         y_stacked = y_multi.reshape(B * H)
         # Per-horizon mean CE via reduction='none' → (B*H,) → (H,)
-        ce_per_sample = torch.nn.functional.cross_entropy(
-            y_hat_stacked, y_stacked, reduction='none'
-        )  # (B*H,)
-        ce_per_h = ce_per_sample.reshape(B, H).mean(0)   # (H,)
+        ce_per_sample = torch.nn.functional.cross_entropy(y_hat_stacked, y_stacked, reduction="none")  # (B*H,)
+        ce_per_h = ce_per_sample.reshape(B, H).mean(0)  # (H,)
         # Uncertainty weighting (vectorised)
         sigma2 = torch.exp(self.log_vars)  # (H,)
         total_loss = (ce_per_h / (2.0 * sigma2) + 0.5 * self.log_vars).sum()
-        return total_loss, ce_per_h.detach()   # scalar, (H,) tensor
+        return total_loss, ce_per_h.detach()  # scalar, (H,) tensor
 
     # ------------------------------------------------------------------
     # Training
@@ -320,7 +318,9 @@ class Engine(LightningModule):
                 self.test_proba.append(torch.softmax(y_hat, dim=1)[:, 1])
                 batch_loss_mean = torch.mean(batch_loss)
 
-        self.test_losses.append(batch_loss_mean.item() if isinstance(batch_loss_mean, torch.Tensor) else float(batch_loss_mean))
+        self.test_losses.append(
+            batch_loss_mean.item() if isinstance(batch_loss_mean, torch.Tensor) else float(batch_loss_mean)
+        )
         return batch_loss_mean
 
     # ------------------------------------------------------------------
@@ -331,8 +331,8 @@ class Engine(LightningModule):
         self.train_losses = []
         self.current_train_loss = loss
         self._section(f"Epoch {self.current_epoch} - Train/Validation Diagnostics")
-        self._console(f'Learning rate: {self.optimizer.param_groups[0]["lr"]}')
-        self._console(f'Train loss on epoch {self.current_epoch}: {loss}')
+        self._console(f"Learning rate: {self.optimizer.param_groups[0]['lr']}")
+        self._console(f"Train loss on epoch {self.current_epoch}: {loss}")
         if self.multi_horizon:
             ce_chunks = []
             sigma_chunks = []
@@ -351,21 +351,17 @@ class Engine(LightningModule):
         self.val_loss = float(sum(self.val_losses) / len(self.val_losses))
         self.val_losses = []
 
-        # model checkpointing
+        # Model checkpointing only; LR scheduling is handled by Lightning scheduler integration.
         if self.val_loss < self.min_loss:
-            if self.val_loss - self.min_loss > -0.002:
-                self.optimizer.param_groups[0]["lr"] /= 2
             self.min_loss = self.val_loss
             self.model_checkpointing(self.val_loss)
-        else:
-            self.optimizer.param_groups[0]["lr"] /= 2
 
         # W&B logging: combined losses (train/val) + optional per-horizon train CE + σ_h
         self.log_losses_to_wandb(self.current_train_loss, self.val_loss)
 
         # Lightning monitoring (EarlyStopping watches val_loss)
         self.log("val_loss", self.val_loss)
-        self._console(f'Validation loss on epoch {self.current_epoch}: {self.val_loss}')
+        self._console(f"Validation loss on epoch {self.current_epoch}: {self.val_loss}")
 
         # Classification report on primary horizon (always h10 for multi, full for single)
         targets = torch.cat(self.val_targets).cpu().numpy()
@@ -391,13 +387,10 @@ class Engine(LightningModule):
             self._console("Validation summary by horizon")
             self._console(format_horizon_table(val_metrics, HORIZONS, val_baselines))
 
-            low_mcc_horizons = [
-                f"h{HORIZONS[i]}" for i, metrics in enumerate(val_metrics) if metrics["mcc"] < 0.15
-            ]
+            low_mcc_horizons = [f"h{HORIZONS[i]}" for i, metrics in enumerate(val_metrics) if metrics["mcc"] < 0.15]
             if low_mcc_horizons:
                 self._console(
-                    "Warning: near-random validation behaviour (MCC < 0.15) at "
-                    + ", ".join(low_mcc_horizons)
+                    "Warning: near-random validation behaviour (MCC < 0.15) at " + ", ".join(low_mcc_horizons)
                 )
 
         self.val_targets = []
@@ -480,10 +473,7 @@ class Engine(LightningModule):
                 f"(F1(mac)={macro_f1_values[worst_idx]:.4f}, MCC={mcc_values[worst_idx]:.4f})"
             )
             if near_random:
-                self._console(
-                    "Warning: near-random test performance (MCC < 0.15) at "
-                    + ", ".join(near_random)
-                )
+                self._console("Warning: near-random test performance (MCC < 0.15) at " + ", ".join(near_random))
 
             self._console("")
             self._console("Detailed classification reports")
@@ -542,15 +532,26 @@ class Engine(LightningModule):
             eps = 1
         else:
             eps = 1e-8
-        if self.optimizer == 'Adam':
+        if self.optimizer == "Adam":
             self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, eps=eps)
-        elif self.optimizer == 'AdamW':
+        elif self.optimizer == "AdamW":
             self.optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, eps=eps, weight_decay=self.weight_decay)
-        elif self.optimizer == 'SGD':
+        elif self.optimizer == "SGD":
             self.optimizer = torch.optim.SGD(self.parameters(), lr=self.lr, momentum=0.9)
-        elif self.optimizer == 'Lion':
+        elif self.optimizer == "Lion":
             self.optimizer = Lion(self.parameters(), lr=self.lr)
-        return self.optimizer
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=self.max_epochs,
+            eta_min=1e-6,
+        )
+        return {
+            "optimizer": self.optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+            },
+        }
 
     # ------------------------------------------------------------------
     # Logging helpers
@@ -585,11 +586,7 @@ class Engine(LightningModule):
     def model_checkpointing(self, loss):
         if self.last_path_ckpt is not None:
             os.remove(self.last_path_ckpt)
-        filename_ckpt = (
-            "val_loss=" + str(round(loss, 3))
-            + "_epoch=" + str(self.current_epoch)
-            + ".pt"
-        )
+        filename_ckpt = "val_loss=" + str(round(loss, 3)) + "_epoch=" + str(self.current_epoch) + ".pt"
         path_ckpt = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "pt", filename_ckpt)
 
         with self.ema.average_parameters():
@@ -599,11 +596,7 @@ class Engine(LightningModule):
             if not self.multi_horizon:
                 onnx_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "onnx")
                 os.makedirs(onnx_dir, exist_ok=True)
-                onnx_filename = (
-                    "val_loss=" + str(round(loss, 3))
-                    + "_epoch=" + str(self.current_epoch)
-                    + ".onnx"
-                )
+                onnx_filename = "val_loss=" + str(round(loss, 3)) + "_epoch=" + str(self.current_epoch) + ".onnx"
                 onnx_path = os.path.join(onnx_dir, onnx_filename)
                 dummy_input = torch.randn(1, self.seq_size, self.num_features, device=self.device)
                 export_model = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
@@ -629,9 +622,9 @@ class Engine(LightningModule):
                                 export_params=True,
                                 opset_version=25,
                                 do_constant_folding=True,
-                                input_names=['input'],
-                                output_names=['output'],
-                                dynamic_shapes={'input': {0: torch.export.Dim('batch_size')}},
+                                input_names=["input"],
+                                output_names=["output"],
+                                dynamic_shapes={"input": {0: torch.export.Dim("batch_size")}},
                             )
                     finally:
                         onnx_logger.setLevel(previous_onnx_logger_level)
@@ -639,10 +632,7 @@ class Engine(LightningModule):
                 except Exception as e:
                     self._console(f"Failed to export ONNX model: {e}")
                 finally:
-                    if (
-                        hasattr(export_model, "set_fast_attention")
-                        and previous_fast_attention_state is not None
-                    ):
+                    if hasattr(export_model, "set_fast_attention") and previous_fast_attention_state is not None:
                         export_model.set_fast_attention(previous_fast_attention_state)
 
         self.last_path_ckpt = path_ckpt
@@ -652,22 +642,24 @@ class Engine(LightningModule):
     # ------------------------------------------------------------------
     def plot_pr_curves(self, recall, precision, is_wandb):
         plt.figure(figsize=(20, 10), dpi=80)
-        plt.plot(recall, precision, label='Precision-Recall', color='black')
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.title('Precision-Recall Curve')
+        plt.plot(recall, precision, label="Precision-Recall", color="black")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title("Precision-Recall Curve")
         if is_wandb:
             tag = "multi_horizon" if self.multi_horizon else self.dataset_type
             wandb.log({f"precision_recall_curve_{tag}": wandb.Image(plt)})
-        plt.savefig(cst.DIR_SAVED_MODEL + "/" + str(self.model_type) + "/" + f"precision_recall_curve_{self.dataset_type}.svg")
+        plt.savefig(
+            cst.DIR_SAVED_MODEL + "/" + str(self.model_type) + "/" + f"precision_recall_curve_{self.dataset_type}.svg"
+        )
         plt.close()
 
 
 def compute_most_attended(att_feature):
-    ''' att_feature: list of tensors of shape (num_samples, num_layers, 2, num_heads, num_features) '''
+    """att_feature: list of tensors of shape (num_samples, num_layers, 2, num_heads, num_features)"""
     att_feature = np.stack(att_feature)
     att_feature = att_feature.transpose(1, 3, 0, 2, 4)
-    ''' att_feature: shape (num_layers, num_heads, num_samples, 2, num_features) '''
+    """ att_feature: shape (num_layers, num_heads, num_samples, 2, num_features) """
     indices = att_feature[:, :, :, 1]
     values = att_feature[:, :, :, 0]
     most_frequent_indices = np.zeros((indices.shape[0], indices.shape[1], indices.shape[3]), dtype=int)

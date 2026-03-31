@@ -142,7 +142,7 @@ class Experiment:
     checkpoint_reference: str = ""
     seed: int = 1
     horizon: int = 10
-    max_epochs: int = 10
+    max_epochs: int = 50
     dir_ckpt: str = "model.ckpt"
     optimizer: str = "Adam"
     use_torch_compile: bool = True

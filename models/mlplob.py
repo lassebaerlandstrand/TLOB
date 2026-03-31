@@ -95,7 +95,8 @@ class MLP(nn.Module):
     def __init__(self, 
                  start_dim: int,
                  hidden_dim: int,
-                 final_dim: int
+                 final_dim: int,
+                 dropout: float = 0.0,
                  ) -> None:
         super().__init__()
         
@@ -103,11 +104,13 @@ class MLP(nn.Module):
         self.fc = nn.Linear(start_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, final_dim)
         self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
         residual = x
         x = self.fc(x)
         x = self.gelu(x)
+        x = self.dropout(x)
         x = self.fc2(x)
         if x.shape[2] == residual.shape[2]:
             x = x + residual

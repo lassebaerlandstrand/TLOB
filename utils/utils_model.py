@@ -15,6 +15,7 @@ def pick_model(
     dataset_type=None,
     use_fast_attention=True,
     num_horizons=1,
+    dropout=0.0,
 ):
     if model_type == "MLPLOB":
         return MLPLOB(hidden_dim, num_layers, seq_size, num_features, dataset_type, num_horizons=num_horizons)
@@ -29,6 +30,7 @@ def pick_model(
             dataset_type,
             use_fast_attention=use_fast_attention,
             num_horizons=num_horizons,
+            dropout=dropout,
         )
     elif model_type == "BINCTABL":
         return BiN_CTABL(60, num_features, seq_size, seq_size, 120, 5, 3, 1)

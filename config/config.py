@@ -42,6 +42,7 @@ class TLOB(Model):
             "seq_size": 128,
             "all_features": True,
             "weight_decay": 0.01,
+            "dropout": 0.0,
         }
     )
     hyperparameters_sweep: dict = field(
@@ -129,7 +130,7 @@ class BATTERY(Dataset):
     parsed_data_path: str = "data/battery_markets/parsed"
     max_lob_depth: float = 1000.0
     all_features: bool = True
-    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 46})
+    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 46, "dropout": 0.1})
 
 
 @dataclass

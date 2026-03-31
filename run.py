@@ -691,6 +691,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
                 weight_decay=config.model.hyperparameters_fixed["weight_decay"],
+                dropout=config.model.hyperparameters_fixed.get("dropout", 0.0),
                 multi_horizon=multi_horizon,
             )
         elif model_type == cst.ModelType.BINCTABL:

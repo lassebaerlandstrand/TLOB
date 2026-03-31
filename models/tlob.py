@@ -2,7 +2,6 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-import constants as cst
 from models.bin import BiN
 from models.mlplob import MLP
 import numpy as np
@@ -25,15 +24,24 @@ class ComputeQKV(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, final_dim: int, use_fast_attention: bool = True):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        final_dim: int,
+        use_fast_attention: bool = True,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.use_fast_attention = use_fast_attention
+        self.attn_dropout_p = dropout
+        self.resid_dropout = nn.Dropout(dropout)
         self.norm = nn.RMSNorm(hidden_dim)
         self.qkv = ComputeQKV(hidden_dim, num_heads)
         self.attention = nn.MultiheadAttention(hidden_dim*num_heads, num_heads, batch_first=True)
-        self.mlp = MLP(hidden_dim, hidden_dim*4, final_dim)
+        self.mlp = MLP(hidden_dim, hidden_dim*4, final_dim, dropout=dropout)
         self.w0 = nn.Linear(hidden_dim*num_heads, hidden_dim)
         self.use_residual = (final_dim == hidden_dim)
 
@@ -46,7 +54,13 @@ class TransformerLayer(nn.Module):
         q = q.reshape(bsz, seq_len, self.num_heads, head_dim).transpose(1, 2)
         k = k.reshape(bsz, seq_len, self.num_heads, head_dim).transpose(1, 2)
         v = v.reshape(bsz, seq_len, self.num_heads, head_dim).transpose(1, 2)
-        x = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=self.attn_dropout_p if self.training else 0.0,
+            is_causal=False,
+        )
         x = x.transpose(1, 2).contiguous().reshape(bsz, seq_len, embed_dim)
         return x
         
@@ -64,7 +78,7 @@ class TransformerLayer(nn.Module):
             att = None
         else:
             x, att = self.attention(q, k, v, average_attn_weights=False, need_weights=need_weights)
-        x = self.w0(x)
+        x = self.resid_dropout(self.w0(x))
         x = x + res
         x = self.norm(x)
         x = self.mlp(x)
@@ -73,14 +87,16 @@ class TransformerLayer(nn.Module):
         return x, att
 
 
-def _build_head(total_dim: int) -> nn.ModuleList:
+def _build_head(total_dim: int, dropout: float = 0.0) -> nn.ModuleList:
     """Build the classification head (shrink-to-3) matching the original design."""
     layers = nn.ModuleList()
     dim = total_dim
     while dim > 128:
+        layers.append(nn.Dropout(dropout))
         layers.append(nn.Linear(dim, dim // 4))
         layers.append(nn.GELU())
         dim = dim // 4
+    layers.append(nn.Dropout(dropout))
     layers.append(nn.Linear(dim, 3))
     return layers
 
@@ -96,6 +112,7 @@ class TLOB(nn.Module):
                  dataset_type: str,
                  use_fast_attention: bool = True,
                  num_horizons: int = 1,
+                 dropout: float = 0.0,
                  ) -> None:
         super().__init__()
         
@@ -107,6 +124,7 @@ class TLOB(nn.Module):
         self.dataset_type = dataset_type
         self.use_fast_attention = use_fast_attention
         self.num_horizons = num_horizons
+        self.dropout = dropout
         self.layers = nn.ModuleList()
         self.first_branch = nn.ModuleList()
         self.second_branch = nn.ModuleList()
@@ -121,11 +139,43 @@ class TLOB(nn.Module):
         
         for i in range(num_layers):
             if i != num_layers-1:
-                self.layers.append(TransformerLayer(hidden_dim, num_heads, hidden_dim, use_fast_attention=use_fast_attention))
-                self.layers.append(TransformerLayer(seq_size, num_heads, seq_size, use_fast_attention=use_fast_attention))
+                self.layers.append(
+                    TransformerLayer(
+                        hidden_dim,
+                        num_heads,
+                        hidden_dim,
+                        use_fast_attention=use_fast_attention,
+                        dropout=dropout,
+                    )
+                )
+                self.layers.append(
+                    TransformerLayer(
+                        seq_size,
+                        num_heads,
+                        seq_size,
+                        use_fast_attention=use_fast_attention,
+                        dropout=dropout,
+                    )
+                )
             else:
-                self.layers.append(TransformerLayer(hidden_dim, num_heads, hidden_dim//4, use_fast_attention=use_fast_attention))
-                self.layers.append(TransformerLayer(seq_size, num_heads, seq_size//4, use_fast_attention=use_fast_attention))
+                self.layers.append(
+                    TransformerLayer(
+                        hidden_dim,
+                        num_heads,
+                        hidden_dim//4,
+                        use_fast_attention=use_fast_attention,
+                        dropout=dropout,
+                    )
+                )
+                self.layers.append(
+                    TransformerLayer(
+                        seq_size,
+                        num_heads,
+                        seq_size//4,
+                        use_fast_attention=use_fast_attention,
+                        dropout=dropout,
+                    )
+                )
         self.att_temporal = []
         self.att_feature = []
         self.mean_att_distance_temporal = []
@@ -133,13 +183,13 @@ class TLOB(nn.Module):
 
         if num_horizons == 1:
             # Original single head (backward-compatible)
-            self.final_layers = _build_head(total_dim)
+            self.final_layers = _build_head(total_dim, dropout=dropout)
             self.heads = None
         else:
             # One independent head per horizon, all sharing the encoder above
             self.final_layers = None
             self.heads = nn.ModuleList([
-                nn.ModuleList(_build_head(total_dim)) for _ in range(num_horizons)
+                nn.ModuleList(_build_head(total_dim, dropout=dropout)) for _ in range(num_horizons)
             ])
 
     def set_fast_attention(self, use_fast_attention: bool):

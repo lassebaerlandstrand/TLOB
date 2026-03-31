@@ -54,6 +54,7 @@ class Engine(LightningModule):
         torch_compile_backend="inductor",
         use_fast_attention=True,
         weight_decay: float = 0.0,
+        dropout: float = 0.0,
         multi_horizon: bool = False,
     ):
         super().__init__()
@@ -68,6 +69,7 @@ class Engine(LightningModule):
         self.lr = lr
         self.optimizer = optimizer
         self.weight_decay = weight_decay
+        self.dropout = dropout
         self.dir_ckpt = dir_ckpt
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -92,6 +94,7 @@ class Engine(LightningModule):
             dataset_type,
             use_fast_attention=use_fast_attention,
             num_horizons=num_horizons,
+            dropout=dropout,
         )
         self._compile_model()
         self.ema = ExponentialMovingAverage(self.parameters(), decay=0.999)

@@ -24,6 +24,7 @@ from utils.metrics import (
 )
 import constants as cst
 from scipy.stats import mode
+from models.losses import FocalLoss
 
 # Horizons in canonical order (h10, h20, h50, h100)
 HORIZONS = [10, 20, 50, 100]
@@ -57,6 +58,9 @@ class Engine(LightningModule):
         dropout: float = 0.0,
         multi_horizon: bool = False,
         class_weights: torch.Tensor | None = None,
+        loss_type: str = "focal_ordinal",
+        focal_gamma: float = 2.0,
+        ordinal_smoothing: float = 0.15,
     ):
         super().__init__()
         self.seq_size = seq_size
@@ -82,6 +86,20 @@ class Engine(LightningModule):
         self.torch_compile_backend = torch_compile_backend
         self.use_fast_attention = use_fast_attention
         self.multi_horizon = multi_horizon
+        # DeepLOB and BiNCTABL are unmodified reference implementations that output
+        # probabilities (they apply softmax internally). Focal loss requires logits,
+        # so fall back to cross_entropy for those models.
+        _PROB_OUTPUT_MODELS = ("DEEPLOB", "BINCTABL")
+        if loss_type != "cross_entropy" and str(model_type).upper() in _PROB_OUTPUT_MODELS:
+            print(
+                f"[Engine] loss_type='{loss_type}' is not supported for {model_type} "
+                "(model outputs probabilities, not logits). Falling back to cross_entropy."
+            )
+            loss_type = "cross_entropy"
+        self.loss_type = loss_type
+        if loss_type != "cross_entropy":
+            self.focal_gamma = focal_gamma
+            self.ordinal_smoothing = ordinal_smoothing
 
         num_horizons = len(HORIZONS) if multi_horizon else 1
         self.model = pick_model(
@@ -112,17 +130,41 @@ class Engine(LightningModule):
                         f"Expected class_weights for {len(HORIZONS)} horizons, got {class_weights.shape[0]}"
                     )
                 self.register_buffer("class_weights", class_weights)
-                self.loss_function = nn.CrossEntropyLoss()
             else:
                 if class_weights.ndim == 2:
                     class_weights = class_weights[0]
                 if class_weights.ndim != 1:
                     raise ValueError("class_weights must have shape (C,) in single-horizon mode")
                 self.register_buffer("class_weights", class_weights)
-                self.loss_function = nn.CrossEntropyLoss(weight=self.class_weights)
         else:
             self.class_weights = None
-            self.loss_function = nn.CrossEntropyLoss()
+
+        if self.loss_type == "cross_entropy":
+            if self.multi_horizon:
+                # Per-horizon weights applied manually in _multi_horizon_loss
+                self.loss_function = nn.CrossEntropyLoss()
+            else:
+                self.loss_function = nn.CrossEntropyLoss(
+                    weight=self.class_weights if self.class_weights is not None else None
+                )
+        else:
+            # focal or focal_ordinal
+            smoothing = ordinal_smoothing if self.loss_type == "focal_ordinal" else 0.0
+            if self.multi_horizon:
+                # One FocalLoss per horizon, each with its own per-horizon alpha
+                self.horizon_losses = nn.ModuleList()
+                for h_idx in range(len(HORIZONS)):
+                    alpha_h = self.class_weights[h_idx] if self.class_weights is not None else None
+                    self.horizon_losses.append(
+                        FocalLoss(gamma=focal_gamma, alpha=alpha_h, ordinal_smoothing=smoothing)
+                    )
+                self.loss_function = None  # not used in multi-horizon; _multi_horizon_loss handles it
+            else:
+                self.loss_function = FocalLoss(
+                    gamma=focal_gamma,
+                    alpha=self.class_weights,
+                    ordinal_smoothing=smoothing,
+                )
 
         # Learnable log-variance parameters for homoscedastic uncertainty weighting.
         # One scalar per horizon; initialised to 0 (σ_h = 1, equal initial weights).
@@ -141,7 +183,10 @@ class Engine(LightningModule):
         self.val_loss = np.inf
         self.val_predictions = []
         self.min_loss = np.inf
-        self.save_hyperparameters()
+        if self.loss_type == "cross_entropy":
+            self.save_hyperparameters(ignore=["focal_gamma", "ordinal_smoothing"])
+        else:
+            self.save_hyperparameters()
         self.last_path_ckpt = None
         self.first_test = True
         self.test_mid_prices = []
@@ -221,18 +266,21 @@ class Engine(LightningModule):
         """
         horizon_losses = []
         for horizon_index, y_hat_h in enumerate(y_hat_list):
-            horizon_weight = None
-            if self.class_weights is not None:
-                if self.class_weights.ndim == 2:
-                    horizon_weight = self.class_weights[horizon_index]
-                else:
-                    horizon_weight = self.class_weights
-            ce_h = torch.nn.functional.cross_entropy(
-                y_hat_h,
-                y_multi[:, horizon_index],
-                weight=horizon_weight,
-                reduction="mean",
-            )
+            if self.loss_type == "cross_entropy":
+                horizon_weight = None
+                if self.class_weights is not None:
+                    if self.class_weights.ndim == 2:
+                        horizon_weight = self.class_weights[horizon_index]
+                    else:
+                        horizon_weight = self.class_weights
+                ce_h = torch.nn.functional.cross_entropy(
+                    y_hat_h,
+                    y_multi[:, horizon_index],
+                    weight=horizon_weight,
+                    reduction="mean",
+                )
+            else:
+                ce_h = self.horizon_losses[horizon_index](y_hat_h, y_multi[:, horizon_index])
             horizon_losses.append(ce_h)
 
         ce_per_h = torch.stack(horizon_losses)  # (H,)

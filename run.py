@@ -635,6 +635,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
                 map_location=cst.DEVICE,
                 weights_only=False,
                 use_torch_compile=config.experiment.use_torch_compile,
@@ -662,6 +665,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_heads=checkpoint["hyper_parameters"]["num_heads"],
                 is_sin_emb=checkpoint["hyper_parameters"]["is_sin_emb"],
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
                 map_location=cst.DEVICE,
                 weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
@@ -686,6 +692,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
                 map_location=cst.DEVICE,
                 weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
@@ -710,6 +719,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 num_features=train_input.shape[1],
                 dataset_type=dataset_type,
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
                 map_location=cst.DEVICE,
                 weights_only=False,
                 len_test_dataloader=len(test_loaders[0]),
@@ -745,6 +757,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 weight_decay=config.model.hyperparameters_fixed["weight_decay"],
                 multi_horizon=multi_horizon,
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
             )
         elif model_type == cst.ModelType.TLOB:
             model = Engine(
@@ -773,6 +788,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dropout=config.model.hyperparameters_fixed.get("dropout", 0.0),
                 multi_horizon=multi_horizon,
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
             )
         elif model_type == cst.ModelType.BINCTABL:
             model = Engine(
@@ -794,6 +812,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
             )
         elif model_type == cst.ModelType.DEEPLOB:
             model = Engine(
@@ -815,6 +836,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
             )
 
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))
@@ -835,6 +859,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
                 class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
             )
         except Exception as checkpoint_error:
             print(f"failed to load best checkpoint ({best_model_path}): {checkpoint_error}")

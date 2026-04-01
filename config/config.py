@@ -154,6 +154,9 @@ class Experiment:
     use_fast_attention: bool = True
     use_diff_features: bool = True
     multi_horizon: bool = False
+    loss_type: str = "cross_entropy"  # "cross_entropy" | "focal" | "focal_ordinal"
+    focal_gamma: float = 2.0  # Unused if loss_type is not "focal" or "focal_ordinal"
+    ordinal_smoothing: float = 0.15  # Unused if loss_type is not "focal_ordinal"
 
 
 defaults = [Model, Experiment, Dataset]

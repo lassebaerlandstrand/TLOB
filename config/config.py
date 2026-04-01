@@ -130,9 +130,7 @@ class BATTERY(Dataset):
     parsed_data_path: str = "data/battery_markets/parsed"
     max_lob_depth: float = 1000.0
     all_features: bool = True
-    model_overrides: dict = field(
-        default_factory=lambda: {"hidden_dim": 64, "num_heads": 4, "dropout": 0.1, "lr": 0.0003}
-    )
+    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1})
 
 
 @dataclass

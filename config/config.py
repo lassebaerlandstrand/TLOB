@@ -152,6 +152,7 @@ class Experiment:
     torch_compile_backend: str = "inductor"
     precision: str = "32-true"
     use_fast_attention: bool = True
+    use_diff_features: bool = True
     multi_horizon: bool = False
 
 

@@ -19,6 +19,7 @@ from preprocessing.battery import battery_load, battery_load_multi, battery_cach
 from preprocessing.dataset import Dataset, DataModule, MultiHorizonDataset
 import constants as cst
 from constants import SamplingType, ProductMode
+from utils.utils_data import compute_lob_diffs
 
 torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
 
@@ -129,6 +130,14 @@ def train(config: Config, trainer: L.Trainer, run=None):
     seq_size = config.model.hyperparameters_fixed["seq_size"]
     horizon = config.experiment.horizon
     multi_horizon = config.experiment.multi_horizon
+    use_diff_features = config.experiment.use_diff_features
+    n_lob_features = cst.N_LOB_LEVELS * cst.LEN_LEVEL
+
+    def maybe_add_diff_features(input_tensor: torch.Tensor) -> torch.Tensor:
+        if not use_diff_features:
+            return input_tensor
+        return compute_lob_diffs(input_tensor, n_lob=n_lob_features)
+
     model_type = config.model.type
     checkpoint_ref = config.experiment.checkpoint_reference
     checkpoint_path = os.path.join(cst.DIR_SAVED_MODEL, model_type.value, checkpoint_ref)
@@ -139,6 +148,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
             train_input, train_labels, val_input, val_labels, test_input, test_labels = fi_2010_load_multi(
                 path, seq_size, config.model.hyperparameters_fixed["all_features"]
             )
+            train_input = maybe_add_diff_features(train_input)
+            val_input = maybe_add_diff_features(val_input)
+            test_input = maybe_add_diff_features(test_input)
             train_set = MultiHorizonDataset(train_input, train_labels, seq_size)
             val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
             test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
@@ -146,6 +158,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
             train_input, train_labels, val_input, val_labels, test_input, test_labels = fi_2010_load(
                 path, seq_size, horizon, config.model.hyperparameters_fixed["all_features"]
             )
+            train_input = maybe_add_diff_features(train_input)
+            val_input = maybe_add_diff_features(val_input)
+            test_input = maybe_add_diff_features(test_input)
             train_set = Dataset(train_input, train_labels, seq_size)
             val_set = Dataset(val_input, val_labels, seq_size)
             test_set = Dataset(test_input, test_labels, seq_size)
@@ -168,6 +183,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
             train_input, train_labels = btc_load_multi(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, seq_size)
             val_input, val_labels = btc_load_multi(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, seq_size)
             test_input, test_labels = btc_load_multi(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, seq_size)
+            train_input = maybe_add_diff_features(train_input)
+            val_input = maybe_add_diff_features(val_input)
+            test_input = maybe_add_diff_features(test_input)
             train_set = MultiHorizonDataset(train_input, train_labels, seq_size)
             val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
             test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
@@ -175,6 +193,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
             train_input, train_labels = btc_load(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, horizon, seq_size)
             val_input, val_labels = btc_load(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, horizon, seq_size)
             test_input, test_labels = btc_load(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, horizon, seq_size)
+            train_input = maybe_add_diff_features(train_input)
+            val_input = maybe_add_diff_features(val_input)
+            test_input = maybe_add_diff_features(test_input)
             train_set = Dataset(train_input, train_labels, seq_size)
             val_set = Dataset(val_input, val_labels, seq_size)
             test_set = Dataset(test_input, test_labels, seq_size)
@@ -232,6 +253,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                             inp, lab = battery_load(path, all_features, cst.LEN_SMOOTH, horizon, seq_size)
                     except ValueError:
                         continue  # product too small for seq_size / horizon
+                    inp = maybe_add_diff_features(inp)
                     if inp.shape[0] < seq_size:
                         continue
 
@@ -295,6 +317,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 test_input, test_labels = battery_load_multi(
                     concat_dir + "/test.npy", all_features, cst.LEN_SMOOTH, seq_size
                 )
+                train_input = maybe_add_diff_features(train_input)
+                val_input = maybe_add_diff_features(val_input)
+                test_input = maybe_add_diff_features(test_input)
                 train_set = MultiHorizonDataset(train_input, train_labels, seq_size)
                 val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
                 test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
@@ -308,6 +333,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 test_input, test_labels = battery_load(
                     concat_dir + "/test.npy", all_features, cst.LEN_SMOOTH, horizon, seq_size
                 )
+                train_input = maybe_add_diff_features(train_input)
+                val_input = maybe_add_diff_features(val_input)
+                test_input = maybe_add_diff_features(test_input)
                 train_set = Dataset(train_input, train_labels, seq_size)
                 val_set = Dataset(val_input, val_labels, seq_size)
                 test_set = Dataset(test_input, test_labels, seq_size)
@@ -345,6 +373,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                                 horizon,
                                 seq_size,
                             )
+                        train_input = maybe_add_diff_features(train_input)
                     if j == 1:
                         path = cst.DATA_DIR + "/" + training_stocks[i] + "/val.npy"
                         if multi_horizon:
@@ -359,6 +388,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                                 horizon,
                                 seq_size,
                             )
+                        val_input = maybe_add_diff_features(val_input)
             else:
                 for j in range(2):
                     if j == 0:
@@ -385,6 +415,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                                 horizon,
                                 seq_size,
                             )
+                        train_input_tmp = maybe_add_diff_features(train_input_tmp)
                         train_input = torch.cat((train_input, train_input_tmp), 0)
                         train_labels = torch.cat((train_labels, train_labels_tmp), 0)
                     if j == 1:
@@ -411,6 +442,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                                 horizon,
                                 seq_size,
                             )
+                        val_input_tmp = maybe_add_diff_features(val_input_tmp)
                         val_input = torch.cat((val_input, val_input_tmp), 0)
                         val_labels = torch.cat((val_labels, val_labels_tmp), 0)
         test_loaders = []
@@ -420,11 +452,13 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 test_input, test_labels = lobster_load_multi(
                     path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size
                 )
+                test_input = maybe_add_diff_features(test_input)
                 test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
             else:
                 test_input, test_labels = lobster_load(
                     path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size
                 )
+                test_input = maybe_add_diff_features(test_input)
                 test_set = Dataset(test_input, test_labels, seq_size)
             test_dataloader = DataLoader(
                 dataset=test_set,
@@ -889,6 +923,7 @@ def run_wandb(config: Config, accelerator):
         run.log({"seed": config.experiment.seed}, commit=False)
         run.log({"all_features": config.model.hyperparameters_fixed["all_features"]}, commit=False)
         run.log({"multi_horizon": config.experiment.multi_horizon}, commit=False)
+        run.log({"use_diff_features": config.experiment.use_diff_features}, commit=False)
         dates = config.dataset.dates
         num_days = (datetime.strptime(dates[1], "%Y-%m-%d") - datetime.strptime(dates[0], "%Y-%m-%d")).days
         run.log({"num_dates": f"{num_days} ({dates[0]} - {dates[1]})"}, commit=False)
@@ -943,6 +978,7 @@ def print_setup(config: Config):
     print("torch.compile backend: ", config.experiment.torch_compile_backend)
     print("Precision: ", config.experiment.precision)
     print("Use fast attention: ", config.experiment.use_fast_attention)
+    print("Use diff features: ", config.experiment.use_diff_features)
     print(config.experiment.type)
     print("Is debug: ", config.experiment.is_debug)
     if config.dataset.type == cst.DatasetType.LOBSTER:

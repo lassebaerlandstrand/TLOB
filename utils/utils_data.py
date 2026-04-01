@@ -3,6 +3,9 @@ import numpy as np
 import torch
 
 
+DEFAULT_N_LOB_FEATURES = 40
+
+
 def z_score_orderbook(data, mean_size=None, mean_prices=None, std_size=None, std_prices=None):
     """DONE: remember to use the mean/std of the training set, to z-normalize the test set."""
     if (mean_size is None) or (std_size is None):
@@ -90,6 +93,34 @@ def reset_indexes(dataframes):
 
 def unnormalize(x, mean, std):
     return x * std + mean
+
+
+def compute_lob_diffs(data: torch.Tensor, n_lob: int = DEFAULT_N_LOB_FEATURES) -> torch.Tensor:
+    """Append first-order temporal diffs for the first n_lob columns.
+
+    Parameters
+    ----------
+    data : torch.Tensor
+        Feature matrix with shape (N, F).
+    n_lob : int
+        Number of leading columns that correspond to LOB features.
+
+    Returns
+    -------
+    torch.Tensor
+        Tensor with shape (N, F + n_lob): original features followed by LOB diffs.
+    """
+    if data.ndim != 2:
+        raise ValueError(f"Expected 2D tensor (N, F), got shape {tuple(data.shape)}")
+    if n_lob <= 0:
+        raise ValueError(f"n_lob must be positive, got {n_lob}")
+    if n_lob > data.shape[1]:
+        raise ValueError(f"n_lob={n_lob} exceeds available features ({data.shape[1]})")
+
+    lob = data[:, :n_lob]
+    diffs = torch.zeros_like(lob)
+    diffs[1:] = lob[1:] - lob[:-1]
+    return torch.cat([data, diffs], dim=1)
 
 
 def one_hot_encoding_type(data):

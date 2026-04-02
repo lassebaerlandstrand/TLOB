@@ -24,6 +24,36 @@ MAX_EPOCHS = 50
 IS_WANDB = "True"
 
 
+def profile_overrides(args):
+    """Return Hydra overrides for a named experiment profile."""
+    profile = args.profile.lower()
+    is_original_model = str(args.model).lower().endswith("_original")
+
+    if profile == "auto":
+        # Backward-compatible behavior with safe baseline defaults.
+        if is_original_model:
+            return ["experiment.use_diff_features=False"]
+        return []
+
+    if profile == "strict_original":
+        return [
+            "experiment.use_diff_features=False",
+            "experiment.use_class_weights=False",
+            "experiment.label_mode=percent_change",
+            "experiment.loss_type=cross_entropy",
+            "experiment.optimizer=Adam",
+            "experiment.max_epochs=10",
+            "experiment.use_torch_compile=False",
+            "experiment.use_fast_attention=False",
+        ]
+
+    if profile == "ablation":
+        # Intentionally minimal profile, preserves CLI-provided settings.
+        return []
+
+    raise ValueError(f"Unknown profile: {args.profile}")
+
+
 def run_command(command, dry_run=False):
     print(f"\nExecuting: {' '.join(command)}")
     if not dry_run:
@@ -38,7 +68,7 @@ def run_command(command, dry_run=False):
 
 def base_command(args, is_preprocessed="True"):
     """Build the common part of every main.py invocation."""
-    return [
+    command = [
         sys.executable,
         "main.py",
         f"+model={args.model}",
@@ -49,6 +79,8 @@ def base_command(args, is_preprocessed="True"):
         f"experiment.is_data_preprocessed={is_preprocessed}",
         f"experiment.is_wandb={IS_WANDB}",
     ]
+    command += profile_overrides(args)
+    return command
 
 
 def battery_extras(args):
@@ -124,6 +156,16 @@ def main():
         default=None,
         metavar=("START", "END"),
         help="Date range (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        choices=["auto", "strict_original", "ablation"],
+        default="auto",
+        help=(
+            "Preset policy for experiment overrides. "
+            "auto keeps existing behavior; strict_original enforces paper-like baseline defaults."
+        ),
     )
 
     args = parser.parse_args()

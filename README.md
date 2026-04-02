@@ -106,6 +106,14 @@ python main.py +model={your_model_name} +dataset={dataset_name} hydra.job.chdir=
 python run_experiments.py --mode all-horizons --model tlob --dataset btc
 ```
 
+### Original TLOB baseline (`tlob_original`)
+
+The `strict_original` profile sets paper-faithful training defaults (e.g. Adam, 10 epochs, no diff features, no class weights, percent-change labels when data is rebuilt, cross-entropy loss, no `torch.compile`, no fast attention).
+
+```sh
+python run_experiments.py --model tlob_original --dataset btc --mode all-horizons --profile strict_original
+```
+
 ### Single horizon
 
 ```sh
@@ -118,8 +126,8 @@ python run_experiments.py --mode single --model tlob --dataset btc --horizon 10
 python run_experiments.py --mode multi-horizons --model tlob --dataset btc
 ```
 
-Additional flags: `--epochs`, `--rebuild-data`, `--dry-run`.  
-For the battery dataset, also pass `--start-date` and `--end-date`.
+Additional flags: `--epochs`, `--rebuild-data`, `--dry-run`, `--profile`.  
+For the battery dataset, also pass `--sampling-time` and `--dates START END` when needed.
 
 # Citation
 

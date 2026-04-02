@@ -1,24 +1,27 @@
-from datetime import datetime
 import json
-import lightning as L
-import omegaconf
-import numpy as np
-import torch
 import os
-from lightning.pytorch.loggers import WandbLogger
-import wandb
-from torch.utils.data import ConcatDataset, DataLoader
+from datetime import datetime
+
+import lightning as L
+import numpy as np
+import omegaconf
+import torch
 from lightning.pytorch.callbacks import TQDMProgressBar
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+from lightning.pytorch.loggers import WandbLogger
+from torch.utils.data import ConcatDataset, DataLoader
+
+import constants as cst
+import wandb
 from config.config import Config
+from constants import ProductMode, SamplingType
 from models.engine import Engine
+from models.original.engine import Engine as OriginalEngine
+from preprocessing.battery import battery_cache_subdir, battery_load, battery_load_multi
+from preprocessing.btc import btc_load, btc_load_multi
+from preprocessing.dataset import DataModule, Dataset, MultiHorizonDataset
 from preprocessing.fi_2010 import fi_2010_load, fi_2010_load_multi
 from preprocessing.lobster import lobster_load, lobster_load_multi
-from preprocessing.btc import btc_load, btc_load_multi
-from preprocessing.battery import battery_load, battery_load_multi, battery_cache_subdir
-from preprocessing.dataset import Dataset, DataModule, MultiHorizonDataset
-import constants as cst
-from constants import SamplingType, ProductMode
 from utils.utils_data import compute_lob_diffs
 
 torch.serialization.add_safe_globals([omegaconf.listconfig.ListConfig])
@@ -66,7 +69,9 @@ def _inverse_sqrt_class_weights(class_counts: torch.Tensor) -> torch.Tensor:
     return weights * (float(num_classes) / weights.sum())
 
 
-def _print_per_product_split_diagnostics(split_name: str, datasets, multi_horizon: bool, horizon: int):
+def _print_per_product_split_diagnostics(
+    split_name: str, datasets, multi_horizon: bool, horizon: int
+):
     sizes = np.asarray([len(ds) for ds in datasets], dtype=np.float64)
     print(
         f"{split_name} product sizes: min={_fmt_int_space(int(sizes.min()))} "
@@ -85,8 +90,14 @@ def _print_per_product_split_diagnostics(split_name: str, datasets, multi_horizo
         down = class_counts[2] / total
 
         non_zero = class_counts[class_counts > 0]
-        imbalance_ratio = float(class_counts.max() / non_zero.min()) if non_zero.size else float("inf")
-        imbalance_text = f"{imbalance_ratio:.2f}x" if np.isfinite(imbalance_ratio) else "inf"
+        imbalance_ratio = (
+            float(class_counts.max() / non_zero.min())
+            if non_zero.size
+            else float("inf")
+        )
+        imbalance_text = (
+            f"{imbalance_ratio:.2f}x" if np.isfinite(imbalance_ratio) else "inf"
+        )
 
         print(
             f"  h{h}: up={up:.3f} stat={stat:.3f} down={down:.3f} "
@@ -104,16 +115,20 @@ def run(config: Config, accelerator):
         training_stocks = config.dataset.training_stocks
         config.experiment.dir_ckpt = f"{dataset}_{training_stocks}_seq_size_{seq_size}_horizon_{horizon}_seed_{config.experiment.seed}{mh_suffix}"
     else:
-        config.experiment.dir_ckpt = (
-            f"{dataset}_seq_size_{seq_size}_horizon_{horizon}_seed_{config.experiment.seed}{mh_suffix}"
-        )
+        config.experiment.dir_ckpt = f"{dataset}_seq_size_{seq_size}_horizon_{horizon}_seed_{config.experiment.seed}{mh_suffix}"
 
     trainer = L.Trainer(
         accelerator=accelerator,
         precision=config.experiment.precision,
         max_epochs=config.experiment.max_epochs,
         callbacks=[
-            EarlyStopping(monitor="val_loss", mode="min", patience=3, verbose=True, min_delta=0.0005),
+            EarlyStopping(
+                monitor="val_loss",
+                mode="min",
+                patience=3,
+                verbose=True,
+                min_delta=0.0005,
+            ),
             TQDMProgressBar(refresh_rate=100),
         ],
         num_sanity_val_steps=0,
@@ -140,12 +155,37 @@ def train(config: Config, trainer: L.Trainer, run=None):
 
     model_type = config.model.type
     checkpoint_ref = config.experiment.checkpoint_reference
-    checkpoint_path = os.path.join(cst.DIR_SAVED_MODEL, model_type.value, checkpoint_ref)
+    checkpoint_path = os.path.join(
+        cst.DIR_SAVED_MODEL, model_type.value, checkpoint_ref
+    )
     dataset_type = config.dataset.type.value
+
+    if multi_horizon and model_type in {
+        cst.ModelType.MLPLOB_ORIGINAL,
+        cst.ModelType.TLOB_ORIGINAL,
+    }:
+        raise ValueError(
+            "Multi-horizon mode is not supported for *_ORIGINAL baseline models."
+        )
+    if (
+        model_type in {cst.ModelType.MLPLOB_ORIGINAL, cst.ModelType.TLOB_ORIGINAL}
+        and config.experiment.loss_type != "cross_entropy"
+    ):
+        raise ValueError(
+            "Original baseline models support only loss_type='cross_entropy'."
+        )
+
     if dataset_type == "FI_2010":
         path = cst.DATA_DIR + "/FI_2010"
         if multi_horizon:
-            train_input, train_labels, val_input, val_labels, test_input, test_labels = fi_2010_load_multi(
+            (
+                train_input,
+                train_labels,
+                val_input,
+                val_labels,
+                test_input,
+                test_labels,
+            ) = fi_2010_load_multi(
                 path, seq_size, config.model.hyperparameters_fixed["all_features"]
             )
             train_input = maybe_add_diff_features(train_input)
@@ -155,8 +195,18 @@ def train(config: Config, trainer: L.Trainer, run=None):
             val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
             test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
         else:
-            train_input, train_labels, val_input, val_labels, test_input, test_labels = fi_2010_load(
-                path, seq_size, horizon, config.model.hyperparameters_fixed["all_features"]
+            (
+                train_input,
+                train_labels,
+                val_input,
+                val_labels,
+                test_input,
+                test_labels,
+            ) = fi_2010_load(
+                path,
+                seq_size,
+                horizon,
+                config.model.hyperparameters_fixed["all_features"],
             )
             train_input = maybe_add_diff_features(train_input)
             val_input = maybe_add_diff_features(val_input)
@@ -180,9 +230,15 @@ def train(config: Config, trainer: L.Trainer, run=None):
 
     elif dataset_type == "BTC":
         if multi_horizon:
-            train_input, train_labels = btc_load_multi(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, seq_size)
-            val_input, val_labels = btc_load_multi(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, seq_size)
-            test_input, test_labels = btc_load_multi(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, seq_size)
+            train_input, train_labels = btc_load_multi(
+                cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, seq_size
+            )
+            val_input, val_labels = btc_load_multi(
+                cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, seq_size
+            )
+            test_input, test_labels = btc_load_multi(
+                cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, seq_size
+            )
             train_input = maybe_add_diff_features(train_input)
             val_input = maybe_add_diff_features(val_input)
             test_input = maybe_add_diff_features(test_input)
@@ -190,9 +246,15 @@ def train(config: Config, trainer: L.Trainer, run=None):
             val_set = MultiHorizonDataset(val_input, val_labels, seq_size)
             test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
         else:
-            train_input, train_labels = btc_load(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, horizon, seq_size)
-            val_input, val_labels = btc_load(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, horizon, seq_size)
-            test_input, test_labels = btc_load(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, horizon, seq_size)
+            train_input, train_labels = btc_load(
+                cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, horizon, seq_size
+            )
+            val_input, val_labels = btc_load(
+                cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, horizon, seq_size
+            )
+            test_input, test_labels = btc_load(
+                cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, horizon, seq_size
+            )
             train_input = maybe_add_diff_features(train_input)
             val_input = maybe_add_diff_features(val_input)
             test_input = maybe_add_diff_features(test_input)
@@ -221,7 +283,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
         _pm = getattr(config.dataset, "product_mode", "concat")
         product_mode = ProductMode(_pm) if isinstance(_pm, str) else _pm
         cache_sub = battery_cache_subdir(
-            config.dataset.sampling_time, config.dataset.dates, config.dataset.sampling_type.value, all_features
+            config.dataset.sampling_time,
+            config.dataset.dates,
+            config.dataset.sampling_type.value,
+            all_features,
         )
 
         if product_mode == ProductMode.PER_PRODUCT:
@@ -248,16 +313,24 @@ def train(config: Config, trainer: L.Trainer, run=None):
                         continue
                     try:
                         if multi_horizon:
-                            inp, lab = battery_load_multi(path, all_features, cst.LEN_SMOOTH, seq_size)
+                            inp, lab = battery_load_multi(
+                                path, all_features, cst.LEN_SMOOTH, seq_size
+                            )
                         else:
-                            inp, lab = battery_load(path, all_features, cst.LEN_SMOOTH, horizon, seq_size)
+                            inp, lab = battery_load(
+                                path, all_features, cst.LEN_SMOOTH, horizon, seq_size
+                            )
                     except ValueError:
                         continue  # product too small for seq_size / horizon
                     inp = maybe_add_diff_features(inp)
                     if inp.shape[0] < seq_size:
                         continue
 
-                    ds = MultiHorizonDataset(inp, lab, seq_size) if multi_horizon else Dataset(inp, lab, seq_size)
+                    ds = (
+                        MultiHorizonDataset(inp, lab, seq_size)
+                        if multi_horizon
+                        else Dataset(inp, lab, seq_size)
+                    )
 
                     if split == "train":
                         train_datasets.append(ds)
@@ -267,9 +340,13 @@ def train(config: Config, trainer: L.Trainer, run=None):
                         test_datasets.append(ds)
 
             if not train_datasets:
-                raise RuntimeError("[BATTERY] No training data found in per_product mode")
+                raise RuntimeError(
+                    "[BATTERY] No training data found in per_product mode"
+                )
             if not val_datasets:
-                raise RuntimeError("[BATTERY] No validation data found in per_product mode")
+                raise RuntimeError(
+                    "[BATTERY] No validation data found in per_product mode"
+                )
             if not test_datasets:
                 raise RuntimeError("[BATTERY] No test data found in per_product mode")
 
@@ -325,13 +402,25 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
             else:
                 train_input, train_labels = battery_load(
-                    concat_dir + "/train.npy", all_features, cst.LEN_SMOOTH, horizon, seq_size
+                    concat_dir + "/train.npy",
+                    all_features,
+                    cst.LEN_SMOOTH,
+                    horizon,
+                    seq_size,
                 )
                 val_input, val_labels = battery_load(
-                    concat_dir + "/val.npy", all_features, cst.LEN_SMOOTH, horizon, seq_size
+                    concat_dir + "/val.npy",
+                    all_features,
+                    cst.LEN_SMOOTH,
+                    horizon,
+                    seq_size,
                 )
                 test_input, test_labels = battery_load(
-                    concat_dir + "/test.npy", all_features, cst.LEN_SMOOTH, horizon, seq_size
+                    concat_dir + "/test.npy",
+                    all_features,
+                    cst.LEN_SMOOTH,
+                    horizon,
+                    seq_size,
                 )
                 train_input = maybe_add_diff_features(train_input)
                 val_input = maybe_add_diff_features(val_input)
@@ -363,7 +452,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
                         path = cst.DATA_DIR + "/" + training_stocks[i] + "/train.npy"
                         if multi_horizon:
                             train_input, train_labels = lobster_load_multi(
-                                path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size
+                                path,
+                                config.model.hyperparameters_fixed["all_features"],
+                                cst.LEN_SMOOTH,
+                                seq_size,
                             )
                         else:
                             train_input, train_labels = lobster_load(
@@ -378,7 +470,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
                         path = cst.DATA_DIR + "/" + training_stocks[i] + "/val.npy"
                         if multi_horizon:
                             val_input, val_labels = lobster_load_multi(
-                                path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size
+                                path,
+                                config.model.hyperparameters_fixed["all_features"],
+                                cst.LEN_SMOOTH,
+                                seq_size,
                             )
                         else:
                             val_input, val_labels = lobster_load(
@@ -405,7 +500,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
                         train_labels = torch.cat((train_labels, pad), 0)
                         if multi_horizon:
                             train_input_tmp, train_labels_tmp = lobster_load_multi(
-                                path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size
+                                path,
+                                config.model.hyperparameters_fixed["all_features"],
+                                cst.LEN_SMOOTH,
+                                seq_size,
                             )
                         else:
                             train_input_tmp, train_labels_tmp = lobster_load(
@@ -432,7 +530,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
                         val_labels = torch.cat((val_labels, pad), 0)
                         if multi_horizon:
                             val_input_tmp, val_labels_tmp = lobster_load_multi(
-                                path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size
+                                path,
+                                config.model.hyperparameters_fixed["all_features"],
+                                cst.LEN_SMOOTH,
+                                seq_size,
                             )
                         else:
                             val_input_tmp, val_labels_tmp = lobster_load(
@@ -450,13 +551,20 @@ def train(config: Config, trainer: L.Trainer, run=None):
             path = cst.DATA_DIR + "/" + testing_stocks[i] + "/test.npy"
             if multi_horizon:
                 test_input, test_labels = lobster_load_multi(
-                    path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, seq_size
+                    path,
+                    config.model.hyperparameters_fixed["all_features"],
+                    cst.LEN_SMOOTH,
+                    seq_size,
                 )
                 test_input = maybe_add_diff_features(test_input)
                 test_set = MultiHorizonDataset(test_input, test_labels, seq_size)
             else:
                 test_input, test_labels = lobster_load(
-                    path, config.model.hyperparameters_fixed["all_features"], cst.LEN_SMOOTH, horizon, seq_size
+                    path,
+                    config.model.hyperparameters_fixed["all_features"],
+                    cst.LEN_SMOOTH,
+                    horizon,
+                    seq_size,
                 )
                 test_input = maybe_add_diff_features(test_input)
                 test_set = Dataset(test_input, test_labels, seq_size)
@@ -499,8 +607,12 @@ def train(config: Config, trainer: L.Trainer, run=None):
         product_label = "product" if test_total_products == 1 else "products"
         loader_label = "DataLoader" if len(test_loaders) == 1 else "DataLoaders"
 
-        print(f"\nTrain set: {_fmt_int_space(len(train_set))} samples ({len(train_set.datasets)} products)")
-        print(f"Val set:   {_fmt_int_space(len(val_set))} samples ({len(val_set.datasets)} products)")
+        print(
+            f"\nTrain set: {_fmt_int_space(len(train_set))} samples ({len(train_set.datasets)} products)"
+        )
+        print(
+            f"Val set:   {_fmt_int_space(len(val_set))} samples ({len(val_set.datasets)} products)"
+        )
         print(
             f"Test:      {_fmt_int_space(test_total_samples)} samples "
             f"({test_total_products} {product_label}, {len(test_loaders)} {loader_label})\n"
@@ -508,12 +620,18 @@ def train(config: Config, trainer: L.Trainer, run=None):
 
         if dataset_type == "BATTERY":
             print("Per-product aggregated diagnostics")
-            _print_per_product_split_diagnostics("train", train_set.datasets, multi_horizon, horizon)
-            _print_per_product_split_diagnostics("val", val_set.datasets, multi_horizon, horizon)
+            _print_per_product_split_diagnostics(
+                "train", train_set.datasets, multi_horizon, horizon
+            )
+            _print_per_product_split_diagnostics(
+                "val", val_set.datasets, multi_horizon, horizon
+            )
 
             test_concat = test_loaders[0].dataset
             if isinstance(test_concat, ConcatDataset):
-                _print_per_product_split_diagnostics("test", test_concat.datasets, multi_horizon, horizon)
+                _print_per_product_split_diagnostics(
+                    "test", test_concat.datasets, multi_horizon, horizon
+                )
             print()
     else:
         counts_train = torch.unique(train_labels, return_counts=True)
@@ -534,33 +652,40 @@ def train(config: Config, trainer: L.Trainer, run=None):
         )
         print()
 
-    counts_source = train_set.datasets if isinstance(train_set, ConcatDataset) else [train_set]
+    counts_source = (
+        train_set.datasets if isinstance(train_set, ConcatDataset) else [train_set]
+    )
     train_counts = _aggregate_split_counts(counts_source, multi_horizon).float()
     class_weights = None
-    if multi_horizon:
-        per_horizon_weights = []
-        for horizon_index, horizon_value in enumerate(cst.LOBSTER_HORIZONS):
-            horizon_counts = train_counts[horizon_index]
-            horizon_weights = _inverse_sqrt_class_weights(horizon_counts)
-            per_horizon_weights.append(horizon_weights)
-            print(
-                f"Using class weights (h{horizon_value}): "
-                f"counts={horizon_counts.to(torch.long).tolist()} "
-                f"weights={[round(weight, 4) for weight in horizon_weights.tolist()]}"
-            )
+    if config.experiment.use_class_weights:
+        if multi_horizon:
+            per_horizon_weights = []
+            for horizon_index, horizon_value in enumerate(cst.LOBSTER_HORIZONS):
+                horizon_counts = train_counts[horizon_index]
+                horizon_weights = _inverse_sqrt_class_weights(horizon_counts)
+                per_horizon_weights.append(horizon_weights)
+                print(
+                    f"Using class weights (h{horizon_value}): "
+                    f"counts={horizon_counts.to(torch.long).tolist()} "
+                    f"weights={[round(weight, 4) for weight in horizon_weights.tolist()]}"
+                )
 
-        class_weights = torch.stack(per_horizon_weights, dim=0)
-    else:
-        horizon_counts = train_counts[0]
-        if horizon_counts.sum() > 0:
-            class_weights = _inverse_sqrt_class_weights(horizon_counts)
-            print(
-                "Using class weights (h10): "
-                f"counts={horizon_counts.to(torch.long).tolist()} "
-                f"weights={[round(weight, 4) for weight in class_weights.tolist()]}"
-            )
+            class_weights = torch.stack(per_horizon_weights, dim=0)
         else:
-            print("Skipping class weights: unable to compute non-empty h10 class counts.")
+            horizon_counts = train_counts[0]
+            if horizon_counts.sum() > 0:
+                class_weights = _inverse_sqrt_class_weights(horizon_counts)
+                print(
+                    "Using class weights (h10): "
+                    f"counts={horizon_counts.to(torch.long).tolist()} "
+                    f"weights={[round(weight, 4) for weight in class_weights.tolist()]}"
+                )
+            else:
+                print(
+                    "Skipping class weights: unable to compute non-empty h10 class counts."
+                )
+    else:
+        print("Class weights disabled via experiment.use_class_weights=False")
 
     # Log dataset stats to wandb
     if run is not None:
@@ -606,7 +731,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
     experiment_type = config.experiment.type
     if "FINETUNING" in experiment_type or "EVALUATION" in experiment_type:
         if checkpoint_ref != "":
-            checkpoint = torch.load(checkpoint_path, map_location=cst.DEVICE, weights_only=False)
+            checkpoint = torch.load(
+                checkpoint_path, map_location=cst.DEVICE, weights_only=False
+            )
 
         print("Loading model from checkpoint: ", config.experiment.checkpoint_reference)
         lr = checkpoint["hyper_parameters"]["lr"]
@@ -646,6 +773,12 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
             )
+        elif model_type == "MLPLOB_ORIGINAL":
+            model = OriginalEngine.load_from_checkpoint(
+                checkpoint_path,
+                map_location=cst.DEVICE,
+                weights_only=False,
+            )
         elif model_type == "TLOB":
             model = Engine.load_from_checkpoint(
                 checkpoint_path,
@@ -676,6 +809,12 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                 torch_compile_backend=config.experiment.torch_compile_backend,
                 use_fast_attention=config.experiment.use_fast_attention,
+            )
+        elif model_type == "TLOB_ORIGINAL":
+            model = OriginalEngine.load_from_checkpoint(
+                checkpoint_path,
+                map_location=cst.DEVICE,
+                weights_only=False,
             )
         elif model_type == "BINCTABL":
             model = Engine.load_from_checkpoint(
@@ -733,7 +872,53 @@ def train(config: Config, trainer: L.Trainer, run=None):
             )
 
     else:
-        if model_type == cst.ModelType.MLPLOB:
+        if model_type == cst.ModelType.MLPLOB_ORIGINAL:
+            optimizer_name = (
+                "Adam"
+                if config.experiment.optimizer == "AdamW"
+                else config.experiment.optimizer
+            )
+            model = OriginalEngine(
+                seq_size=seq_size,
+                horizon=horizon,
+                max_epochs=config.experiment.max_epochs,
+                model_type=config.model.type.value,
+                is_wandb=config.experiment.is_wandb,
+                experiment_type=experiment_type,
+                lr=config.model.hyperparameters_fixed["lr"],
+                optimizer=optimizer_name,
+                dir_ckpt=config.experiment.dir_ckpt,
+                hidden_dim=config.model.hyperparameters_fixed["hidden_dim"],
+                num_layers=config.model.hyperparameters_fixed["num_layers"],
+                num_features=train_input.shape[1],
+                dataset_type=dataset_type,
+                len_test_dataloader=len(test_loaders[0]),
+            )
+        elif model_type == cst.ModelType.TLOB_ORIGINAL:
+            optimizer_name = (
+                "Adam"
+                if config.experiment.optimizer == "AdamW"
+                else config.experiment.optimizer
+            )
+            model = OriginalEngine(
+                seq_size=seq_size,
+                horizon=horizon,
+                max_epochs=config.experiment.max_epochs,
+                model_type=config.model.type.value,
+                is_wandb=config.experiment.is_wandb,
+                experiment_type=experiment_type,
+                lr=config.model.hyperparameters_fixed["lr"],
+                optimizer=optimizer_name,
+                dir_ckpt=config.experiment.dir_ckpt,
+                hidden_dim=config.model.hyperparameters_fixed["hidden_dim"],
+                num_layers=config.model.hyperparameters_fixed["num_layers"],
+                num_features=train_input.shape[1],
+                dataset_type=dataset_type,
+                num_heads=config.model.hyperparameters_fixed["num_heads"],
+                is_sin_emb=config.model.hyperparameters_fixed["is_sin_emb"],
+                len_test_dataloader=len(test_loaders[0]),
+            )
+        elif model_type == cst.ModelType.MLPLOB:
             model = Engine(
                 seq_size=seq_size,
                 horizon=horizon,
@@ -842,29 +1027,44 @@ def train(config: Config, trainer: L.Trainer, run=None):
             )
 
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))
-    train_dataloader, val_dataloader = data_module.train_dataloader(), data_module.val_dataloader()
+    train_dataloader, val_dataloader = (
+        data_module.train_dataloader(),
+        data_module.val_dataloader(),
+    )
 
     if "TRAINING" in experiment_type or "FINETUNING" in experiment_type:
         trainer.fit(model, train_dataloader, val_dataloader)
         best_model_path = model.last_path_ckpt
         print("Best model path: ", best_model_path)
         try:
-            best_model = Engine.load_from_checkpoint(
-                best_model_path,
-                map_location=cst.DEVICE,
-                weights_only=False,
-                use_torch_compile=config.experiment.use_torch_compile,
-                torch_compile_mode=config.experiment.torch_compile_mode,
-                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
-                torch_compile_backend=config.experiment.torch_compile_backend,
-                use_fast_attention=config.experiment.use_fast_attention,
-                class_weights=class_weights,
-                loss_type=config.experiment.loss_type,
-                focal_gamma=config.experiment.focal_gamma,
-                ordinal_smoothing=config.experiment.ordinal_smoothing,
-            )
+            if model_type in {
+                cst.ModelType.MLPLOB_ORIGINAL,
+                cst.ModelType.TLOB_ORIGINAL,
+            }:
+                best_model = OriginalEngine.load_from_checkpoint(
+                    best_model_path,
+                    map_location=cst.DEVICE,
+                    weights_only=False,
+                )
+            else:
+                best_model = Engine.load_from_checkpoint(
+                    best_model_path,
+                    map_location=cst.DEVICE,
+                    weights_only=False,
+                    use_torch_compile=config.experiment.use_torch_compile,
+                    torch_compile_mode=config.experiment.torch_compile_mode,
+                    torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                    torch_compile_backend=config.experiment.torch_compile_backend,
+                    use_fast_attention=config.experiment.use_fast_attention,
+                    class_weights=class_weights,
+                    loss_type=config.experiment.loss_type,
+                    focal_gamma=config.experiment.focal_gamma,
+                    ordinal_smoothing=config.experiment.ordinal_smoothing,
+                )
         except Exception as checkpoint_error:
-            print(f"failed to load best checkpoint ({best_model_path}): {checkpoint_error}")
+            print(
+                f"failed to load best checkpoint ({best_model_path}): {checkpoint_error}"
+            )
             print("selecting the last model")
             best_model = model
         best_model.experiment_type = "EVALUATION"
@@ -889,7 +1089,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
 
 def run_wandb(config: Config, accelerator):
     def wandb_sweep_callback():
-        wandb_logger = WandbLogger(project=cst.PROJECT_NAME, log_model=False, save_dir=cst.DIR_SAVED_MODEL)
+        wandb_logger = WandbLogger(
+            project=cst.PROJECT_NAME, log_model=False, save_dir=cst.DIR_SAVED_MODEL
+        )
         run_name = None
         if not config.experiment.is_sweep:
             run_name = ""
@@ -903,7 +1105,9 @@ def run_wandb(config: Config, accelerator):
                 else:
                     run_name += str(param[:2]) + "_" + str(value.value) + "_"
 
-        run = wandb.init(project=cst.PROJECT_NAME, name=run_name, entity="")  # set entity to your wandb username
+        run = wandb.init(
+            project=cst.PROJECT_NAME, name=run_name, entity=""
+        )  # set entity to your wandb username
 
         if config.experiment.is_sweep:
             model_params = run.config
@@ -923,9 +1127,7 @@ def run_wandb(config: Config, accelerator):
         mh_suffix = "_multi_horizon" if config.experiment.multi_horizon else ""
         if dataset == "LOBSTER":
             training_stocks = config.dataset.training_stocks
-            config.experiment.dir_ckpt = (
-                f"{dataset}_{training_stocks}_seq_size_{seq_size}_horizon_{horizon}_seed_{seed}{mh_suffix}"
-            )
+            config.experiment.dir_ckpt = f"{dataset}_{training_stocks}_seq_size_{seq_size}_horizon_{horizon}_seed_{seed}{mh_suffix}"
         else:
             config.experiment.dir_ckpt = f"{dataset}_seq_size_{seq_size}_horizon_{horizon}_seed_{seed}{mh_suffix}"
         wandb_instance_name = config.experiment.dir_ckpt
@@ -935,7 +1137,13 @@ def run_wandb(config: Config, accelerator):
             precision=config.experiment.precision,
             max_epochs=config.experiment.max_epochs,
             callbacks=[
-                EarlyStopping(monitor="val_loss", mode="min", patience=3, verbose=True, min_delta=0.0005),
+                EarlyStopping(
+                    monitor="val_loss",
+                    mode="min",
+                    patience=3,
+                    verbose=True,
+                    min_delta=0.0005,
+                ),
                 TQDMProgressBar(refresh_rate=1000),
             ],
             num_sanity_val_steps=0,
@@ -948,23 +1156,43 @@ def run_wandb(config: Config, accelerator):
         run.log({"model": config.model.type.value}, commit=False)
         run.log({"dataset": config.dataset.type.value}, commit=False)
         run.log({"seed": config.experiment.seed}, commit=False)
-        run.log({"all_features": config.model.hyperparameters_fixed["all_features"]}, commit=False)
+        run.log(
+            {"all_features": config.model.hyperparameters_fixed["all_features"]},
+            commit=False,
+        )
         run.log({"multi_horizon": config.experiment.multi_horizon}, commit=False)
-        run.log({"use_diff_features": config.experiment.use_diff_features}, commit=False)
+        run.log(
+            {"use_diff_features": config.experiment.use_diff_features}, commit=False
+        )
         dates = config.dataset.dates
-        num_days = (datetime.strptime(dates[1], "%Y-%m-%d") - datetime.strptime(dates[0], "%Y-%m-%d")).days
+        num_days = (
+            datetime.strptime(dates[1], "%Y-%m-%d")
+            - datetime.strptime(dates[0], "%Y-%m-%d")
+        ).days
         run.log({"num_dates": f"{num_days} ({dates[0]} - {dates[1]})"}, commit=False)
         if hasattr(config.dataset, "sampling_type"):
             run.log({"sampling_type": config.dataset.sampling_type.value}, commit=False)
-            if config.dataset.sampling_type in (SamplingType.TIME, SamplingType.TIME_DEDUP):
+            if config.dataset.sampling_type in (
+                SamplingType.TIME,
+                SamplingType.TIME_DEDUP,
+            ):
                 run.log({"sampling_time": config.dataset.sampling_time}, commit=False)
             elif config.dataset.sampling_type == SamplingType.QUANTITY:
-                run.log({"sampling_quantity": config.dataset.sampling_quantity}, commit=False)
+                run.log(
+                    {"sampling_quantity": config.dataset.sampling_quantity},
+                    commit=False,
+                )
         if config.dataset.type == cst.DatasetType.LOBSTER:
             for i in range(len(config.dataset.training_stocks)):
-                run.log({f"training stock{i}": config.dataset.training_stocks[i]}, commit=False)
+                run.log(
+                    {f"training stock{i}": config.dataset.training_stocks[i]},
+                    commit=False,
+                )
             for i in range(len(config.dataset.testing_stocks)):
-                run.log({f"testing stock{i}": config.dataset.testing_stocks[i]}, commit=False)
+                run.log(
+                    {f"testing stock{i}": config.dataset.testing_stocks[i]},
+                    commit=False,
+                )
         if config.dataset.type == cst.DatasetType.BATTERY:
             run.log({"product_mode": config.dataset.product_mode.value}, commit=False)
         train(config, trainer, run)

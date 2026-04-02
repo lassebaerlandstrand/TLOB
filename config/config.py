@@ -1,8 +1,10 @@
-from typing import List
-from hydra.core.config_store import ConfigStore
 from dataclasses import dataclass, field
-from constants import DatasetType, ModelType, SamplingType, ProductMode
+from typing import List
+
+from hydra.core.config_store import ConfigStore
 from omegaconf import MISSING
+
+from constants import DatasetType, ModelType, ProductMode, SamplingType
 
 
 @dataclass
@@ -25,7 +27,12 @@ class MLPLOB(Model):
         }
     )
     hyperparameters_sweep: dict = field(
-        default_factory=lambda: {"num_layers": [3, 6], "hidden_dim": [128], "lr": [0.0003], "seq_size": [384]}
+        default_factory=lambda: {
+            "num_layers": [3, 6],
+            "hidden_dim": [128],
+            "lr": [0.0003],
+            "seq_size": [384],
+        }
     )
     type: ModelType = ModelType.MLPLOB
 
@@ -59,16 +66,72 @@ class TLOB(Model):
 
 
 @dataclass
+class MLPLOBOriginal(Model):
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 3,
+            "hidden_dim": 40,
+            "lr": 0.0003,
+            "seq_size": 384,
+            "all_features": True,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [3, 6],
+            "hidden_dim": [128],
+            "lr": [0.0003],
+            "seq_size": [384],
+        }
+    )
+    type: ModelType = ModelType.MLPLOB_ORIGINAL
+
+
+@dataclass
+class TLOBOriginal(Model):
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 4,
+            "hidden_dim": 40,
+            "num_heads": 1,
+            "is_sin_emb": True,
+            "lr": 0.0001,
+            "seq_size": 128,
+            "all_features": True,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [4, 6],
+            "hidden_dim": [128, 256],
+            "num_heads": [1],
+            "is_sin_emb": [True],
+            "lr": [0.0001],
+            "seq_size": [128],
+        }
+    )
+    type: ModelType = ModelType.TLOB_ORIGINAL
+
+
+@dataclass
 class BiNCTABL(Model):
-    hyperparameters_fixed: dict = field(default_factory=lambda: {"lr": 0.001, "seq_size": 10, "all_features": False})
-    hyperparameters_sweep: dict = field(default_factory=lambda: {"lr": [0.001], "seq_size": [10]})
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {"lr": 0.001, "seq_size": 10, "all_features": False}
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {"lr": [0.001], "seq_size": [10]}
+    )
     type: ModelType = ModelType.BINCTABL
 
 
 @dataclass
 class DeepLOB(Model):
-    hyperparameters_fixed: dict = field(default_factory=lambda: {"lr": 0.01, "seq_size": 100, "all_features": False})
-    hyperparameters_sweep: dict = field(default_factory=lambda: {"lr": [0.01], "seq_size": [100]})
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {"lr": 0.01, "seq_size": 100, "all_features": False}
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {"lr": [0.01], "seq_size": [100]}
+    )
     type: ModelType = ModelType.DEEPLOB
 
 
@@ -130,7 +193,9 @@ class BATTERY(Dataset):
     parsed_data_path: str = "data/battery_markets/parsed"
     max_lob_depth: float = 1000.0
     all_features: bool = True
-    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1})
+    model_overrides: dict = field(
+        default_factory=lambda: {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1}
+    )
 
 
 @dataclass
@@ -153,6 +218,8 @@ class Experiment:
     precision: str = "32-true"
     use_fast_attention: bool = True
     use_diff_features: bool = True
+    use_class_weights: bool = True
+    label_mode: str = "absolute_change"  # "absolute_change" | "percent_change"
     multi_horizon: bool = False
     loss_type: str = "cross_entropy"  # "cross_entropy" | "focal" | "focal_ordinal"
     focal_gamma: float = 2.0  # Unused if loss_type is not "focal" or "focal_ordinal"
@@ -168,7 +235,11 @@ class Config:
     dataset: Dataset
     experiment: Experiment = field(default_factory=Experiment)
     defaults: List = field(
-        default_factory=lambda: [{"hydra/job_logging": "disabled"}, {"hydra/hydra_logging": "disabled"}, "_self_"]
+        default_factory=lambda: [
+            {"hydra/job_logging": "disabled"},
+            {"hydra/hydra_logging": "disabled"},
+            "_self_",
+        ]
     )
 
 
@@ -176,6 +247,8 @@ cs = ConfigStore.instance()
 cs.store(name="config", node=Config)
 cs.store(group="model", name="mlplob", node=MLPLOB)
 cs.store(group="model", name="tlob", node=TLOB)
+cs.store(group="model", name="mlplob_original", node=MLPLOBOriginal)
+cs.store(group="model", name="tlob_original", node=TLOBOriginal)
 cs.store(group="model", name="binctabl", node=BiNCTABL)
 cs.store(group="model", name="deeplob", node=DeepLOB)
 cs.store(group="dataset", name="lobster", node=LOBSTER)

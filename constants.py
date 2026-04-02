@@ -1,29 +1,34 @@
-import torch
 from enum import Enum
+
+import torch
+
 
 class DatasetType(Enum):
     LOBSTER = "LOBSTER"
     FI_2010 = "FI_2010"
     BTC = "BTC"
     BATTERY = "BATTERY"
-    
+
 
 class ModelType(Enum):
     MLPLOB = "MLPLOB"
     TLOB = "TLOB"
+    MLPLOB_ORIGINAL = "MLPLOB_ORIGINAL"
+    TLOB_ORIGINAL = "TLOB_ORIGINAL"
     BINCTABL = "BINCTABL"
     DEEPLOB = "DEEPLOB"
-    
+
+
 class SamplingType(Enum):
     TIME = "time"
     TIME_DEDUP = "time_dedup"
     QUANTITY = "quantity"
     NONE = "none"
 
+
 class ProductMode(Enum):
     CONCAT = "concat"
     PER_PRODUCT = "per_product"
-
 
 
 # for 15 days of TSLA
@@ -57,8 +62,6 @@ INTC_EVENT_MEAN_DEPTH = 1.3685517399834501
 INTC_EVENT_STD_DEPTH = 2.333747222206966
 
 
-
-
 LOBSTER_HORIZONS = [10, 20, 50, 100]
 PRECISION = 32
 N_LOB_LEVELS = 10
@@ -66,7 +69,7 @@ LEN_LEVEL = 4
 LEN_ORDER = 6
 LEN_SMOOTH = 10
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DIR_EXPERIMENTS = "data/experiments"
 DIR_SAVED_MODEL = "data/checkpoints"
 DATA_DIR = "data"

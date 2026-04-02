@@ -12,9 +12,9 @@ Examples:
   python run_experiments.py --dataset battery --mode all-horizons --sampling-time 5s --dry-run
 """
 
+import argparse
 import subprocess
 import sys
-import argparse
 
 MODEL = "tlob"
 DATASET = "fi_2010"
@@ -75,7 +75,12 @@ def main():
         default="all-horizons",
         help="Experiment mode (default: all-horizons).",
     )
-    parser.add_argument("--horizon", type=int, default=10, help="Horizon for 'single' mode (default: 10).")
+    parser.add_argument(
+        "--horizon",
+        type=int,
+        default=10,
+        help="Horizon for 'single' mode (default: 10).",
+    )
     parser.add_argument(
         "--horizons",
         type=int,
@@ -83,19 +88,51 @@ def main():
         default=HORIZONS,
         help=f"Horizons for 'all-horizons' mode (default: {HORIZONS}).",
     )
-    parser.add_argument("--model", type=str, default=MODEL, help=f"Model to use (default: {MODEL})")
-    parser.add_argument("--dataset", type=str, default=DATASET, help=f"Dataset to use (default: {DATASET})")
-    parser.add_argument("--epochs", type=int, default=MAX_EPOCHS, help=f"Max epochs per run (default: {MAX_EPOCHS})")
-    parser.add_argument("--rebuild-data", action="store_true", help="Force data preprocessing on the first run.")
-    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
-    parser.add_argument("--sampling-time", type=str, default=None, help="Battery sampling interval (e.g. '5s', '10s')")
     parser.add_argument(
-        "--dates", type=str, nargs=2, default=None, metavar=("START", "END"), help="Date range (YYYY-MM-DD)"
+        "--model", type=str, default=MODEL, help=f"Model to use (default: {MODEL})"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=DATASET,
+        help=f"Dataset to use (default: {DATASET})",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=MAX_EPOCHS,
+        help=f"Max epochs per run (default: {MAX_EPOCHS})",
+    )
+    parser.add_argument(
+        "--rebuild-data",
+        action="store_true",
+        help="Force data preprocessing on the first run.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print commands without executing them."
+    )
+    parser.add_argument(
+        "--sampling-time",
+        type=str,
+        default=None,
+        help="Battery sampling interval (e.g. '5s', '10s')",
+    )
+    parser.add_argument(
+        "--dates",
+        type=str,
+        nargs=2,
+        default=None,
+        metavar=("START", "END"),
+        help="Date range (YYYY-MM-DD)",
     )
 
     args = parser.parse_args()
 
     is_battery = args.dataset.lower() == "battery"
+    if args.mode == "multi-horizons" and str(args.model).lower().endswith("_original"):
+        raise SystemExit(
+            "multi-horizons mode is not supported for *_original baseline models. Use --mode single or all-horizons."
+        )
 
     # ----------------------------------------------------------------- #
     # single: one run for a specified horizon

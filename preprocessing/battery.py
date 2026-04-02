@@ -49,7 +49,9 @@ _N_LOB = cst.N_LOB_LEVELS * cst.LEN_LEVEL  # 40
 _N_LABELS = len(cst.LOBSTER_HORIZONS)  # 4
 _NCOLS_FULL = _N_MSG + _N_LOB + _N_LABELS  # 54
 _NCOLS_LOB = _N_LOB + _N_LABELS  # 44
-_HORIZON_IDX = {h: i for i, h in enumerate(cst.LOBSTER_HORIZONS)}  # {10:0, 20:1, 50:2, 100:3}
+_HORIZON_IDX = {
+    h: i for i, h in enumerate(cst.LOBSTER_HORIZONS)
+}  # {10:0, 20:1, 50:2, 100:3}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,7 +86,9 @@ def battery_load(path: str, all_features: bool, len_smooth: int, h: int, seq_siz
     labels  : LongTensor  (N_valid,)   values in {0, 1, 2}
     """
     if h not in _HORIZON_IDX:
-        raise ValueError(f"Unsupported horizon: {h}. Must be one of {list(_HORIZON_IDX)}")
+        raise ValueError(
+            f"Unsupported horizon: {h}. Must be one of {list(_HORIZON_IDX)}"
+        )
 
     arr = np.load(path)
     msg_cols, lob_cols, label_cols = _split_columns(arr, path)
@@ -146,12 +150,17 @@ def _select_features(msg_cols, lob_cols, all_features: bool, path: str) -> np.nd
                 f"all_features=True but {path} was preprocessed with all_features=False "
                 f"(LOB-only format, 44 columns). Re-preprocess with all_features=True."
             )
-        return np.concatenate([lob_cols, msg_cols], axis=1).astype(np.float32)  # (N, 50)
+        return np.concatenate([lob_cols, msg_cols], axis=1).astype(
+            np.float32
+        )  # (N, 50)
     return lob_cols.astype(np.float32)  # (N, 40)
 
 
 def battery_cache_subdir(
-    sampling_time: str, dates: list[str], sampling_type: str = "time", all_features: bool = False
+    sampling_time: str,
+    dates: list[str],
+    sampling_type: str = "time",
+    all_features: bool = False,
 ) -> str:
     """Return a human-readable subdirectory name encoding sampling_time, dates, sampling_type, and all_features.
 
@@ -228,6 +237,7 @@ class BatteryDataBuilder:
         max_lob_depth: float = 1000.0,
         all_features: bool = True,
         force_rebuild: bool = False,
+        label_mode: str = "absolute_change",
     ):
         self.data_dir = data_dir
         self.sampling_time_str = sampling_time
@@ -247,6 +257,7 @@ class BatteryDataBuilder:
         self.max_lob_depth = max_lob_depth
         self.all_features = all_features
         self.force_rebuild = force_rebuild
+        self.label_mode = label_mode
         self.sampling_type = sampling_type
         self.dedup = sampling_type == SamplingType.TIME_DEDUP
         self.n_lob_levels = cst.N_LOB_LEVELS  # 10
@@ -292,7 +303,9 @@ class BatteryDataBuilder:
             snapshots = self._extract_all_snapshots(bin_path, cache_hash)
 
         if snapshots["lobs"].shape[0] == 0:
-            raise ValueError("No LOB snapshots extracted. Check raw data and date range.")
+            raise ValueError(
+                "No LOB snapshots extracted. Check raw data and date range."
+            )
 
         # ── Stage 4: Split, label, normalise, save ────────────────────────────
         print(f"\n[BATTERY] Stage 4/4: Building datasets...")
@@ -319,15 +332,24 @@ class BatteryDataBuilder:
         parse_end = self.end_date.strftime("%Y-%m-%d")
 
         # Check cache: need CSVs for start-1 through end
-        expected_dates = pd.date_range(self.start_date - pd.Timedelta(days=1), self.end_date, freq="D")
+        expected_dates = pd.date_range(
+            self.start_date - pd.Timedelta(days=1), self.end_date, freq="D"
+        )
         existing = set(csv_path.glob("orderbook_*.csv.zip"))
-        existing_dates = {pd.Timestamp(f.name.replace("orderbook_", "").replace(".csv.zip", "")) for f in existing}
-        missing = [d for d in expected_dates if pd.Timestamp(d.date()) not in existing_dates]
+        existing_dates = {
+            pd.Timestamp(f.name.replace("orderbook_", "").replace(".csv.zip", ""))
+            for f in existing
+        }
+        missing = [
+            d for d in expected_dates if pd.Timestamp(d.date()) not in existing_dates
+        ]
 
         if not missing:
             print(f"  [BATTERY] Using cached CSVs from {csv_path}")
         else:
-            print(f"  Parsing {len(expected_dates)} days ({parse_start} → {parse_end})...")
+            print(
+                f"  Parsing {len(expected_dates)} days ({parse_start} → {parse_end})..."
+            )
             data_handler = bitepy.Data()
             data_handler.parse_market_data(
                 start_date_str=parse_start,
@@ -351,18 +373,26 @@ class BatteryDataBuilder:
 
         csv_files = sorted(csv_path.glob("orderbook_*.csv.zip"))
         if not csv_files:
-            raise FileNotFoundError(f"No CSV files found in {csv_path}. Did Stage 1 succeed?")
+            raise FileNotFoundError(
+                f"No CSV files found in {csv_path}. Did Stage 1 succeed?"
+            )
 
         # Check cache: compare number of bins vs csvs
         existing_bins = set(bin_path.glob("*.bin"))
-        missing_bins = [f for f in csv_files if not (bin_path / (f.stem.replace(".csv", "") + ".bin")).exists()]
+        missing_bins = [
+            f
+            for f in csv_files
+            if not (bin_path / (f.stem.replace(".csv", "") + ".bin")).exists()
+        ]
 
         if not missing_bins:
             print(f"  [BATTERY] Using cached bins from {bin_path}")
         else:
             print(f"  Converting {len(csv_files)} CSV files to binary...")
             data_handler = bitepy.Data()
-            data_handler.create_bins_from_csv(csv_files, str(bin_path) + "/", verbose=True)
+            data_handler.create_bins_from_csv(
+                csv_files, str(bin_path) + "/", verbose=True
+            )
 
         return bin_path
 
@@ -390,9 +420,15 @@ class BatteryDataBuilder:
         if not day_buffer:
             return
         lobs = np.array([s["lob"] for s in day_buffer], dtype=np.float32)
-        snap_times = np.array([s["snapshot_time"].value for s in day_buffer], dtype=np.int64)
-        deliv_times = np.array([s["delivery_time"].value for s in day_buffer], dtype=np.int64)
-        deliv_dates = np.array([s["delivery_date"].toordinal() for s in day_buffer], dtype=np.int32)
+        snap_times = np.array(
+            [s["snapshot_time"].value for s in day_buffer], dtype=np.int64
+        )
+        deliv_times = np.array(
+            [s["delivery_time"].value for s in day_buffer], dtype=np.int64
+        )
+        deliv_dates = np.array(
+            [s["delivery_date"].toordinal() for s in day_buffer], dtype=np.int32
+        )
         save_kw: dict[str, np.ndarray] = dict(
             lobs=lobs,
             snap_times=snap_times,
@@ -417,18 +453,30 @@ class BatteryDataBuilder:
                 all_msgs.append(data["msgs"])
                 has_msgs = True
         result: dict[str, np.ndarray] = {
-            "lobs": np.concatenate(all_lobs) if all_lobs else np.empty((0, self.n_lob_levels * 4), dtype=np.float32),
-            "snap_times": np.concatenate(all_snap) if all_snap else np.empty(0, dtype=np.int64),
-            "deliv_times": np.concatenate(all_deliv) if all_deliv else np.empty(0, dtype=np.int64),
-            "deliv_dates": np.concatenate(all_dd) if all_dd else np.empty(0, dtype=np.int32),
+            "lobs": np.concatenate(all_lobs)
+            if all_lobs
+            else np.empty((0, self.n_lob_levels * 4), dtype=np.float32),
+            "snap_times": np.concatenate(all_snap)
+            if all_snap
+            else np.empty(0, dtype=np.int64),
+            "deliv_times": np.concatenate(all_deliv)
+            if all_deliv
+            else np.empty(0, dtype=np.int64),
+            "deliv_dates": np.concatenate(all_dd)
+            if all_dd
+            else np.empty(0, dtype=np.int32),
         }
         if has_msgs:
             result["msgs"] = np.concatenate(all_msgs)
         n = result["lobs"].shape[0]
-        print(f"  Loaded {n:,} cached (snapshot, product) pairs from {len(day_paths)} day files")
+        print(
+            f"  Loaded {n:,} cached (snapshot, product) pairs from {len(day_paths)} day files"
+        )
         return result
 
-    def _extract_all_snapshots(self, bin_path: Path, cache_hash: str) -> dict[str, np.ndarray]:
+    def _extract_all_snapshots(
+        self, bin_path: Path, cache_hash: str
+    ) -> dict[str, np.ndarray]:
         """Run bitepy Simulation, flushing snapshots to per-day .npz files.
 
         Each observation day's snapshots are converted to numpy arrays and saved
@@ -466,11 +514,15 @@ class BatteryDataBuilder:
             [
                 str(p)
                 for p in bin_path.glob("*.bin")
-                if bin_start.date() <= pd.Timestamp(p.stem.split("_", 1)[1]).date() <= self.end_date.date()
+                if bin_start.date()
+                <= pd.Timestamp(p.stem.split("_", 1)[1]).date()
+                <= self.end_date.date()
             ]
         )
         if not all_bins:
-            raise FileNotFoundError(f"No bin files found in {bin_path} for {bin_start.date()} → {self.end_date.date()}")
+            raise FileNotFoundError(
+                f"No bin files found in {bin_path} for {bin_start.date()} → {self.end_date.date()}"
+            )
 
         # Load first bin; subsequent bins are loaded when the previous one is exhausted
         bin_idx = 0
@@ -501,7 +553,9 @@ class BatteryDataBuilder:
             sim.run_one_day(is_last=is_last_bin)
 
             if sim.has_stopped_at_stop_time():
-                lob_dict = sim.get_limit_order_book_state(max_action=self.max_lob_depth, return_dict=True)
+                lob_dict = sim.get_limit_order_book_state(
+                    max_action=self.max_lob_depth, return_dict=True
+                )
 
                 if lob_dict:
                     for dt_key in sorted(lob_dict.keys()):
@@ -522,7 +576,11 @@ class BatteryDataBuilder:
                         prev_ts = prev_time_per_product.get(delivery_time, current_time)
 
                         # Dedup: skip if LOB unchanged since last kept snapshot
-                        if self.dedup and prev_lob is not None and np.array_equal(lob_row, prev_lob):
+                        if (
+                            self.dedup
+                            and prev_lob is not None
+                            and np.array_equal(lob_row, prev_lob)
+                        ):
                             continue
 
                         msg_row = None
@@ -573,7 +631,9 @@ class BatteryDataBuilder:
 
         # Flush any remaining snapshots (last day)
         if day_buffer and day_idx < len(day_paths):
-            self._flush_day_buffer(day_buffer, day_paths[min(day_idx, len(day_paths) - 1)])
+            self._flush_day_buffer(
+                day_buffer, day_paths[min(day_idx, len(day_paths) - 1)]
+            )
             total_flushed += len(day_buffer)
             day_buffer = []
 
@@ -583,7 +643,9 @@ class BatteryDataBuilder:
             day_idx += 1
         day_bar.close()
 
-        print(f"  Extracted and saved {total_flushed:,} snapshots across {len(days)} day files")
+        print(
+            f"  Extracted and saved {total_flushed:,} snapshots across {len(days)} day files"
+        )
 
         # Load all per-day files and return concatenated arrays
         existing_paths = [p for p in day_paths if p.exists()]
@@ -639,7 +701,9 @@ class BatteryDataBuilder:
         return np.array(row, dtype=np.float32)
 
     @staticmethod
-    def _reduceat_aggregate(prices: np.ndarray, volumes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def _reduceat_aggregate(
+        prices: np.ndarray, volumes: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Aggregate volumes at consecutive same-price entries.
 
         Parameters are assumed pre-sorted (ascending for sells, descending for buys).
@@ -680,7 +744,9 @@ class BatteryDataBuilder:
 
         ttd_seconds = max((delivery_time - curr_time).total_seconds(), 0.0)
         time_to_delivery_hrs = ttd_seconds / 3600.0
-        lifecycle_progress = float(np.clip(1.0 - (ttd_seconds / (31.5 * 3600.0)), 0.0, 1.0))
+        lifecycle_progress = float(
+            np.clip(1.0 - (ttd_seconds / (31.5 * 3600.0)), 0.0, 1.0)
+        )
 
         spread_bps = ((sell1 - buy1) / max(abs(mid), 0.01)) * 10000.0
 
@@ -752,7 +818,9 @@ class BatteryDataBuilder:
         obs_days = sorted([_dt.date.fromordinal(int(o)) for o in unique_obs_ord])
         train_days, val_days, test_days = self._split_day_list(obs_days)
 
-        print(f"  Concat split — train: {len(train_days)} days, val: {len(val_days)} days, test: {len(test_days)} days")
+        print(
+            f"  Concat split — train: {len(train_days)} days, val: {len(val_days)} days, test: {len(test_days)} days"
+        )
 
         train_ord = np.array([d.toordinal() for d in train_days], dtype=np.int32)
         val_ord = np.array([d.toordinal() for d in val_days], dtype=np.int32)
@@ -767,7 +835,10 @@ class BatteryDataBuilder:
         print(f"  test: {test_mask.sum():,} snapshots")
 
         subdir = battery_cache_subdir(
-            self.sampling_time_str, self.date_strs, self.sampling_type.value, self.all_features
+            self.sampling_time_str,
+            self.date_strs,
+            self.sampling_type.value,
+            self.all_features,
         )
         out_dir = Path(self.data_dir) / "battery_markets" / "concat" / subdir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -792,7 +863,9 @@ class BatteryDataBuilder:
 
         # Normalise
         print("  Normalising features...")
-        train_norm, val_norm, test_norm = self._normalise_splits(train_features, val_features, test_features)
+        train_norm, val_norm, test_norm = self._normalise_splits(
+            train_features, val_features, test_features
+        )
 
         # Save
         self._save_split(train_norm, train_labels, out_dir / "train.npy")
@@ -831,7 +904,10 @@ class BatteryDataBuilder:
         print(f"  Total unique delivery contracts: {len(unique_dt)}")
 
         subdir = battery_cache_subdir(
-            self.sampling_time_str, self.date_strs, self.sampling_type.value, self.all_features
+            self.sampling_time_str,
+            self.date_strs,
+            self.sampling_type.value,
+            self.all_features,
         )
         out_root = Path(self.data_dir) / "battery_markets" / "per_product" / subdir
         out_root.mkdir(parents=True, exist_ok=True)
@@ -856,7 +932,11 @@ class BatteryDataBuilder:
         if self.all_features and msgs is not None:
             train_msgs_global = msgs[train_mask]
             train_features_global = np.concatenate(
-                [train_msgs_global.astype(np.float32), train_lobs_global.astype(np.float32)], axis=1
+                [
+                    train_msgs_global.astype(np.float32),
+                    train_lobs_global.astype(np.float32),
+                ],
+                axis=1,
             )
         else:
             train_features_global = train_lobs_global.astype(np.float32)
@@ -893,7 +973,9 @@ class BatteryDataBuilder:
 
             prod_dir = products_dir / key
             prod_dir.mkdir(exist_ok=True)
-            self._save_product_arrays(split_name, prod_lobs, prod_msgs, prod_dir, global_stats)
+            self._save_product_arrays(
+                split_name, prod_lobs, prod_msgs, prod_dir, global_stats
+            )
             product_keys_saved.append(key)
 
         # Save manifest at root level (read by run.py)
@@ -901,7 +983,9 @@ class BatteryDataBuilder:
         with open(out_root / "products.json", "w") as f:
             json.dump(manifest, f, indent=2)
 
-        print(f"  Saved {len(product_keys_saved)} product directories under {products_dir}")
+        print(
+            f"  Saved {len(product_keys_saved)} product directories under {products_dir}"
+        )
 
     def _save_product_arrays(
         self,
@@ -916,7 +1000,9 @@ class BatteryDataBuilder:
             return
 
         if self.all_features and msgs is not None:
-            features = np.concatenate([msgs.astype(np.float32), lobs.astype(np.float32)], axis=1)
+            features = np.concatenate(
+                [msgs.astype(np.float32), lobs.astype(np.float32)], axis=1
+            )
         else:
             features = lobs.astype(np.float32)
 
@@ -967,7 +1053,9 @@ class BatteryDataBuilder:
 
         label_cols = []
         for h in tqdm(cst.LOBSTER_HORIZONS, desc="  Computing labels", leave=False):
-            lbls = labeling(raw_lob, cst.LEN_SMOOTH, h)  # (N - h - LEN_SMOOTH + 1,)
+            lbls = labeling(
+                raw_lob, cst.LEN_SMOOTH, h, label_mode=self.label_mode
+            )  # (N - h - LEN_SMOOTH + 1,)
             pad = np.full(raw_lob.shape[0] - lbls.shape[0], np.inf, dtype=np.float64)
             label_cols.append(np.concatenate([lbls.astype(np.float64), pad]))
 
@@ -990,7 +1078,9 @@ class BatteryDataBuilder:
         norm, stats = self._normalise_features(features, stats=None)
         return norm, stats, {}
 
-    def _normalise_features(self, features: np.ndarray, stats: dict | None) -> tuple[np.ndarray, dict]:
+    def _normalise_features(
+        self, features: np.ndarray, stats: dict | None
+    ) -> tuple[np.ndarray, dict]:
         """Z-score normalise feature columns.
 
         For all_features=True:  features is (N, 50) = [10 msg | 40 LOB]
@@ -1046,13 +1136,20 @@ class BatteryDataBuilder:
                     columns=stats["msg_columns"],
                 )
 
-            norm = np.concatenate([msg_df.values, lob_df.values], axis=1).astype(np.float32)
+            norm = np.concatenate([msg_df.values, lob_df.values], axis=1).astype(
+                np.float32
+            )
         else:
             lob_df = pd.DataFrame(features)
             if stats is None:
                 ms, mp, ss, sp = self._lob_stats(lob_df)
                 lob_df, _, _, _, _ = z_score_orderbook(lob_df, ms, mp, ss, sp)
-                stats = dict(lob_mean_size=ms, lob_mean_price=mp, lob_std_size=ss, lob_std_price=sp)
+                stats = dict(
+                    lob_mean_size=ms,
+                    lob_mean_price=mp,
+                    lob_std_size=ss,
+                    lob_std_price=sp,
+                )
             else:
                 lob_df, _, _, _, _ = z_score_orderbook(
                     lob_df,
@@ -1097,7 +1194,9 @@ class BatteryDataBuilder:
             stds = np.asarray(stds, dtype=np.float64)
 
         if means.shape[0] != len(columns) or stds.shape[0] != len(columns):
-            raise ValueError("Message normalisation stats do not match feature columns.")
+            raise ValueError(
+                "Message normalisation stats do not match feature columns."
+            )
 
         safe_stds = np.maximum(stds, _EPS)
         df_out = data.copy()
@@ -1135,13 +1234,17 @@ class BatteryDataBuilder:
                 continue
 
             # Column count
-            assert arr.shape[1] == expected_ncols, f"{split}.npy has {arr.shape[1]} columns, expected {expected_ncols}"
+            assert arr.shape[1] == expected_ncols, (
+                f"{split}.npy has {arr.shape[1]} columns, expected {expected_ncols}"
+            )
 
             # Features finite
             feat = arr[:, :-_N_LABELS]
             non_finite_pct = (~np.isfinite(feat)).mean() * 100
             if non_finite_pct > 0:
-                print(f"  WARNING {split}.npy: {non_finite_pct:.2f}% non-finite feature values")
+                print(
+                    f"  WARNING {split}.npy: {non_finite_pct:.2f}% non-finite feature values"
+                )
 
             # Labels
             label_arr = arr[:, -_N_LABELS:]
@@ -1150,14 +1253,19 @@ class BatteryDataBuilder:
                 valid = col[np.isfinite(col)]
                 if valid.size > 0:
                     unique, counts = np.unique(valid.astype(int), return_counts=True)
-                    dist = {int(u): f"{c / valid.size * 100:.1f}%" for u, c in zip(unique, counts)}
+                    dist = {
+                        int(u): f"{c / valid.size * 100:.1f}%"
+                        for u, c in zip(unique, counts)
+                    }
                     print(f"  {split}.npy h{h} labels: {dist} ({valid.size:,} valid)")
                 else:
                     print(f"  WARNING {split}.npy h{h}: no valid labels")
 
             # LOB structure (on first 1000 rows for speed)
             lob_start = _N_MSG if self.all_features else 0
-            self._validate_lob_structure(arr[:1000, lob_start : lob_start + _N_LOB], split)
+            self._validate_lob_structure(
+                arr[:1000, lob_start : lob_start + _N_LOB], split
+            )
 
         print(f"[BATTERY] Validation complete.\n")
 
@@ -1191,4 +1299,6 @@ class BatteryDataBuilder:
         # Best ask should be above best bid (after z-score: sell1 > buy1)
         crossed = (sell_prices[:, 0] <= buy_prices[:, 0]).mean()
         if crossed > 0.05:
-            print(f"  WARNING {name}: {crossed * 100:.1f}% snapshots have crossed book (sell1 <= buy1)")
+            print(
+                f"  WARNING {name}: {crossed * 100:.1f}% snapshots have crossed book (sell1 <= buy1)"
+            )

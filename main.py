@@ -1,20 +1,20 @@
 import os
 import random
 import warnings
-
 import zipfile
 
 warnings.filterwarnings("ignore")
-import numpy as np
-import wandb
-import torch
-import constants as cst
 import hydra
+import numpy as np
+import torch
+
+import constants as cst
+import wandb
 from config.config import Config
-from run import run_wandb, run, sweep_init
-from preprocessing.lobster import LOBSTERDataBuilder
-from preprocessing.btc import BTCDataBuilder
 from preprocessing.battery import BatteryDataBuilder
+from preprocessing.btc import BTCDataBuilder
+from preprocessing.lobster import LOBSTERDataBuilder
+from run import run, run_wandb, sweep_init
 
 
 @hydra.main(config_path="config", config_name="config")
@@ -35,7 +35,10 @@ def hydra_app(config: Config):
     if hasattr(config.dataset, "all_features"):
         config.model.hyperparameters_fixed["all_features"] = config.dataset.all_features
 
-    if config.dataset.type.value == "LOBSTER" and not config.experiment.is_data_preprocessed:
+    if (
+        config.dataset.type.value == "LOBSTER"
+        and not config.experiment.is_data_preprocessed
+    ):
         # prepare the datasets, this will save train.npy, val.npy and test.npy in the data directory
         data_builder = LOBSTERDataBuilder(
             stocks=config.dataset.training_stocks,
@@ -45,10 +48,14 @@ def hydra_app(config: Config):
             sampling_type=config.dataset.sampling_type,
             sampling_time=config.dataset.sampling_time,
             sampling_quantity=config.dataset.sampling_quantity,
+            label_mode=config.experiment.label_mode,
         )
         data_builder.prepare_save_datasets()
 
-    elif config.dataset.type.value == "FI_2010" and not config.experiment.is_data_preprocessed:
+    elif (
+        config.dataset.type.value == "FI_2010"
+        and not config.experiment.is_data_preprocessed
+    ):
         try:
             # take the .zip files name in data/FI_2010
             dir = cst.DATA_DIR + "/FI_2010/"
@@ -61,7 +68,10 @@ def hydra_app(config: Config):
         except Exception as e:
             raise (f"Error downloading or extracting data: {e}")
 
-    elif config.dataset.type == cst.DatasetType.BTC and not config.experiment.is_data_preprocessed:
+    elif (
+        config.dataset.type == cst.DatasetType.BTC
+        and not config.experiment.is_data_preprocessed
+    ):
         data_builder = BTCDataBuilder(
             data_dir=cst.DATA_DIR,
             date_trading_days=config.dataset.dates,
@@ -69,10 +79,14 @@ def hydra_app(config: Config):
             sampling_type=config.dataset.sampling_type,
             sampling_time=config.dataset.sampling_time,
             sampling_quantity=config.dataset.sampling_quantity,
+            label_mode=config.experiment.label_mode,
         )
         data_builder.prepare_save_datasets()
 
-    elif config.dataset.type == cst.DatasetType.BATTERY and not config.experiment.is_data_preprocessed:
+    elif (
+        config.dataset.type == cst.DatasetType.BATTERY
+        and not config.experiment.is_data_preprocessed
+    ):
         data_builder = BatteryDataBuilder(
             data_dir=cst.DATA_DIR,
             date_trading_days=config.dataset.dates,
@@ -87,6 +101,7 @@ def hydra_app(config: Config):
             max_lob_depth=config.dataset.max_lob_depth,
             all_features=config.dataset.all_features,
             force_rebuild=True,
+            label_mode=config.experiment.label_mode,
         )
         data_builder.prepare_save_datasets()
 
@@ -94,7 +109,9 @@ def hydra_app(config: Config):
         if config.experiment.is_sweep:
             sweep_config = sweep_init(config)
             sweep_id = wandb.sweep(sweep_config, project=cst.PROJECT_NAME, entity="")
-            wandb.agent(sweep_id, run_wandb(config, accelerator), count=sweep_config["run_cap"])
+            wandb.agent(
+                sweep_id, run_wandb(config, accelerator), count=sweep_config["run_cap"]
+            )
         else:
             start_wandb = run_wandb(config, accelerator)
             start_wandb()

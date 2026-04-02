@@ -291,4 +291,5 @@ data/checkpoints/**/*.svg
 
 # Agent files
 AGENTS.md
+CLAUDE.md
 ccswitch.sh

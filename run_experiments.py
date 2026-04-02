@@ -21,7 +21,7 @@ DATASET = "fi_2010"
 HORIZONS = [10, 20, 50, 100]
 SEED = 1
 MAX_EPOCHS = 50
-IS_WANDB = "True"
+IS_WANDB = True
 
 
 def profile_overrides(args):
@@ -77,7 +77,7 @@ def base_command(args, is_preprocessed="True"):
         f"experiment.seed={SEED}",
         f"experiment.max_epochs={args.epochs}",
         f"experiment.is_data_preprocessed={is_preprocessed}",
-        f"experiment.is_wandb={IS_WANDB}",
+        f"experiment.is_wandb={not args.no_wandb and IS_WANDB}",
     ]
     command += profile_overrides(args)
     return command
@@ -156,6 +156,11 @@ def main():
         default=None,
         metavar=("START", "END"),
         help="Date range (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable WandB logging (useful for quick validation runs).",
     )
     parser.add_argument(
         "--profile",

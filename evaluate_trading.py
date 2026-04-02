@@ -7,12 +7,67 @@ protocol with optional cost sensitivity and confidence threshold sweeps.
 Usage
 -----
     # Single or multi-horizon (auto-detected)
-    python evaluate_trading.py --checkpoint_dir data/checkpoints/TLOB/BTC_seq_size_128_horizon_10_seed_1
+    python evaluate_trading.py --checkpoint_dir data/checkpoints/TLOB/BTC_seq_size_128_horizon_10_seed_1_multi_horizon
 
     # With cost sensitivity and confidence sweep
     python evaluate_trading.py --checkpoint_dir <path> \
         --costs 0.0 0.5 1.0 2.0 5.0 \
         --confidence_thresholds 0.0 0.5 0.7 0.9
+
+Parameters
+----------
+    Cost               Transaction cost as a multiple of the mean absolute
+                       per-step price change (mean |Δmid|). Cost=0 is free,
+                       cost=1.0 means each trade costs one average price
+                       movement. Auto-scales across datasets: cost=1.0 means
+                       the same thing for BTC (250ms) and Battery (10s+).
+                       Charged per unit of position change (long->short = 2).
+
+    Confidence         Minimum softmax probability to act on a prediction.
+    threshold          If max(p_up, p_stat, p_down) < threshold, the
+                       prediction is overridden to STATIONARY (flat).
+                       Higher thresholds = fewer but more confident trades.
+                       At 0.0 (default), all predictions are acted on.
+
+Output columns
+--------------
+    PnL(norm)      Cumulative profit/loss in z-score normalized price units
+                   over the entire test period. Not dollars — measures
+                   prediction quality. Scale-invariant across datasets.
+
+    Sharpe/step    Per-step Sharpe ratio = mean(step_return) / std(step_return).
+                   Signal-to-noise of a single step's return. Small number
+                   (e.g. 0.13) but directly comparable across datasets
+                   regardless of number of steps or sampling frequency.
+
+    Sortino/step   Like Sharpe but only penalizes downside volatility.
+                   Always >= Sharpe for profitable strategies.
+
+    MaxDD%         Maximum drawdown as % of equity (starting capital = 1.0).
+                   Largest peak-to-trough decline. -100% means the strategy
+                   lost all notional capital at some point (even if it recovered).
+
+    WinRate        % of active steps (non-zero position) with positive return.
+                   Can be low (e.g. 19%) yet profitable if winning steps are
+                   much larger than losing ones (see ProfitF). Low win rates
+                   are typical at high sampling frequencies (250ms) where most
+                   individual steps are noise.
+
+    ProfitF        Profit factor = sum(positive returns) / |sum(negative returns)|.
+                   >1 = profitable, 1 = breakeven, <1 = losing. A ProfitF of
+                   5.0 means $5 earned for every $1 lost across all steps.
+
+    Trades         Number of position changes (long->short counts as 1 trade).
+
+    Exposure       % of steps where the model holds a non-zero position
+                   (long or short). Higher exposure = more active strategy.
+
+    p-value        Two-sided t-test: "could this mean return be zero?"
+                   p < 0.05 = statistically significant profit (or loss).
+                   Near-zero p-values are normal with hundreds of thousands
+                   of steps — even tiny signals are significant at that scale.
+                   Only becomes non-trivial when very few trades are made
+                   (e.g. high confidence thresholds filtering out most signals).
 """
 
 from __future__ import annotations
@@ -317,9 +372,7 @@ def _save_json_results(results: dict, save_dir: str):
                 if conf_key.startswith("_"):
                     continue
                 if isinstance(conf_val, dict):
-                    clean[cost_key][conf_key] = {
-                        k: v for k, v in conf_val.items() if not k.startswith("_")
-                    }
+                    clean[cost_key][conf_key] = {k: v for k, v in conf_val.items() if not k.startswith("_")}
                 else:
                     clean[cost_key][conf_key] = conf_val
 

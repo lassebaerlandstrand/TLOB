@@ -4,6 +4,7 @@ from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy import stats as scipy_stats
 from sklearn.metrics import (
     accuracy_score,
     cohen_kappa_score,
@@ -315,3 +316,232 @@ def plot_confusion_matrices(metrics_list, horizons, save_dir):
     saved_paths.append(combined_path)
 
     return saved_paths
+
+
+# ---------------------------------------------------------------------------
+# Directional trading simulation (Zhang et al., 2019 protocol)
+# ---------------------------------------------------------------------------
+
+_POSITION_MAP = np.array([1, 0, -1], dtype=np.float64)  # UP=+1, STAT=0, DOWN=-1
+
+
+def compute_trading_metrics(
+    mid_prices: np.ndarray,
+    predictions: np.ndarray,
+    probabilities: np.ndarray | None = None,
+    cost_per_trade: float = 0.0,
+    confidence_threshold: float = 0.0,
+    segment_boundaries: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Simulate a directional trading strategy and compute performance metrics.
+
+    Follows the Zhang et al. (2019) DeepLOB protocol:
+    UP(0) -> long +1, STATIONARY(1) -> flat 0, DOWN(2) -> short -1.
+
+    Parameters
+    ----------
+    mid_prices : (N,) array of sequential (normalized) mid-prices.
+    predictions : (N,) array with values in {0, 1, 2}.
+    probabilities : (N, 3) softmax probabilities, optional.
+        Used for confidence thresholding.
+    cost_per_trade : Cost multiplier (x mean |Δmid|) per unit of position change.
+    confidence_threshold : Minimum max-class probability to act.
+        Predictions below this threshold are treated as STATIONARY.
+    segment_boundaries : 1-D array of cumulative boundary indices, optional.
+        Positions are forced to zero at each boundary (e.g. EPEX product
+        boundaries).  Values are exclusive end indices of each segment.
+    """
+    mid_prices = _to_numpy(mid_prices).astype(np.float64, copy=False).ravel()
+    predictions = _to_numpy(predictions).astype(np.int64, copy=False).ravel()
+    n = min(len(mid_prices), len(predictions))
+    if n < 2:
+        return _empty_trading_metrics()
+
+    mid_prices = mid_prices[:n]
+    predictions = predictions[:n]
+
+    # --- confidence filtering ---
+    if probabilities is not None and confidence_threshold > 0.0:
+        probabilities = _to_numpy(probabilities).astype(np.float64, copy=False)
+        if probabilities.ndim == 2:
+            max_conf = probabilities[:n].max(axis=1)
+        else:
+            max_conf = probabilities[:n]
+        low_conf = max_conf < confidence_threshold
+        predictions = predictions.copy()
+        predictions[low_conf] = 1  # treat as STATIONARY
+
+    # --- build position series ---
+    positions = _POSITION_MAP[predictions]  # (N,)
+
+    # --- force close at segment boundaries ---
+    if segment_boundaries is not None:
+        segment_boundaries = np.asarray(segment_boundaries, dtype=np.int64)
+        for b in segment_boundaries:
+            if 0 < b < n:
+                positions[b - 1] = 0  # close position at end of segment
+
+    # force close at the very end
+    positions[-1] = 0
+
+    # --- step returns ---
+    price_changes = np.diff(mid_prices)  # (N-1,)
+    mean_abs_price_change = float(np.mean(np.abs(price_changes)))
+    step_positions = positions[:-1]  # position held during [t, t+1)
+    gross_returns = step_positions * price_changes  # (N-1,)
+
+    # --- transaction costs (relative to mean |Δmid|) ---
+    effective_cost = cost_per_trade * mean_abs_price_change
+    position_changes = np.abs(np.diff(positions))  # (N-1,)
+    # first step: change from flat (0)
+    first_change = np.abs(positions[0])
+    costs = np.empty(n - 1, dtype=np.float64)
+    costs[0] = effective_cost * first_change
+    costs[1:] = effective_cost * position_changes[:-1]
+    # Add final closing cost (going from positions[-2] to positions[-1]=0)
+    if n > 2:
+        costs[-1] += effective_cost * position_changes[-1]
+
+    # Zero out gross returns at boundary crossings (artificial price change
+    # spanning two different products) but keep costs (closing cost is real).
+    if segment_boundaries is not None:
+        for b in segment_boundaries:
+            idx = b - 1
+            if 0 <= idx < len(gross_returns):
+                gross_returns[idx] = 0.0
+
+    net_returns = gross_returns - costs
+
+    # --- cumulative PnL ---
+    cumulative_pnl = np.cumsum(net_returns)
+    total_pnl = float(cumulative_pnl[-1]) if len(cumulative_pnl) > 0 else 0.0
+
+    # --- active steps (non-zero position) ---
+    active_mask = step_positions != 0
+    n_active = int(active_mask.sum())
+    active_returns = net_returns[active_mask]
+
+    # --- Per-step Sharpe ratio (signal-to-noise of single-step return) ---
+    std_r = float(np.std(net_returns))
+    mean_r = float(np.mean(net_returns))
+    sharpe = (mean_r / std_r) if std_r > 1e-12 else 0.0
+
+    # --- Per-step Sortino (downside deviation over all N returns) ---
+    downside_returns = np.minimum(net_returns, 0.0)
+    downside_std = float(np.sqrt(np.mean(downside_returns**2)))
+    sortino = (mean_r / downside_std) if downside_std > 1e-12 else 0.0
+
+    # --- Max drawdown ---
+    running_max = np.maximum.accumulate(cumulative_pnl)
+    drawdowns = cumulative_pnl - running_max
+    max_dd = float(drawdowns.min()) if len(drawdowns) > 0 else 0.0
+
+    # MaxDD% via equity curve with notional starting capital = 1.0
+    equity = 1.0 + cumulative_pnl
+    if np.any(equity <= 0):
+        max_dd_pct = -100.0
+    elif len(equity) > 0:
+        running_max_eq = np.maximum.accumulate(equity)
+        drawdowns_pct = (equity - running_max_eq) / running_max_eq
+        max_dd_pct = float(drawdowns_pct.min()) * 100.0
+    else:
+        max_dd_pct = 0.0
+
+    # --- Calmar ---
+    calmar = (total_pnl / abs(max_dd)) if abs(max_dd) > 1e-12 else 0.0
+
+    # --- Win rate ---
+    if n_active > 0:
+        win_rate = float((active_returns > 0).sum()) / n_active
+    else:
+        win_rate = 0.0
+
+    # --- Profit factor ---
+    gross_profit = float(net_returns[net_returns > 0].sum())
+    gross_loss = float(np.abs(net_returns[net_returns < 0].sum()))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 1e-12 else float("inf") if gross_profit > 0 else 0.0
+
+    # --- Trade count (number of position changes) ---
+    n_trades = int(first_change != 0) + int(position_changes.sum())
+
+    # --- Exposure ---
+    exposure_pct = (n_active / len(step_positions) * 100.0) if len(step_positions) > 0 else 0.0
+
+    # --- Statistical significance (t-test: H0 mean return = 0) ---
+    if len(net_returns) > 1 and std_r > 1e-12:
+        t_stat, p_value = scipy_stats.ttest_1samp(net_returns, 0.0)
+        t_stat = float(t_stat)
+        p_value = float(p_value)
+    else:
+        t_stat = 0.0
+        p_value = 1.0
+
+    return {
+        "total_pnl": total_pnl,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "max_drawdown": max_dd,
+        "max_drawdown_pct": max_dd_pct,
+        "calmar": calmar,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "n_trades": n_trades,
+        "exposure_pct": exposure_pct,
+        "t_stat": t_stat,
+        "p_value": p_value,
+        "n_steps": len(net_returns),
+        "mean_abs_price_change": mean_abs_price_change,
+        "returns_series": net_returns,
+        "cumulative_pnl": cumulative_pnl,
+        "positions": positions,
+    }
+
+
+def _empty_trading_metrics() -> dict[str, Any]:
+    return {
+        "total_pnl": 0.0,
+        "sharpe": 0.0,
+        "sortino": 0.0,
+        "max_drawdown": 0.0,
+        "max_drawdown_pct": 0.0,
+        "calmar": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "n_trades": 0,
+        "exposure_pct": 0.0,
+        "t_stat": 0.0,
+        "p_value": 1.0,
+        "n_steps": 0,
+        "mean_abs_price_change": 0.0,
+        "returns_series": np.array([], dtype=np.float64),
+        "cumulative_pnl": np.array([], dtype=np.float64),
+        "positions": np.array([], dtype=np.float64),
+    }
+
+
+def format_trading_table(trading_metrics_list: list[dict], horizons: list[int]) -> str:
+    header = (
+        "Horizon | PnL(norm) |   Sharpe/step |  Sortino/step | MaxDD%  | WinRate | ProfitF | Trades | Exposure |  p-value"
+    )
+    separator = (
+        "--------|-----------|--------------|--------------|---------|---------|---------|--------|----------|----------"
+    )
+    lines = [header, separator]
+
+    for idx, horizon in enumerate(horizons):
+        m = trading_metrics_list[idx]
+        pf = f"{m['profit_factor']:>7.2f}" if m["profit_factor"] != float("inf") else "    inf"
+        lines.append(
+            f"h{horizon:<6}|"
+            f" {m['total_pnl']:>9.4f} |"
+            f" {m['sharpe']:>12.2e} |"
+            f" {m['sortino']:>12.2e} |"
+            f" {m['max_drawdown_pct']:>6.1f}% |"
+            f" {m['win_rate'] * 100:>6.1f}% |"
+            f" {pf} |"
+            f" {_format_int_space(m['n_trades']):>6} |"
+            f" {m['exposure_pct']:>7.1f}% |"
+            f" {m['p_value']:>9.4f}"
+        )
+
+    return "\n".join(lines)

@@ -350,9 +350,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
             if not test_datasets:
                 raise RuntimeError("[BATTERY] No test data found in per_product mode")
 
+            test_concat = ConcatDataset(test_datasets)
             test_loaders = [
                 DataLoader(
-                    dataset=ConcatDataset(test_datasets),
+                    dataset=test_concat,
                     batch_size=config.dataset.batch_size * 4,
                     shuffle=False,
                     pin_memory=True,
@@ -362,6 +363,17 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     multiprocessing_context="spawn",
                 )
             ]
+            # Save product boundary indices for directional trading evaluation.
+            # ConcatDataset.cumulative_sizes gives the exclusive end index of
+            # each sub-dataset, which is where one product ends and the next
+            # begins — the trading simulation must close positions at these
+            # boundaries.
+            _boundaries = np.array(test_concat.cumulative_sizes, dtype=np.int64)
+            _boundaries_dir = os.path.join(
+                cst.DIR_SAVED_MODEL, config.model.type.value, config.experiment.dir_ckpt
+            )
+            os.makedirs(_boundaries_dir, exist_ok=True)
+            np.save(os.path.join(_boundaries_dir, "product_boundaries"), _boundaries)
 
             train_set = ConcatDataset(train_datasets)
             val_set = ConcatDataset(val_datasets)

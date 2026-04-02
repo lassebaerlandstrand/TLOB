@@ -17,9 +17,11 @@ from utils.utils_model import pick_model
 from utils.metrics import (
     compute_baselines,
     compute_metrics,
+    compute_trading_metrics,
     format_confidence_stats,
     format_horizon_table,
     format_prediction_distribution,
+    format_trading_table,
     plot_confusion_matrices,
 )
 import constants as cst
@@ -179,6 +181,7 @@ class Engine(LightningModule):
         self.test_targets = []
         self.test_predictions = []
         self.test_proba = []
+        self.test_proba_full = []
         self.val_targets = []
         self.val_loss = np.inf
         self.val_predictions = []
@@ -359,7 +362,7 @@ class Engine(LightningModule):
     # ------------------------------------------------------------------
     def test_step(self, batch, batch_idx):
         x, y = batch
-        mid_prices = ((x[:, 0, 0] + x[:, 0, 2]) // 2).cpu().numpy().flatten()
+        mid_prices = ((x[:, -1, 0] + x[:, -1, 2]) / 2).cpu().numpy().flatten()
         self.test_mid_prices.append(mid_prices)
 
         if self.multi_horizon:
@@ -386,16 +389,20 @@ class Engine(LightningModule):
                 with self.ema.average_parameters():
                     y_hat = self.forward(x, batch_idx)
                     batch_loss = self.loss(y_hat, y)
+                    softmax_proba = torch.softmax(y_hat, dim=1)
                     self.test_targets.append(y)
                     self.test_predictions.append(y_hat.argmax(dim=1))
-                    self.test_proba.append(torch.softmax(y_hat, dim=1)[:, 1])
+                    self.test_proba.append(softmax_proba[:, 1])
+                    self.test_proba_full.append(softmax_proba)
                     batch_loss_mean = torch.mean(batch_loss)
             else:
                 y_hat = self.forward(x, batch_idx)
                 batch_loss = self.loss(y_hat, y)
+                softmax_proba = torch.softmax(y_hat, dim=1)
                 self.test_targets.append(y)
                 self.test_predictions.append(y_hat.argmax(dim=1))
-                self.test_proba.append(torch.softmax(y_hat, dim=1)[:, 1])
+                self.test_proba.append(softmax_proba[:, 1])
+                self.test_proba_full.append(softmax_proba)
                 batch_loss_mean = torch.mean(batch_loss)
 
         self.test_losses.append(
@@ -488,8 +495,13 @@ class Engine(LightningModule):
         predictions = torch.cat(self.test_predictions).cpu().numpy()
         save_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt)
         os.makedirs(save_dir, exist_ok=True)
-        predictions_path = os.path.join(save_dir, "predictions")
-        np.save(predictions_path, predictions)
+        np.save(os.path.join(save_dir, "predictions"), predictions)
+        np.save(os.path.join(save_dir, "targets"), targets)
+
+        # Save mid-prices for directional trading evaluation
+        mid_prices = np.concatenate(self.test_mid_prices) if self.test_mid_prices else np.array([])
+        np.save(os.path.join(save_dir, "mid_prices"), mid_prices)
+
         self._section("Test Diagnostics")
 
         if self.multi_horizon:
@@ -514,6 +526,11 @@ class Engine(LightningModule):
 
                 h_report = classification_report(h_targets, h_preds, digits=4, output_dict=True)
                 self.log(f"f1_score_h{h}", h_report["macro avg"]["f1-score"])
+
+                # Save per-horizon arrays for trading evaluation
+                np.save(os.path.join(save_dir, f"predictions_h{h}"), h_preds)
+                np.save(os.path.join(save_dir, f"targets_h{h}"), h_targets)
+                np.save(os.path.join(save_dir, f"probabilities_h{h}"), h_proba)
 
             self._console("Test summary by horizon")
             self._console(format_horizon_table(metrics_per_h, HORIZONS, baselines_per_h))
@@ -577,9 +594,45 @@ class Engine(LightningModule):
             self.log("precision", class_report["macro avg"]["precision"])
             self.log("recall", class_report["macro avg"]["recall"])
 
+        # --- Directional trading simulation summary ---
+        self._section("Directional Trading Simulation")
+        boundaries_path = os.path.join(save_dir, "product_boundaries.npy")
+        segment_boundaries = np.load(boundaries_path) if os.path.exists(boundaries_path) else None
+
+        if self.multi_horizon:
+            trading_metrics_per_h = []
+            for i, h in enumerate(HORIZONS):
+                tm = compute_trading_metrics(
+                    mid_prices, predictions_per_h[i],
+                    probabilities=proba_per_h[i],
+                    segment_boundaries=segment_boundaries,
+                )
+                trading_metrics_per_h.append(tm)
+                self.log(f"trading/sharpe_h{h}", tm["sharpe"])
+                self.log(f"trading/pnl_h{h}", tm["total_pnl"])
+            self._console(format_trading_table(trading_metrics_per_h, HORIZONS))
+        else:
+            tm = compute_trading_metrics(
+                mid_prices, predictions,
+                segment_boundaries=segment_boundaries,
+            )
+            self._console(
+                f"PnL(norm)={tm['total_pnl']:.4f}  Sharpe/step={tm['sharpe']:.2e}  "
+                f"Sortino/step={tm['sortino']:.2e}  MaxDD={tm['max_drawdown_pct']:.1f}%  "
+                f"WinRate={tm['win_rate'] * 100:.1f}%  Trades={tm['n_trades']}  "
+                f"p-value={tm['p_value']:.4f}"
+            )
+            self.log("trading/sharpe", tm["sharpe"])
+            self.log("trading/pnl", tm["total_pnl"])
+
+        self._console("")
+        self._console(f"Checkpoint dir: {save_dir}")
+        self._console(f"  evaluate: python evaluate_trading.py --checkpoint_dir {save_dir}")
+
         self.test_targets = []
         self.test_predictions = []
         self.test_losses = []
+        self.test_mid_prices = []
         self.first_test = False
 
         if not self.multi_horizon and self.test_proba:
@@ -587,7 +640,13 @@ class Engine(LightningModule):
             precision, recall, _ = precision_recall_curve(targets, test_proba, pos_label=1)
             self.plot_pr_curves(recall, precision, self.is_wandb)
 
+        # Save full (N, 3) probabilities for confidence thresholding in trading eval
+        if not self.multi_horizon and self.test_proba_full:
+            full_proba = torch.cat(self.test_proba_full).cpu().numpy()
+            np.save(os.path.join(save_dir, "probabilities"), full_proba)
+
         self.test_proba = []
+        self.test_proba_full = []
 
     def on_fit_end(self) -> None:
         if self.total_train_time_s <= 0:

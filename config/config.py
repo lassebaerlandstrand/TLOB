@@ -224,6 +224,7 @@ class Experiment:
     loss_type: str = "cross_entropy"  # "cross_entropy" | "focal" | "focal_ordinal"
     focal_gamma: float = 2.0  # Unused if loss_type is not "focal" or "focal_ordinal"
     ordinal_smoothing: float = 0.15  # Unused if loss_type is not "focal_ordinal"
+    trading_cost: float = 0.0  # Cost multiplier (x mean |Δmid|) for trading simulation
 
 
 defaults = [Model, Experiment, Dataset]

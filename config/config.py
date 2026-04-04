@@ -115,23 +115,15 @@ class TLOBOriginal(Model):
 
 @dataclass
 class BiNCTABL(Model):
-    hyperparameters_fixed: dict = field(
-        default_factory=lambda: {"lr": 0.001, "seq_size": 10, "all_features": False}
-    )
-    hyperparameters_sweep: dict = field(
-        default_factory=lambda: {"lr": [0.001], "seq_size": [10]}
-    )
+    hyperparameters_fixed: dict = field(default_factory=lambda: {"lr": 0.001, "seq_size": 10, "all_features": False})
+    hyperparameters_sweep: dict = field(default_factory=lambda: {"lr": [0.001], "seq_size": [10]})
     type: ModelType = ModelType.BINCTABL
 
 
 @dataclass
 class DeepLOB(Model):
-    hyperparameters_fixed: dict = field(
-        default_factory=lambda: {"lr": 0.01, "seq_size": 100, "all_features": False}
-    )
-    hyperparameters_sweep: dict = field(
-        default_factory=lambda: {"lr": [0.01], "seq_size": [100]}
-    )
+    hyperparameters_fixed: dict = field(default_factory=lambda: {"lr": 0.01, "seq_size": 100, "all_features": False})
+    hyperparameters_sweep: dict = field(default_factory=lambda: {"lr": [0.01], "seq_size": [100]})
     type: ModelType = ModelType.DEEPLOB
 
 
@@ -220,9 +212,9 @@ class BATTERY(Dataset):
     parsed_data_path: str = "data/battery_markets/parsed"
     max_lob_depth: float = 1000.0
     all_features: bool = True
-    model_overrides: dict = field(
-        default_factory=lambda: {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1}
-    )
+    extract_events: bool = True
+    max_events_per_window: int = 64
+    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1})
 
 
 @dataclass

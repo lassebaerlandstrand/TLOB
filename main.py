@@ -102,6 +102,8 @@ def hydra_app(config: Config):
             all_features=config.dataset.all_features,
             force_rebuild=True,
             label_mode=config.experiment.label_mode,
+            extract_events=getattr(config.dataset, "extract_events", False),
+            max_events_per_window=getattr(config.dataset, "max_events_per_window", 64),
         )
         data_builder.prepare_save_datasets()
 

@@ -238,6 +238,8 @@ class BatteryDataBuilder:
         all_features: bool = True,
         force_rebuild: bool = False,
         label_mode: str = "absolute_change",
+        extract_events: bool = False,
+        max_events_per_window: int = 64,
     ):
         self.data_dir = data_dir
         self.sampling_time_str = sampling_time
@@ -261,6 +263,8 @@ class BatteryDataBuilder:
         self.sampling_type = sampling_type
         self.dedup = sampling_type == SamplingType.TIME_DEDUP
         self.n_lob_levels = cst.N_LOB_LEVELS  # 10
+        self.extract_events = extract_events
+        self.max_events_per_window = max_events_per_window
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -275,31 +279,37 @@ class BatteryDataBuilder:
         print(f"  Features   : {feature_mode} ({feature_cols} cols)")
         print(f"  Dedup      : {self.dedup}")
 
+        n_stages = 5 if self.extract_events else 4
+
         # ── Stage 1: Parse raw EPEX zips to CSV ──────────────────────────────
-        print(f"\n[BATTERY] Stage 1/4: Parsing raw EPEX data to CSV...")
+        print(f"\n[BATTERY] Stage 1/{n_stages}: Parsing raw EPEX data to CSV...")
         csv_path = self._parse_raw_to_csv()
 
         # ── Stage 2: Convert CSVs to binary ──────────────────────────────────
-        print(f"\n[BATTERY] Stage 2/4: Converting CSVs to binary format...")
+        print(f"\n[BATTERY] Stage 2/{n_stages}: Converting CSVs to binary format...")
         bin_path = self._convert_csv_to_bins(csv_path)
 
         # ── Stage 3: Extract LOB snapshots via simulation (per-day cached) ──
-        print(f"\n[BATTERY] Stage 3/4: Extracting LOB snapshots...")
+        print(f"\n[BATTERY] Stage 3/{n_stages}: Extracting LOB snapshots...")
         cache_hash = self._snapshot_cache_hash()
         days = list(pd.date_range(self.start_date, self.end_date, freq="D"))
         day_paths = [self._day_cache_path(bin_path, d.date(), cache_hash) for d in days]
 
         if self.force_rebuild:
-            snap_dir = bin_path.parent / "snap_cache" / cache_hash
-            if snap_dir.exists():
-                shutil.rmtree(snap_dir)
-                print(f"  [BATTERY] force_rebuild: deleted cache dir {snap_dir}")
+            # Only delete the specific day files we're rebuilding, not the whole dir
+            for p in day_paths:
+                if p.exists():
+                    p.unlink()
+            print(f"  [BATTERY] force_rebuild: deleted {len(day_paths)} day cache files")
 
-        all_cached = all(p.exists() for p in day_paths)
-        if all_cached:
+        missing_days = [d for d, p in zip(days, day_paths) if not p.exists()]
+        if not missing_days:
             print(f"  [BATTERY] Using cached per-day snapshots (hash={cache_hash})")
             snapshots = self._load_day_caches(day_paths)
         else:
+            n_cached = len(days) - len(missing_days)
+            if n_cached > 0:
+                print(f"  [BATTERY] {n_cached} days cached, extracting {len(missing_days)} missing days")
             snapshots = self._extract_all_snapshots(bin_path, cache_hash)
 
         if snapshots["lobs"].shape[0] == 0:
@@ -308,13 +318,64 @@ class BatteryDataBuilder:
             )
 
         # ── Stage 4: Split, label, normalise, save ────────────────────────────
-        print(f"\n[BATTERY] Stage 4/4: Building datasets...")
+        print(f"\n[BATTERY] Stage 4/{n_stages}: Building datasets...")
         if self.product_mode == ProductMode.CONCAT:
             self._build_concat_datasets(snapshots)
         elif self.product_mode == ProductMode.PER_PRODUCT:
             self._build_per_product_datasets(snapshots)
         else:
             raise ValueError(f"Unknown product_mode: {self.product_mode!r}.")
+
+        # ── Stage 5 (optional): Extract raw order events ──────────────────
+        if self.extract_events and self.product_mode == ProductMode.PER_PRODUCT:
+            print(f"\n[BATTERY] Stage 5/{n_stages}: Extracting raw order events...")
+            from preprocessing.events import extract_events_for_date_range
+
+            subdir = battery_cache_subdir(
+                self.sampling_time_str,
+                self.date_strs,
+                self.sampling_type.value,
+                self.all_features,
+            )
+            products_dir = (
+                Path(self.data_dir)
+                / "battery_markets"
+                / "per_product"
+                / subdir
+                / "products"
+            )
+            snap_cache_dir = self.parsed_data_path / "snap_cache" / cache_hash
+
+            # Check if events already extracted (skip if cached)
+            import json
+
+            manifest_path = products_dir.parent / "products.json"
+            needs_extraction = self.force_rebuild
+            if not needs_extraction and manifest_path.exists():
+                with open(manifest_path) as f:
+                    product_keys = json.load(f)
+                # Check first product for events.npz
+                if product_keys:
+                    sample_events = products_dir / product_keys[0] / "events.npz"
+                    needs_extraction = not sample_events.exists()
+                else:
+                    needs_extraction = True
+            else:
+                needs_extraction = True
+
+            if needs_extraction:
+                extract_events_for_date_range(
+                    raw_data_path=str(self.raw_data_path),
+                    start_date=self.date_strs[0],
+                    end_date=self.date_strs[1],
+                    snap_cache_path=snap_cache_dir,
+                    output_root=products_dir,
+                    sampling_seconds=self.sampling_seconds,
+                    max_events_per_window=self.max_events_per_window,
+                    parsed_data_path=str(self.parsed_data_path),
+                )
+            else:
+                print("  [BATTERY] Using cached event data")
 
         print(f"\n[BATTERY] Preprocessing complete.\n")
 
@@ -399,12 +460,16 @@ class BatteryDataBuilder:
     # ── Stage 3: Extract LOB snapshots ───────────────────────────────────────
 
     def _snapshot_cache_hash(self) -> str:
-        """Return deterministic hash for Stage 3 per-day cache keying."""
+        """Return deterministic hash for Stage 3 per-day cache keying.
+
+        The hash is independent of start_date/end_date so that per-day .npz
+        files are reusable across different date ranges with the same sampling
+        configuration.  Extending from 12→89 days only extracts the new days.
+        """
         import hashlib
 
         key = (
-            f"{self.start_date}_{self.end_date}"
-            f"_{self.sampling_seconds}_{self.max_lob_depth}"
+            f"{self.sampling_seconds}_{self.max_lob_depth}"
             f"_{self.all_features}_{self.sampling_type.value}"
         )
         return hashlib.md5(key.encode()).hexdigest()[:12]

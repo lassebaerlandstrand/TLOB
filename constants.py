@@ -17,6 +17,7 @@ class ModelType(Enum):
     TLOB_ORIGINAL = "TLOB_ORIGINAL"
     BINCTABL = "BINCTABL"
     DEEPLOB = "DEEPLOB"
+    PATCHLOB = "PATCHLOB"
 
 
 class SamplingType(Enum):

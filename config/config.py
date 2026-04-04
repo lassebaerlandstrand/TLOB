@@ -136,6 +136,33 @@ class DeepLOB(Model):
 
 
 @dataclass
+class PatchLOBConfig(Model):
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 4,
+            "hidden_dim": 64,
+            "num_heads": 1,
+            "is_sin_emb": False,
+            "lr": 0.0001,
+            "seq_size": 128,
+            "all_features": True,
+            "weight_decay": 0.01,
+            "dropout": 0.0,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [4, 6],
+            "hidden_dim": [64, 96, 128],
+            "num_heads": [1],
+            "lr": [0.0001],
+            "seq_size": [128],
+        }
+    )
+    type: ModelType = ModelType.PATCHLOB
+
+
+@dataclass
 class Dataset:
     type: DatasetType = MISSING
     dates: list = MISSING
@@ -252,6 +279,7 @@ cs.store(group="model", name="mlplob_original", node=MLPLOBOriginal)
 cs.store(group="model", name="tlob_original", node=TLOBOriginal)
 cs.store(group="model", name="binctabl", node=BiNCTABL)
 cs.store(group="model", name="deeplob", node=DeepLOB)
+cs.store(group="model", name="patchlob", node=PatchLOBConfig)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)
 cs.store(group="dataset", name="btc", node=BTC)

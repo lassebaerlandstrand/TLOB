@@ -1,6 +1,7 @@
 from models.binctabl import BiN_CTABL
 from models.deeplob import DeepLOB
 from models.mlplob import MLPLOB
+from models.patchlob import PatchLOB  # noqa: F401
 from models.original.mlplob import MLPLOB as MLPLOBOriginal
 from models.original.tlob import TLOB as TLOBOriginal
 from models.tlob import TLOB
@@ -67,5 +68,18 @@ def pick_model(
         return BiN_CTABL(60, num_features, seq_size, seq_size, 120, 5, 3, 1)
     elif model_type == "DEEPLOB":
         return DeepLOB()
+    elif model_type == "PATCHLOB":
+        return PatchLOB(
+            hidden_dim,
+            num_layers,
+            seq_size,
+            num_features,
+            num_heads,
+            is_sin_emb,
+            dataset_type,
+            use_fast_attention=use_fast_attention,
+            num_horizons=num_horizons,
+            dropout=dropout,
+        )
     else:
         raise ValueError("Model not found")

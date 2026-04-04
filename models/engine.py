@@ -235,7 +235,7 @@ class Engine(LightningModule):
     def _compile_model(self):
         if not self.use_torch_compile:
             return
-        if self.model_type not in {"TLOB", "MLPLOB"}:
+        if self.model_type not in {"TLOB", "MLPLOB", "PATCHLOB"}:
             return
         try:
             self.model = torch.compile(
@@ -681,7 +681,7 @@ class Engine(LightningModule):
             self.optimizer = Lion(self.parameters(), lr=self.lr)
 
         # TLOB benefits from validation-aware LR drops when the larger model plateaus early.
-        if self.model_type == "TLOB":
+        if self.model_type in ("TLOB", "PATCHLOB"):
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",

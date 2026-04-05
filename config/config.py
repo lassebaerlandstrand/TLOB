@@ -188,6 +188,40 @@ class FuseLOBConfig(Model):
 
 
 @dataclass
+class NexusLOBConfig(Model):
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 4,
+            "hidden_dim": 128,
+            "num_heads": 2,
+            "is_sin_emb": True,
+            "lr": 0.0001,
+            "seq_size": 128,
+            "all_features": True,
+            "weight_decay": 0.01,
+            "dropout": 0.1,
+            "max_events_per_window": 64,
+            "n_event_features": 7,
+            "n_perceiver_queries": 4,
+            "event_encoder_layers": 2,
+            "event_heads": 4,
+            "patch_size": 4,
+            "cross_attn_heads": 4,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [3, 4],
+            "hidden_dim": [48, 64],
+            "num_heads": [1],
+            "lr": [0.0001],
+            "seq_size": [128],
+        }
+    )
+    type: ModelType = ModelType.NEXUSLOB
+
+
+@dataclass
 class Dataset:
     type: DatasetType = MISSING
     dates: list = MISSING
@@ -251,6 +285,7 @@ class BATTERY(Dataset):
         default_factory=lambda: {
             "_default": {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1},
             "FUSELOB": {"hidden_dim": 64, "num_heads": 1, "dropout": 0.1},
+            "NEXUSLOB": {"hidden_dim": 64, "num_heads": 1, "dropout": 0.1},
         }
     )
 
@@ -311,6 +346,7 @@ cs.store(group="model", name="binctabl", node=BiNCTABL)
 cs.store(group="model", name="deeplob", node=DeepLOB)
 cs.store(group="model", name="patchlob", node=PatchLOBConfig)
 cs.store(group="model", name="fuselob", node=FuseLOBConfig)
+cs.store(group="model", name="nexuslob", node=NexusLOBConfig)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)
 cs.store(group="dataset", name="btc", node=BTC)

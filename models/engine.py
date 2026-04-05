@@ -237,7 +237,7 @@ class Engine(LightningModule):
     def _compile_model(self):
         if not self.use_torch_compile:
             return
-        if self.model_type not in {"TLOB", "MLPLOB", "PATCHLOB", "FUSELOB"}:
+        if self.model_type not in {"TLOB", "MLPLOB", "PATCHLOB", "FUSELOB", "NEXUSLOB"}:
             return
         try:
             self.model = torch.compile(
@@ -697,7 +697,7 @@ class Engine(LightningModule):
             self.optimizer = Lion(self.parameters(), lr=self.lr)
 
         # TLOB benefits from validation-aware LR drops when the larger model plateaus early.
-        if self.model_type in ("TLOB", "PATCHLOB", "FUSELOB"):
+        if self.model_type in ("TLOB", "PATCHLOB", "FUSELOB", "NEXUSLOB"):
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
@@ -766,7 +766,7 @@ class Engine(LightningModule):
 
             # ONNX export — single-head only (multi-horizon output is a list, not yet ONNX-friendly)
             # Skip for FuseLOB (multi-input forward signature not ONNX-compatible)
-            if not self.multi_horizon and self.model_type != "FUSELOB":
+            if not self.multi_horizon and self.model_type not in ("FUSELOB", "NEXUSLOB"):
                 onnx_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "onnx")
                 os.makedirs(onnx_dir, exist_ok=True)
                 onnx_filename = "val_loss=" + str(round(loss, 3)) + "_epoch=" + str(self.current_epoch) + ".onnx"

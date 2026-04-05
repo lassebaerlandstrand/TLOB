@@ -137,10 +137,12 @@ class PerceiverCompression(nn.Module):
     enable FlashAttention dispatch. Padding handled via zero-padding strategy.
     """
 
-    def __init__(self, d_model: int, n_queries: int = 8, n_heads: int = 4, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_queries: int = 8, n_heads: int = 4, dropout: float = 0.0,
+                 pool_output: bool = True):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.pool_output = pool_output
         self.queries = nn.Parameter(torch.randn(1, n_queries, d_model) * 0.02)
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
@@ -156,7 +158,8 @@ class PerceiverCompression(nn.Module):
             has_events: (B,) bool, True if window has any events
 
         Returns:
-            (B, d) compressed representation (mean-pooled over queries)
+            If pool_output=True:  (B, d) compressed representation (mean-pooled over queries)
+            If pool_output=False: (B, K, d) all K query outputs preserved
         """
         B, E, d = x.shape
         M = self.queries.shape[1]
@@ -179,7 +182,9 @@ class PerceiverCompression(nn.Module):
         if has_events is not None:
             compressed = compressed * has_events[:, None, None].float()
 
-        return compressed.mean(dim=1)  # (B, d)
+        if self.pool_output:
+            return compressed.mean(dim=1)  # (B, d)
+        return compressed  # (B, K, d)
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +206,11 @@ class EventEncoder(nn.Module):
         max_events: int = 64,
         n_queries: int = 8,
         dropout: float = 0.0,
+        pool_output: bool = True,
     ):
         super().__init__()
+        self.pool_output = pool_output
+        self.n_queries = n_queries
         self.embedding = EventEmbedding(d_event)
 
         pos_emb = sinusoidal_positional_embedding(max_events, d_event)
@@ -213,7 +221,9 @@ class EventEncoder(nn.Module):
             for _ in range(n_layers)
         ])
 
-        self.compression = PerceiverCompression(d_event, n_queries, n_heads, dropout=dropout)
+        self.compression = PerceiverCompression(
+            d_event, n_queries, n_heads, dropout=dropout, pool_output=pool_output,
+        )
 
     def forward(self, event_features: torch.Tensor, event_mask: torch.Tensor) -> torch.Tensor:
         """
@@ -222,7 +232,8 @@ class EventEncoder(nn.Module):
             event_mask:     (B, T, E) bool, True=real event
 
         Returns:
-            (B, T, d) per-window compressed event representations
+            If pool_output=True:  (B, T, d) per-window compressed event representations
+            If pool_output=False: (B, T, K, d) per-window multi-token event representations
         """
         B, T, E, _ = event_features.shape
 
@@ -243,11 +254,13 @@ class EventEncoder(nn.Module):
         # Re-zero before compression (clean up residual leakage)
         x = x * mask_float
 
-        # Perceiver compression -> (B*T, d)
+        # Perceiver compression
         has_events = mask.any(dim=-1)                   # (B*T,)
         out = self.compression(x, has_events=has_events)
 
-        return out.reshape(B, T, -1)                    # (B, T, d)
+        if self.pool_output:
+            return out.reshape(B, T, -1)                # (B, T, d)
+        return out.reshape(B, T, self.n_queries, -1)    # (B, T, K, d)
 
 
 # ---------------------------------------------------------------------------

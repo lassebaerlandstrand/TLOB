@@ -18,6 +18,7 @@ class ModelType(Enum):
     BINCTABL = "BINCTABL"
     DEEPLOB = "DEEPLOB"
     PATCHLOB = "PATCHLOB"
+    FUSELOB = "FUSELOB"
 
 
 class SamplingType(Enum):

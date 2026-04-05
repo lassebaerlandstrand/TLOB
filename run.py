@@ -20,6 +20,7 @@ from models.original.engine import Engine as OriginalEngine
 from preprocessing.battery import battery_cache_subdir, battery_load, battery_load_multi
 from preprocessing.btc import btc_load, btc_load_multi
 from preprocessing.dataset import DataModule, Dataset, MultiHorizonDataset
+from preprocessing.event_dataset import EventSnapshotDataset, load_events_for_product
 from preprocessing.fi_2010 import fi_2010_load, fi_2010_load_multi
 from preprocessing.lobster import lobster_load, lobster_load_multi
 from utils.utils_data import compute_lob_diffs
@@ -35,9 +36,14 @@ def _fmt_float_space(value: float, decimals: int = 1) -> str:
     return f"{float(value):,.{decimals}f}"
 
 
+_EVENT_MODELS = {cst.ModelType.FUSELOB}
+
+
 def _dataset_labels(dataset):
-    if hasattr(dataset, "y_multi"):
+    if hasattr(dataset, "y_multi") and dataset.y_multi is not None:
         return dataset.y_multi[: len(dataset)]
+    if hasattr(dataset, "labels"):
+        return dataset.labels[: len(dataset)]
     return dataset.y[: len(dataset)]
 
 
@@ -303,9 +309,17 @@ def train(config: Config, trainer: L.Trainer, run=None):
             train_datasets = []
             val_datasets = []
             test_datasets = []
+            uses_events = model_type in _EVENT_MODELS
 
             for product in products:
                 product_dir = os.path.join(pp_dir, "products", product)
+
+                # Load events once per product (shared across splits)
+                product_events = None
+                if uses_events:
+                    product_events = load_events_for_product(product_dir)
+                    if product_events is None:
+                        continue  # skip products without events
 
                 for split in ("train", "val", "test"):
                     path = os.path.join(product_dir, f"{split}.npy")
@@ -326,11 +340,20 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     if inp.shape[0] < seq_size:
                         continue
 
-                    ds = (
-                        MultiHorizonDataset(inp, lab, seq_size)
-                        if multi_horizon
-                        else Dataset(inp, lab, seq_size)
-                    )
+                    if uses_events and product_events is not None:
+                        ds = EventSnapshotDataset(
+                            snapshot_input=inp,
+                            event_features=product_events["event_features"],
+                            event_mask=product_events["event_mask"],
+                            labels=lab,
+                            seq_size=seq_size,
+                        )
+                    else:
+                        ds = (
+                            MultiHorizonDataset(inp, lab, seq_size)
+                            if multi_horizon
+                            else Dataset(inp, lab, seq_size)
+                        )
 
                     if split == "train":
                         train_datasets.append(ds)
@@ -351,10 +374,13 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 raise RuntimeError("[BATTERY] No test data found in per_product mode")
 
             test_concat = ConcatDataset(test_datasets)
+            # Event models hit FlashAttention kernel limits at large B*T;
+            # cap test batch multiplier at 2x for event models, 4x otherwise.
+            _test_mult = 2 if uses_events else 4
             test_loaders = [
                 DataLoader(
                     dataset=test_concat,
-                    batch_size=config.dataset.batch_size * 4,
+                    batch_size=config.dataset.batch_size * _test_mult,
                     shuffle=False,
                     pin_memory=True,
                     drop_last=False,
@@ -378,12 +404,13 @@ def train(config: Config, trainer: L.Trainer, run=None):
             train_set = ConcatDataset(train_datasets)
             val_set = ConcatDataset(val_datasets)
             # Expose train_input for num_features used by model instantiation
-            train_input = train_datasets[0].x
+            first_train = train_datasets[0]
+            train_input = first_train.x if hasattr(first_train, "x") else first_train.data
             data_module = DataModule(
                 train_set=train_set,
                 val_set=val_set,
                 batch_size=config.dataset.batch_size,
-                test_batch_size=config.dataset.batch_size * 4,
+                test_batch_size=config.dataset.batch_size * _test_mult,
                 num_workers=4,
             )
 
@@ -709,7 +736,8 @@ def train(config: Config, trainer: L.Trainer, run=None):
             test_concat = test_loaders[0].dataset
             all_test_labels = []
             for ds in test_concat.datasets:
-                y = ds.y_multi if hasattr(ds, "y_multi") else ds.y
+                y_m = getattr(ds, "y_multi", None)
+                y = y_m if y_m is not None else ds.y
                 all_test_labels.append(y[: len(ds)])
             all_test_labels = torch.cat(all_test_labels, dim=0)
         else:
@@ -1067,6 +1095,44 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 loss_type=config.experiment.loss_type,
                 focal_gamma=config.experiment.focal_gamma,
                 ordinal_smoothing=config.experiment.ordinal_smoothing,
+            )
+        elif model_type == cst.ModelType.FUSELOB:
+            hp = config.model.hyperparameters_fixed
+            model = Engine(
+                seq_size=seq_size,
+                horizon=horizon,
+                max_epochs=config.experiment.max_epochs,
+                model_type=config.model.type.value,
+                is_wandb=config.experiment.is_wandb,
+                experiment_type=experiment_type,
+                lr=hp["lr"],
+                optimizer=config.experiment.optimizer,
+                dir_ckpt=config.experiment.dir_ckpt,
+                hidden_dim=hp["hidden_dim"],
+                num_layers=hp["num_layers"],
+                num_features=train_input.shape[1],
+                dataset_type=dataset_type,
+                num_heads=hp["num_heads"],
+                is_sin_emb=hp["is_sin_emb"],
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=True,
+                torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
+                weight_decay=hp["weight_decay"],
+                dropout=hp.get("dropout", 0.0),
+                multi_horizon=multi_horizon,
+                class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                focal_gamma=config.experiment.focal_gamma,
+                ordinal_smoothing=config.experiment.ordinal_smoothing,
+                max_events_per_window=hp.get("max_events_per_window", 64),
+                n_event_features=hp.get("n_event_features", 7),
+                n_perceiver_queries=hp.get("n_perceiver_queries", 8),
+                event_encoder_layers=hp.get("event_encoder_layers", 2),
+                snap_encoder_layers=hp.get("snap_encoder_layers", 2),
+                event_heads=hp.get("event_heads", 4),
             )
 
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))

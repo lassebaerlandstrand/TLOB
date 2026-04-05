@@ -155,6 +155,39 @@ class PatchLOBConfig(Model):
 
 
 @dataclass
+class FuseLOBConfig(Model):
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 4,
+            "hidden_dim": 64,
+            "num_heads": 1,
+            "is_sin_emb": True,
+            "lr": 0.0001,
+            "seq_size": 128,
+            "all_features": True,
+            "weight_decay": 0.01,
+            "dropout": 0.1,
+            "max_events_per_window": 64,
+            "n_event_features": 7,
+            "n_perceiver_queries": 8,
+            "event_encoder_layers": 2,
+            "snap_encoder_layers": 2,
+            "event_heads": 4,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [3, 4],
+            "hidden_dim": [48, 64],
+            "num_heads": [1],
+            "lr": [0.0001],
+            "seq_size": [128],
+        }
+    )
+    type: ModelType = ModelType.FUSELOB
+
+
+@dataclass
 class Dataset:
     type: DatasetType = MISSING
     dates: list = MISSING
@@ -214,7 +247,12 @@ class BATTERY(Dataset):
     all_features: bool = True
     extract_events: bool = True
     max_events_per_window: int = 64
-    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1})
+    model_overrides: dict = field(
+        default_factory=lambda: {
+            "_default": {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1},
+            "FUSELOB": {"hidden_dim": 64, "num_heads": 1, "dropout": 0.1},
+        }
+    )
 
 
 @dataclass
@@ -234,7 +272,7 @@ class Experiment:
     torch_compile_mode: str = "reduce-overhead"
     torch_compile_dynamic: bool = False
     torch_compile_backend: str = "inductor"
-    precision: str = "32-true"
+    precision: str = "bf16-mixed"
     use_fast_attention: bool = True
     use_diff_features: bool = True
     use_class_weights: bool = True
@@ -272,6 +310,7 @@ cs.store(group="model", name="tlob_original", node=TLOBOriginal)
 cs.store(group="model", name="binctabl", node=BiNCTABL)
 cs.store(group="model", name="deeplob", node=DeepLOB)
 cs.store(group="model", name="patchlob", node=PatchLOBConfig)
+cs.store(group="model", name="fuselob", node=FuseLOBConfig)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)
 cs.store(group="dataset", name="btc", node=BTC)

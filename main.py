@@ -27,8 +27,19 @@ def hydra_app(config: Config):
         accelerator = "gpu"
 
     # Apply dataset-specific model overrides from config.
+    # Supports per-model overrides: {"_default": {...}, "FUSELOB": {...}}
+    # or flat dict for backward compatibility: {"hidden_dim": 50, ...}
     if hasattr(config.dataset, "model_overrides") and config.dataset.model_overrides:
-        for key, value in config.dataset.model_overrides.items():
+        overrides = config.dataset.model_overrides
+        model_name = config.model.type.value
+        if "_default" in overrides:
+            # Per-model override format
+            resolved = dict(overrides.get("_default", {}))
+            resolved.update(overrides.get(model_name, {}))
+        else:
+            # Flat dict (backward compatible)
+            resolved = dict(overrides)
+        for key, value in resolved.items():
             config.model.hyperparameters_fixed[key] = value
 
     # Keep model-level all_features aligned with dataset setting when available.

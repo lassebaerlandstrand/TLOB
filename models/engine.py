@@ -63,6 +63,7 @@ class Engine(LightningModule):
         loss_type: str = "focal_ordinal",
         focal_gamma: float = 2.0,
         ordinal_smoothing: float = 0.15,
+        **model_kwargs,
     ):
         super().__init__()
         self.seq_size = seq_size
@@ -116,6 +117,7 @@ class Engine(LightningModule):
             use_fast_attention=use_fast_attention,
             num_horizons=num_horizons,
             dropout=dropout,
+            **model_kwargs,
         )
         self._compile_model()
         self.ema = ExponentialMovingAverage(self.parameters(), decay=0.999)
@@ -235,7 +237,7 @@ class Engine(LightningModule):
     def _compile_model(self):
         if not self.use_torch_compile:
             return
-        if self.model_type not in {"TLOB", "MLPLOB", "PATCHLOB"}:
+        if self.model_type not in {"TLOB", "MLPLOB", "PATCHLOB", "FUSELOB"}:
             return
         try:
             self.model = torch.compile(
@@ -255,7 +257,21 @@ class Engine(LightningModule):
     # ------------------------------------------------------------------
     # Forward / Loss
     # ------------------------------------------------------------------
-    def forward(self, x, batch_idx=None):
+    def _unpack_batch(self, batch):
+        """Unpack batch into (x, y, events, event_mask).
+
+        Standard models: batch = (x, y)
+        Event models:    batch = (snapshot, events, mask, y)
+        """
+        if len(batch) == 4:
+            snapshot, events, mask, y = batch
+            return snapshot, y, events, mask
+        x, y = batch
+        return x, y, None, None
+
+    def forward(self, x, batch_idx=None, events=None, event_mask=None):
+        if events is not None:
+            return self.model(x, event_features=events, event_mask=event_mask)
         return self.model(x)
 
     def loss(self, y_hat, y):
@@ -296,15 +312,15 @@ class Engine(LightningModule):
     # Training
     # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
-        x, y = batch
+        x, y, events, mask = self._unpack_batch(batch)
         if self.multi_horizon:
-            y_hat_list = self.forward(x)
+            y_hat_list = self.forward(x, events=events, event_mask=mask)
             batch_loss, per_h_ce = self._multi_horizon_loss(y_hat_list, y)
             # per_h_ce is an (H,) tensor — store each horizon's CE as a scalar tensor
             for i, ce_val in enumerate(per_h_ce.unbind()):
                 self.train_losses_per_h[i].append(ce_val)
         else:
-            y_hat = self.forward(x)
+            y_hat = self.forward(x, events=events, event_mask=mask)
             batch_loss = self.loss(y_hat, y)
 
         batch_loss_mean = batch_loss if self.multi_horizon else torch.mean(batch_loss)
@@ -336,10 +352,10 @@ class Engine(LightningModule):
     # Validation
     # ------------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
-        x, y = batch
+        x, y, events, mask = self._unpack_batch(batch)
         with self.ema.average_parameters():
             if self.multi_horizon:
-                y_hat_list = self.forward(x)
+                y_hat_list = self.forward(x, events=events, event_mask=mask)
                 batch_loss, _ = self._multi_horizon_loss(y_hat_list, y)
                 for i, y_hat in enumerate(y_hat_list):
                     self.val_targets_per_h[i].append(y[:, i])
@@ -349,7 +365,7 @@ class Engine(LightningModule):
                 self.val_predictions.append(y_hat_list[0].argmax(dim=1))
                 batch_loss_mean = batch_loss
             else:
-                y_hat = self.forward(x)
+                y_hat = self.forward(x, events=events, event_mask=mask)
                 batch_loss = self.loss(y_hat, y)
                 self.val_targets.append(y)
                 self.val_predictions.append(y_hat.argmax(dim=1))
@@ -361,17 +377,17 @@ class Engine(LightningModule):
     # Test
     # ------------------------------------------------------------------
     def test_step(self, batch, batch_idx):
-        x, y = batch
+        x, y, events, mask = self._unpack_batch(batch)
         mid_prices = ((x[:, -1, 0] + x[:, -1, 2]) / 2).cpu().numpy().flatten()
         self.test_mid_prices.append(mid_prices)
 
         if self.multi_horizon:
             if self.experiment_type == "TRAINING":
                 with self.ema.average_parameters():
-                    y_hat_list = self.forward(x, batch_idx)
+                    y_hat_list = self.forward(x, batch_idx, events=events, event_mask=mask)
                     batch_loss, per_h_ce = self._multi_horizon_loss(y_hat_list, y)
             else:
-                y_hat_list = self.forward(x, batch_idx)
+                y_hat_list = self.forward(x, batch_idx, events=events, event_mask=mask)
                 batch_loss, per_h_ce = self._multi_horizon_loss(y_hat_list, y)
 
             for i, y_hat in enumerate(y_hat_list):
@@ -387,7 +403,7 @@ class Engine(LightningModule):
         else:
             if self.experiment_type == "TRAINING":
                 with self.ema.average_parameters():
-                    y_hat = self.forward(x, batch_idx)
+                    y_hat = self.forward(x, batch_idx, events=events, event_mask=mask)
                     batch_loss = self.loss(y_hat, y)
                     softmax_proba = torch.softmax(y_hat, dim=1)
                     self.test_targets.append(y)
@@ -396,7 +412,7 @@ class Engine(LightningModule):
                     self.test_proba_full.append(softmax_proba)
                     batch_loss_mean = torch.mean(batch_loss)
             else:
-                y_hat = self.forward(x, batch_idx)
+                y_hat = self.forward(x, batch_idx, events=events, event_mask=mask)
                 batch_loss = self.loss(y_hat, y)
                 softmax_proba = torch.softmax(y_hat, dim=1)
                 self.test_targets.append(y)
@@ -681,7 +697,7 @@ class Engine(LightningModule):
             self.optimizer = Lion(self.parameters(), lr=self.lr)
 
         # TLOB benefits from validation-aware LR drops when the larger model plateaus early.
-        if self.model_type in ("TLOB", "PATCHLOB"):
+        if self.model_type in ("TLOB", "PATCHLOB", "FUSELOB"):
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",
@@ -749,7 +765,8 @@ class Engine(LightningModule):
             self.trainer.save_checkpoint(path_ckpt)
 
             # ONNX export — single-head only (multi-horizon output is a list, not yet ONNX-friendly)
-            if not self.multi_horizon:
+            # Skip for FuseLOB (multi-input forward signature not ONNX-compatible)
+            if not self.multi_horizon and self.model_type != "FUSELOB":
                 onnx_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "onnx")
                 os.makedirs(onnx_dir, exist_ok=True)
                 onnx_filename = "val_loss=" + str(round(loss, 3)) + "_epoch=" + str(self.current_epoch) + ".onnx"

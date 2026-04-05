@@ -1,5 +1,6 @@
 from models.binctabl import BiN_CTABL
 from models.deeplob import DeepLOB
+from models.fuselob import FuseLOB
 from models.mlplob import MLPLOB
 from models.patchlob import PatchLOB  # noqa: F401
 from models.original.mlplob import MLPLOB as MLPLOBOriginal
@@ -19,6 +20,7 @@ def pick_model(
     use_fast_attention=True,
     num_horizons=1,
     dropout=0.0,
+    **kwargs,
 ):
     if model_type == "MLPLOB":
         return MLPLOB(
@@ -80,6 +82,25 @@ def pick_model(
             use_fast_attention=use_fast_attention,
             num_horizons=num_horizons,
             dropout=dropout,
+        )
+    elif model_type == "FUSELOB":
+        return FuseLOB(
+            hidden_dim,
+            num_layers,
+            seq_size,
+            num_features,
+            num_heads,
+            is_sin_emb,
+            dataset_type,
+            use_fast_attention=use_fast_attention,
+            num_horizons=num_horizons,
+            dropout=dropout,
+            max_events_per_window=kwargs.get("max_events_per_window", 64),
+            n_event_features=kwargs.get("n_event_features", 7),
+            n_perceiver_queries=kwargs.get("n_perceiver_queries", 8),
+            event_encoder_layers=kwargs.get("event_encoder_layers", 2),
+            snap_encoder_layers=kwargs.get("snap_encoder_layers", 2),
+            event_heads=kwargs.get("event_heads", 4),
         )
     else:
         raise ValueError("Model not found")

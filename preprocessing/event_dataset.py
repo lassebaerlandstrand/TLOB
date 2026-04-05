@@ -69,6 +69,25 @@ class EventSnapshotDataset(data.Dataset):
         # For compatibility with DataModule.pin_memory check
         self.data = self.snapshots
 
+    @property
+    def x(self):
+        """Alias for snapshot data, compatible with Dataset.x"""
+        return self.snapshots
+
+    @property
+    def y(self):
+        """Alias for labels, compatible with Dataset.y (returns h10 for multi-horizon)."""
+        if self.labels.ndim == 2:
+            return self.labels[:, 0]
+        return self.labels
+
+    @property
+    def y_multi(self):
+        """Alias for multi-horizon labels, compatible with MultiHorizonDataset.y_multi."""
+        if self.labels.ndim == 2:
+            return self.labels
+        return None
+
     def __len__(self) -> int:
         return self.length
 

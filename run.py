@@ -125,7 +125,7 @@ def run(config: Config, accelerator):
             EarlyStopping(
                 monitor="val_loss",
                 mode="min",
-                patience=3,
+                patience=2,
                 verbose=True,
                 min_delta=0.0005,
             ),
@@ -317,6 +317,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                             event_mask=product_events["event_mask"],
                             labels=lab,
                             seq_size=seq_size,
+                            event_aggregates=product_events.get("event_aggregates"),
                         )
                     else:
                         ds = MultiHorizonDataset(inp, lab, seq_size) if multi_horizon else Dataset(inp, lab, seq_size)
@@ -1221,7 +1222,7 @@ def run_wandb(config: Config, accelerator):
                 EarlyStopping(
                     monitor="val_loss",
                     mode="min",
-                    patience=3,
+                    patience=2,
                     verbose=True,
                     min_delta=0.0005,
                 ),

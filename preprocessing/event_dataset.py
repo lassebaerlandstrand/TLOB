@@ -34,16 +34,27 @@ class EventSnapshotDataset(data.Dataset):
         event_mask: np.ndarray,
         labels: torch.Tensor | np.ndarray,
         seq_size: int,
+        event_aggregates: np.ndarray | None = None,
     ):
         self.seq_size = seq_size
 
         # Snapshots
         if isinstance(snapshot_input, np.ndarray):
-            self.snapshots = torch.from_numpy(snapshot_input).float()
+            snapshots = torch.from_numpy(snapshot_input).float()
         else:
-            self.snapshots = snapshot_input.float()
+            snapshots = snapshot_input.float()
 
-        # Events: (N, max_events, 7) and (N, max_events) bool
+        # Concatenate event aggregates to snapshot features if provided
+        if event_aggregates is not None:
+            if isinstance(event_aggregates, np.ndarray):
+                agg = torch.from_numpy(event_aggregates).float()
+            else:
+                agg = event_aggregates.float()
+            snapshots = torch.cat([snapshots, agg], dim=1)
+
+        self.snapshots = snapshots
+
+        # Events: (N, max_events, N_EVENT_FEATURES) and (N, max_events) bool
         if isinstance(event_features, np.ndarray):
             self.event_features = torch.from_numpy(event_features).float()
         else:
@@ -159,9 +170,12 @@ def load_events_for_product(product_dir: str) -> dict[str, np.ndarray] | None:
     if not os.path.exists(events_path):
         return None
 
-    data = np.load(events_path)
-    return {
-        "event_features": data["event_features"],
-        "event_mask": data["event_mask"],
-        "n_events": data["n_events"],
+    npz_data = np.load(events_path)
+    result = {
+        "event_features": npz_data["event_features"],
+        "event_mask": npz_data["event_mask"],
+        "n_events": npz_data["n_events"],
     }
+    if "event_aggregates" in npz_data:
+        result["event_aggregates"] = npz_data["event_aggregates"]
+    return result

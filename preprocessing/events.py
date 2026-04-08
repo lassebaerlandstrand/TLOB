@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 ACTION_CODE_MAP = {"A": 0, "D": 1, "M": 2, "P": 3, "X": 4, "C": 5, "I": 6, "H": 7}
 SIDE_MAP = {"BUY": 0, "SELL": 1}
 N_ACTION_CODES = len(ACTION_CODE_MAP)
-N_EVENT_FEATURES = 7
+N_EVENT_FEATURES = 11
 
 # Trade/execution action codes — highest priority during subsampling
 _TRADE_CODES = {"M", "P", "C"}
@@ -35,17 +35,23 @@ _TRADE_CODES_LIST = sorted(_TRADE_CODES)
 _EXPIRY_CODES = {"X", "H"}
 _EXPIRY_CODES_LIST = sorted(_EXPIRY_CODES)
 
+# Execution restriction mapping
+_EXEC_MAP = {"NON": 0, "IOC": 1, "FOK": 2, "AON": 3}
+
 # Columns to read from raw CSV
 _RAW_COLS = [
     "Product",
     "DeliveryStart",
     "TransactionTime",
+    "CreationTime",
     "ActionCode",
     "Side",
     "Price",
     "Quantity",
     "RevisionNo",
     "InitialId",
+    "ParentId",
+    "ExecutionRestriction",
 ]
 
 # Hourly power product types (both local Intraday and cross-border XBID)
@@ -179,9 +185,16 @@ def _read_hourly_events(
         if parquet_path.exists():
             df = pd.read_parquet(parquet_path)
             # Ensure UTC timezone (parquet may strip it)
-            for col in ("TransactionTime", "DeliveryStart"):
-                if df[col].dt.tz is None:
+            for col in ("TransactionTime", "DeliveryStart", "CreationTime"):
+                if col in df.columns and df[col].dt.tz is None:
                     df[col] = df[col].dt.tz_localize("UTC")
+            # Handle parquet files cached before new columns were added
+            if "CreationTime" not in df.columns or "ParentId" not in df.columns:
+                parquet_path.unlink()  # Delete stale cache
+                df = _read_hourly_events_from_zip(zip_path)
+                if not df.empty:
+                    parquet_cache_dir.mkdir(parents=True, exist_ok=True)
+                    df.to_parquet(parquet_path, compression="zstd", index=False)
             return df
 
     # Parse from raw zip
@@ -212,6 +225,7 @@ def _read_hourly_events_from_zip(zip_path: Path) -> pd.DataFrame:
     # Parse timestamps
     df["TransactionTime"] = pd.to_datetime(df["TransactionTime"], utc=True)
     df["DeliveryStart"] = pd.to_datetime(df["DeliveryStart"], utc=True)
+    df["CreationTime"] = pd.to_datetime(df["CreationTime"], utc=True)
 
     # Drop iceberg replenishments (I) — not visible in LOB
     df = df[df["ActionCode"] != "I"].copy()
@@ -240,30 +254,39 @@ def _tokenize_events_for_product(
 ) -> dict[str, np.ndarray]:
     """Tokenize events for one product, aligned to snapshot windows.
 
-    Events are tokenized into 7 features:
+    Events are tokenized into 11 features:
         0: action_code (int 0-7)
         1: side (int 0-1)
         2: price_relative (float, event price relative to LOB mid-price of its window)
         3: quantity_log (float, log1p of quantity)
         4: time_delta (float, log1p of seconds since previous event)
-        5: revision_flag (int 0-1, whether this is a modified order)
+        5: revision_log (float, log1p of RevisionNo — algo trading intensity)
         6: is_aggressive (int 0-1, whether this is a trade execution)
+        7: is_iceberg (int 0-1, whether this has a ParentId)
+        8: exec_restriction (int 0-3, NON/IOC/FOK/AON)
+        9: order_age_log (float, log1p seconds from CreationTime to TransactionTime)
+        10: signed_quantity (float, quantity_log × sign, positive=BUY negative=SELL)
 
     Windows with more than max_events are subsampled with priority:
         1. Trade events (M, P, C) — always kept
         2. Expiry/hibernate events (X, H) — kept if space allows
         3. Remaining events (A, D) — most recent kept
+
+    Also computes per-window aggregates stored separately.
     """
     n_windows = len(snap_times_ns)
     out_features = np.zeros((n_windows, max_events, N_EVENT_FEATURES), dtype=np.float32)
     out_mask = np.zeros((n_windows, max_events), dtype=bool)
     out_n_events = np.zeros(n_windows, dtype=np.int32)
+    n_aggregates = 5
+    out_aggregates = np.zeros((n_windows, n_aggregates), dtype=np.float32)
 
     if events.empty:
         return {
             "event_features": out_features,
             "event_mask": out_mask,
             "n_events": out_n_events,
+            "event_aggregates": out_aggregates,
         }
 
     # ── Vectorized feature computation for ALL events at once ────────────
@@ -295,11 +318,30 @@ def _tokenize_events_for_product(
     time_deltas_s = np.maximum(time_deltas_ns / 1e9, 0.0)
     td_vec = np.log1p(time_deltas_s).astype(np.float32)
 
-    # Feature 5: revision_flag (vectorized)
-    rev_vec = (revision_nos > 1).astype(np.float32)
+    # Feature 5: revision_log (continuous, replaces binary revision_flag)
+    rev_vec = np.log1p(revision_nos.astype(np.float64)).astype(np.float32)
 
     # Feature 6: is_aggressive (vectorized)
     agg_vec = np.isin(action_codes_str, _TRADE_CODES_LIST).astype(np.float32)
+
+    # Feature 7: is_iceberg (has ParentId)
+    parent_ids = events["ParentId"].values
+    iceberg_vec = (~pd.isna(parent_ids)).astype(np.float32)
+
+    # Feature 8: execution restriction
+    exec_strs = events["ExecutionRestriction"].values.astype(str)
+    exec_vec = np.zeros(n_events_total, dtype=np.float32)
+    for code, idx in _EXEC_MAP.items():
+        exec_vec[exec_strs == code] = idx
+
+    # Feature 9: order_age_log (TransactionTime - CreationTime)
+    creation_times_ns = _to_nanoseconds(events["CreationTime"].values)
+    order_age_s = np.maximum((event_times_ns - creation_times_ns) / 1e9, 0.0)
+    age_vec = np.log1p(order_age_s).astype(np.float32)
+
+    # Feature 10: signed_quantity (positive=BUY, negative=SELL)
+    side_sign = np.where(sides_str == "BUY", 1.0, -1.0).astype(np.float32)
+    signed_qty_vec = qty_vec * side_sign
 
     # ── Assign events to windows ─────────────────────────────────────────
 
@@ -315,6 +357,28 @@ def _tokenize_events_for_product(
             continue
 
         w_idx = np.where(w_mask)[0]
+
+        # Compute per-window aggregates BEFORE subsampling (use all events)
+        w_agg = agg_vec[w_idx]
+        w_side_sign = side_sign[w_idx]
+        w_qty = qty_vec[w_idx]
+        w_iceberg = iceberg_vec[w_idx]
+        w_action = action_codes_str[w_idx]
+
+        trade_mask_w = w_agg > 0.5
+        n_trades = trade_mask_w.sum()
+        n_deletes = (w_action == "D").sum()
+
+        # Aggregate 0: net aggressive flow (signed trade volume)
+        out_aggregates[w, 0] = float(np.sum(w_qty[trade_mask_w] * w_side_sign[trade_mask_w]))
+        # Aggregate 1: log trade count
+        out_aggregates[w, 1] = np.log1p(n_trades).astype(np.float32)
+        # Aggregate 2: log event count
+        out_aggregates[w, 2] = np.log1p(w_count).astype(np.float32)
+        # Aggregate 3: cancel-to-trade ratio
+        out_aggregates[w, 3] = float(n_deletes / max(n_trades, 1))
+        # Aggregate 4: iceberg fraction
+        out_aggregates[w, 4] = float(w_iceberg.sum() / max(w_count, 1))
 
         # Priority-based subsampling if needed
         if w_count > max_events:
@@ -342,12 +406,17 @@ def _tokenize_events_for_product(
         out_features[w, :w_count, 4] = td_vec[w_idx]
         out_features[w, :w_count, 5] = rev_vec[w_idx]
         out_features[w, :w_count, 6] = agg_vec[w_idx]
+        out_features[w, :w_count, 7] = iceberg_vec[w_idx]
+        out_features[w, :w_count, 8] = exec_vec[w_idx]
+        out_features[w, :w_count, 9] = age_vec[w_idx]
+        out_features[w, :w_count, 10] = signed_qty_vec[w_idx]
         out_mask[w, :w_count] = True
 
     return {
         "event_features": out_features,
         "event_mask": out_mask,
         "n_events": out_n_events,
+        "event_aggregates": out_aggregates,
     }
 
 
@@ -501,6 +570,7 @@ def extract_events_for_date_range(
                 event_features=result["event_features"],
                 event_mask=result["event_mask"],
                 n_events=result["n_events"],
+                event_aggregates=result["event_aggregates"],
             )
             extracted_keys.append(product_key)
 

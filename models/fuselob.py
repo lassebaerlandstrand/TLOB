@@ -27,38 +27,48 @@ from models.tlob import TransformerLayer, _build_head, sinusoidal_positional_emb
 # ---------------------------------------------------------------------------
 
 class EventEmbedding(nn.Module):
-    """Map 7 raw event features to d_event-dimensional embedding.
+    """Map 11 raw event features to d_event-dimensional embedding.
 
     Feature order (from preprocessing/events.py):
-        0: action_code  (int 0-7)
-        1: side          (int 0-1)
-        2: price_relative (float)
-        3: quantity_log   (float)
-        4: time_delta     (float)
-        5: revision_flag  (int 0-1)
-        6: is_aggressive  (int 0-1)
+        0: action_code       (int 0-7)
+        1: side               (int 0-1)
+        2: price_relative     (float)
+        3: quantity_log        (float)
+        4: time_delta          (float)
+        5: revision_log        (float, log1p of RevisionNo)
+        6: is_aggressive       (int 0-1)
+        7: is_iceberg          (int 0-1)
+        8: exec_restriction    (int 0-3)
+        9: order_age_log       (float, log1p seconds)
+        10: signed_quantity    (float, qty × side_sign)
     """
 
     def __init__(self, d_event: int = 64):
         super().__init__()
-        # Categorical embeddings: total 32 dims
+        # Categorical embeddings: total 40 dims
         self.action_emb = nn.Embedding(8, 16)
         self.side_emb = nn.Embedding(2, 8)
-        self.revision_emb = nn.Embedding(2, 4)
         self.aggression_emb = nn.Embedding(2, 4)
-        cat_dim = 16 + 8 + 4 + 4  # 32
+        self.iceberg_emb = nn.Embedding(2, 4)
+        self.exec_emb = nn.Embedding(4, 8)
+        cat_dim = 16 + 8 + 4 + 4 + 8  # 40
 
-        # Continuous projection: 3 features -> remaining dims
-        self.cont_proj = nn.Linear(3, d_event - cat_dim)
+        # Continuous projection: 6 features -> remaining dims
+        # price_relative, quantity_log, time_delta, revision_log, order_age_log, signed_quantity
+        self.cont_proj = nn.Linear(6, d_event - cat_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (*, E, 7) float32 -> (*, E, d_event)"""
+        """x: (*, E, 11) float32 -> (*, E, d_event)"""
         action = self.action_emb(x[..., 0].long())
         side = self.side_emb(x[..., 1].long())
-        continuous = self.cont_proj(x[..., 2:5])
-        revision = self.revision_emb(x[..., 5].long())
+        # Continuous: indices 2,3,4,5,9,10
+        continuous = self.cont_proj(
+            torch.cat([x[..., 2:6], x[..., 9:11]], dim=-1)
+        )
         aggression = self.aggression_emb(x[..., 6].long())
-        return torch.cat([action, side, revision, aggression, continuous], dim=-1)
+        iceberg = self.iceberg_emb(x[..., 7].long())
+        exec_restr = self.exec_emb(x[..., 8].long())
+        return torch.cat([action, side, aggression, iceberg, exec_restr, continuous], dim=-1)
 
 
 # ---------------------------------------------------------------------------

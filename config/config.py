@@ -168,7 +168,7 @@ class FuseLOBConfig(Model):
             "weight_decay": 0.01,
             "dropout": 0.1,
             "max_events_per_window": 64,
-            "n_event_features": 7,
+            "n_event_features": 11,
             "n_perceiver_queries": 8,
             "event_encoder_layers": 2,
             "snap_encoder_layers": 2,

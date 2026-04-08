@@ -8,13 +8,15 @@ day and closes ~5 minutes before delivery.
 
 .npy format
 -----------
-    all_features=True  → 54 columns: [10 msg | 40 LOB | 4 labels]
+    all_features=True  → 62 columns: [18 msg | 40 LOB | 4 labels]
   all_features=False → 44 columns: [40 LOB | 4 labels]
 
 Message columns (synthesised from LOB state at sampling time):
     [log_time_delta, time_to_delivery_hrs, lifecycle_progress, direction,
      spread_bps, book_imbalance, top_imbalance, weighted_mid_dev,
-     log_total_volume, price_range_ratio]
+     log_total_volume, price_range_ratio,
+     ofi_top1, ofi_top3, ofi_top5, ofi_top10,
+     bid_vwap3_rel, ask_vwap3_rel, bid_vwap10_rel, ask_vwap10_rel]
 
 LOB columns (10 levels, interleaved ask/bid):
   [sell1, vsell1, buy1, vbuy1, sell2, vsell2, buy2, vbuy2, ..., sell10, vsell10, buy10, vbuy10]
@@ -44,7 +46,7 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants derived from cst
 # ─────────────────────────────────────────────────────────────────────────────
-_N_MSG = 10
+_N_MSG = 18
 _N_LOB = cst.N_LOB_LEVELS * cst.LEN_LEVEL  # 40
 _N_LABELS = len(cst.LOBSTER_HORIZONS)  # 4
 _NCOLS_FULL = _N_MSG + _N_LOB + _N_LABELS  # 54
@@ -793,17 +795,22 @@ class BatteryDataBuilder:
         curr_time: pd.Timestamp,
         delivery_time: pd.Timestamp,
     ) -> list[float]:
-        """Synthesise 10 EPEX-specific message columns from LOB state.
+        """Synthesise 18 EPEX-specific message columns from LOB state.
 
-        Columns:
+        Columns (original 10):
           [log_time_delta, time_to_delivery_hrs, lifecycle_progress, direction,
            spread_bps, book_imbalance, top_imbalance, weighted_mid_dev,
            log_total_volume, price_range_ratio]
+
+        New columns (8):
+          [ofi_top1, ofi_top3, ofi_top5, ofi_top10,
+           bid_vwap3_rel, ask_vwap3_rel, bid_vwap10_rel, ask_vwap10_rel]
         """
         sell1, vsell1, buy1, vbuy1 = lob_row[0], lob_row[1], lob_row[2], lob_row[3]
         sell10, buy10 = lob_row[36], lob_row[38]
 
         mid = (sell1 + buy1) / 2.0
+        abs_mid = max(abs(mid), 0.01)
         time_delta_s = max((curr_time - prev_time).total_seconds(), 0.0)
         log_time_delta = math.log1p(time_delta_s)
 
@@ -813,7 +820,7 @@ class BatteryDataBuilder:
             np.clip(1.0 - (ttd_seconds / (31.5 * 3600.0)), 0.0, 1.0)
         )
 
-        spread_bps = ((sell1 - buy1) / max(abs(mid), 0.01)) * 10000.0
+        spread_bps = ((sell1 - buy1) / abs_mid) * 10000.0
 
         sum_ask_vol = float(np.sum(lob_row[1::4]))
         sum_bid_vol = float(np.sum(lob_row[3::4]))
@@ -831,6 +838,65 @@ class BatteryDataBuilder:
         best_spread = sell1 - buy1
         raw_price_range_ratio = (sell10 - buy10) / max(best_spread, 1e-8)
         price_range_ratio = float(np.clip(raw_price_range_ratio, 0.5, 200.0))
+
+        # ── OFI features (order flow imbalance from LOB diffs) ───────────
+        # OFI_l = ΔV_bid_l - ΔV_ask_l (positive = net buying pressure)
+        # LOB layout: [sell_p, sell_v, buy_p, buy_v] × 10 levels
+        ofi_top1 = 0.0
+        ofi_top3 = 0.0
+        ofi_top5 = 0.0
+        ofi_top10 = 0.0
+        if prev_lob is not None:
+            for l in range(10):
+                bid_vol_change = float(lob_row[l * 4 + 3] - prev_lob[l * 4 + 3])
+                ask_vol_change = float(lob_row[l * 4 + 1] - prev_lob[l * 4 + 1])
+                ofi_l = bid_vol_change - ask_vol_change
+                if l < 1:
+                    ofi_top1 += ofi_l
+                if l < 3:
+                    ofi_top3 += ofi_l
+                if l < 5:
+                    ofi_top5 += ofi_l
+                ofi_top10 += ofi_l
+
+        # ── VWAP features (volume-weighted average price at depth) ───────
+        # Normalized relative to mid-price for stationarity
+        bid_vwap3_rel = 0.0
+        ask_vwap3_rel = 0.0
+        bid_vwap10_rel = 0.0
+        ask_vwap10_rel = 0.0
+
+        bid_pv3 = 0.0
+        bid_v3 = 0.0
+        ask_pv3 = 0.0
+        ask_v3 = 0.0
+        bid_pv10 = 0.0
+        bid_v10 = 0.0
+        ask_pv10 = 0.0
+        ask_v10 = 0.0
+        for l in range(10):
+            ask_p = lob_row[l * 4]
+            ask_v = lob_row[l * 4 + 1]
+            bid_p = lob_row[l * 4 + 2]
+            bid_v = lob_row[l * 4 + 3]
+            if l < 3:
+                bid_pv3 += bid_p * bid_v
+                bid_v3 += bid_v
+                ask_pv3 += ask_p * ask_v
+                ask_v3 += ask_v
+            bid_pv10 += bid_p * bid_v
+            bid_v10 += bid_v
+            ask_pv10 += ask_p * ask_v
+            ask_v10 += ask_v
+
+        if bid_v3 > 1e-8:
+            bid_vwap3_rel = ((bid_pv3 / bid_v3) - mid) / abs_mid
+        if ask_v3 > 1e-8:
+            ask_vwap3_rel = ((ask_pv3 / ask_v3) - mid) / abs_mid
+        if bid_v10 > 1e-8:
+            bid_vwap10_rel = ((bid_pv10 / bid_v10) - mid) / abs_mid
+        if ask_v10 > 1e-8:
+            ask_vwap10_rel = ((ask_pv10 / ask_v10) - mid) / abs_mid
 
         # For first snapshot per delivery product, keep cold-start dynamics neutral.
         if prev_lob is not None:
@@ -852,6 +918,16 @@ class BatteryDataBuilder:
             float(weighted_mid_dev),
             float(log_total_volume),
             price_range_ratio,
+            # New: OFI at multiple depths
+            float(ofi_top1),
+            float(ofi_top3),
+            float(ofi_top5),
+            float(ofi_top10),
+            # New: VWAP at multiple depths (relative to mid)
+            float(bid_vwap3_rel),
+            float(ask_vwap3_rel),
+            float(bid_vwap10_rel),
+            float(ask_vwap10_rel),
         ]
 
     # ── Stage 4a: Concat mode ─────────────────────────────────────────────────
@@ -1166,6 +1242,14 @@ class BatteryDataBuilder:
                 "weighted_mid_dev",
                 "log_total_volume",
                 "price_range_ratio",
+                "ofi_top1",
+                "ofi_top3",
+                "ofi_top5",
+                "ofi_top10",
+                "bid_vwap3_rel",
+                "ask_vwap3_rel",
+                "bid_vwap10_rel",
+                "ask_vwap10_rel",
             ]
             msg_df = pd.DataFrame(
                 features[:, :_N_MSG],

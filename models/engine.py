@@ -227,6 +227,8 @@ class Engine(LightningModule):
         self.val_targets = []
         self.val_loss = np.inf
         self.val_predictions = []
+        self.val_mid_prices = []
+        self.val_z_half_spreads = []
         self.min_loss = np.inf
         # Save hyperparameters, ignoring unused ones for cleaner checkpoints
         ignore_params = []
@@ -666,6 +668,9 @@ class Engine(LightningModule):
     # ------------------------------------------------------------------
     def validation_step(self, batch, batch_idx):
         x, y, events, mask, dfl_data = self._unpack_batch(batch)
+        # Accumulate mid-prices for trading evaluation (same as test_step)
+        self.val_mid_prices.append(((x[:, -1, 0] + x[:, -1, 2]) / 2).cpu().numpy().flatten())
+        self.val_z_half_spreads.append(((x[:, -1, 0] - x[:, -1, 2]) / 2).cpu().numpy().flatten())
         with self.ema.average_parameters():
             if self.is_tradelob:
                 return self._tradelob_validation_step(x, y, dfl_data)
@@ -892,13 +897,10 @@ class Engine(LightningModule):
         self.log("val_loss", self.val_loss)
         self._console(f"Validation loss on epoch {self.current_epoch}: {self.val_loss}")
 
-        # Classification report on primary horizon (always h10 for multi, full for single)
+        # Classification metrics (compact — no verbose per-class report)
         targets = torch.cat(self.val_targets).cpu().numpy()
         predictions = torch.cat(self.val_predictions).cpu().numpy()
         class_report = classification_report(targets, predictions, digits=4, output_dict=True)
-        if self.multi_horizon:
-            self._console("Primary horizon (h10) classification report")
-        self._console(classification_report(targets, predictions, digits=4))
         self.log("val_f1_score", class_report["macro avg"]["f1-score"])
         self.log("val_accuracy", class_report["accuracy"])
         self.log("val_precision", class_report["macro avg"]["precision"])
@@ -916,14 +918,38 @@ class Engine(LightningModule):
             self._console("Validation summary by horizon")
             self._console(format_horizon_table(val_metrics, HORIZONS, val_baselines))
 
+            # Trading simulation per horizon
+            val_mid = np.concatenate(self.val_mid_prices)
+            val_z_hs = np.concatenate(self.val_z_half_spreads)
+            trading_per_h = []
+            for i in range(len(HORIZONS)):
+                h_preds = torch.cat(self.val_predictions_per_h[i]).cpu().numpy()
+                tm = compute_trading_metrics(
+                    val_mid, h_preds, z_half_spreads=val_z_hs,
+                )
+                trading_per_h.append(tm)
+            self._console("Validation trading simulation")
+            self._console(format_trading_table(trading_per_h, HORIZONS))
+
             low_mcc_horizons = [f"h{HORIZONS[i]}" for i, metrics in enumerate(val_metrics) if metrics["mcc"] < 0.15]
             if low_mcc_horizons:
                 self._console(
                     "Warning: near-random validation behaviour (MCC < 0.15) at " + ", ".join(low_mcc_horizons)
                 )
+        else:
+            # Single-horizon: compact classification + trading line
+            self._console(f"F1(macro)={class_report['macro avg']['f1-score']:.4f}, "
+                          f"Acc={class_report['accuracy']:.4f}")
+            val_mid = np.concatenate(self.val_mid_prices)
+            val_z_hs = np.concatenate(self.val_z_half_spreads)
+            tm = compute_trading_metrics(val_mid, predictions, z_half_spreads=val_z_hs)
+            self._console(f"Trading: PnL={tm['total_pnl']:.4f}, Sharpe={tm['sharpe']:.2e}, "
+                          f"Trades={tm['n_trades']}")
 
         self.val_targets = []
         self.val_predictions = []
+        self.val_mid_prices = []
+        self.val_z_half_spreads = []
         if self.multi_horizon:
             self.val_targets_per_h = [[] for _ in HORIZONS]
             self.val_predictions_per_h = [[] for _ in HORIZONS]
@@ -1028,12 +1054,6 @@ class Engine(LightningModule):
             if near_random:
                 self._console("Warning: near-random test performance (MCC < 0.15) at " + ", ".join(near_random))
 
-            self._console("")
-            self._console("Detailed classification reports")
-            for i, h in enumerate(HORIZONS):
-                self._console(f"--- Horizon h={h} ---")
-                self._console(classification_report(targets_per_h[i], predictions_per_h[i], digits=4))
-
             self.log("test_loss", sum(self.test_losses) / len(self.test_losses))
 
             # Reset per-horizon accumulators
@@ -1043,7 +1063,8 @@ class Engine(LightningModule):
             self.test_losses_per_h = [[] for _ in HORIZONS]
         else:
             class_report = classification_report(targets, predictions, digits=4, output_dict=True)
-            self._console(classification_report(targets, predictions, digits=4))
+            self._console(f"F1(macro)={class_report['macro avg']['f1-score']:.4f}, "
+                          f"Acc={class_report['accuracy']:.4f}")
             self.log("test_loss", sum(self.test_losses) / len(self.test_losses))
             self.log("f1_score", class_report["macro avg"]["f1-score"])
             self.log("accuracy", class_report["accuracy"])

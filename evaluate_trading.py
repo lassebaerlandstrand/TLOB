@@ -83,6 +83,145 @@ import numpy as np
 from utils.metrics import compute_trading_metrics, format_trading_table
 
 HORIZONS = [10, 20, 50, 100]
+SMA_WINDOWS = [10, 20]
+PF_MIN_HOLDS = [0, 10, 20, 30, 50, 100]
+
+
+def _detect_std_price(checkpoint_dir: str, data: dict) -> tuple[float | None, str]:
+    """Detect dataset and compute std_price for dollar/EUR conversion.
+
+    Returns (std_price, currency_symbol).
+    """
+    has_boundaries = data.get("segment_boundaries") is not None
+
+    if has_boundaries:
+        # Battery (EPEX) — compute from raw/z spread ratio
+        raw_hs = data.get("half_spreads")
+        z_hs = data.get("z_half_spreads")
+        if raw_hs is not None and z_hs is not None:
+            valid = np.abs(z_hs) > 1e-6
+            if valid.sum() > 10:
+                return float(np.median(raw_hs[valid] / z_hs[valid])), "EUR"
+        return None, "EUR"
+    else:
+        # BTC — try loading norm_stats.npz from data/BTC/
+        for path in ["data/BTC/norm_stats.npz"]:
+            if os.path.exists(path):
+                stats = np.load(path)
+                if "std_prices" in stats:
+                    return float(stats["std_prices"]), "$"
+        return None, "$"
+
+
+def _compute_baselines(
+    mid_prices: np.ndarray,
+    targets: np.ndarray | None,
+    half_spreads: np.ndarray | None,
+    z_half_spreads: np.ndarray | None,
+    segment_boundaries: np.ndarray | None,
+) -> list[tuple[str, dict]]:
+    """Compute reference baselines: Buy & Hold, SMA, Perfect Foresight + min_hold."""
+    baselines = []
+    n = len(mid_prices)
+
+    # Buy & Hold (always long = always predict UP)
+    bnh_preds = np.zeros(n, dtype=np.int64)  # label 0 = up → position +1
+    bnh = compute_trading_metrics(
+        mid_prices, bnh_preds,
+        half_spreads=half_spreads, z_half_spreads=z_half_spreads,
+        segment_boundaries=segment_boundaries,
+    )
+    baselines.append(("Buy & Hold", bnh))
+
+    # SMA crossover baselines
+    for w in SMA_WINDOWS:
+        if n < w + 10:
+            continue
+        sma = np.convolve(mid_prices, np.ones(w) / w, mode="valid")
+        offset = w - 1
+        sma_preds = np.ones(n, dtype=np.int64)  # default stationary
+        for t in range(offset, n):
+            if mid_prices[t] > sma[t - offset]:
+                sma_preds[t] = 0  # up → long
+            elif mid_prices[t] < sma[t - offset]:
+                sma_preds[t] = 2  # down → short
+        sma_tm = compute_trading_metrics(
+            mid_prices, sma_preds,
+            half_spreads=half_spreads, z_half_spreads=z_half_spreads,
+            segment_boundaries=segment_boundaries,
+        )
+        baselines.append((f"SMA-{w}", sma_tm))
+
+    # Perfect foresight + optimal min_hold (requires targets)
+    if targets is not None:
+        best_pnl = -float("inf")
+        best_mh = 0
+        best_tm = None
+        for mh in PF_MIN_HOLDS:
+            pf_tm = compute_trading_metrics(
+                mid_prices, targets,
+                half_spreads=half_spreads, z_half_spreads=z_half_spreads,
+                min_hold=mh,
+                segment_boundaries=segment_boundaries,
+            )
+            if pf_tm["total_pnl"] > best_pnl:
+                best_pnl = pf_tm["total_pnl"]
+                best_mh = mh
+                best_tm = pf_tm
+        if best_tm is not None:
+            baselines.append((f"PF+mh={best_mh}", best_tm))
+        # Also show PF without min_hold if different
+        if best_mh != 0:
+            pf_raw = compute_trading_metrics(
+                mid_prices, targets,
+                half_spreads=half_spreads, z_half_spreads=z_half_spreads,
+                segment_boundaries=segment_boundaries,
+            )
+            baselines.append(("PF (no mh)", pf_raw))
+
+    return baselines
+
+
+def _print_baselines(
+    baselines_per_h: dict[int, list[tuple[str, dict]]],
+    horizons: list[int],
+    std_price: float | None,
+    currency: str,
+):
+    """Print baseline reference table."""
+    print(f"\n{'=' * 100}")
+    print(f"  Reference Baselines")
+    if std_price is not None:
+        print(f"  (1 z-unit = {currency}{std_price:.2f})")
+    print(f"{'=' * 100}")
+
+    header = (
+        f"{'Horizon':<8} | {'Strategy':<16} | {'PnL(z)':>10} |"
+    )
+    if std_price is not None:
+        header += f" {'PnL('+currency+')':>12} |"
+    header += f" {'Sharpe':>10} | {'Trades':>7} | {'AvgHold':>8} | {'Exposure':>9}"
+    print(header)
+    print("-" * len(header))
+
+    for h in horizons:
+        if h not in baselines_per_h:
+            continue
+        for name, tm in baselines_per_h[h]:
+            pf = f"{tm['profit_factor']:.2f}" if tm["profit_factor"] != float("inf") else "inf"
+            line = (
+                f"h{h:<7} | {name:<16} | {tm['total_pnl']:>10.4f} |"
+            )
+            if std_price is not None:
+                line += f" {tm['total_pnl'] * std_price:>12.2f} |"
+            line += (
+                f" {tm['sharpe']:>10.2e} |"
+                f" {tm['n_trades']:>7} |"
+                f" {tm['avg_hold_duration']:>8.1f} |"
+                f" {tm['exposure_pct']:>8.1f}%"
+            )
+            print(line)
+        print("-" * len(header))
 
 
 def _detect_multi_horizon(checkpoint_dir: str) -> bool:
@@ -524,6 +663,11 @@ def main():
         action="store_true",
         help="Run a predefined grid search over min_hold and confidence_threshold",
     )
+    parser.add_argument(
+        "--no-baselines",
+        action="store_true",
+        help="Skip reference baselines (Buy & Hold, SMA, Perfect Foresight)",
+    )
     args = parser.parse_args()
 
     checkpoint_dir = args.checkpoint_dir
@@ -574,6 +718,11 @@ def main():
         else:
             print("Warning: --soft-positions requested but no logits found, falling back to hard positions")
 
+    # Detect dataset and std_price for dollar/EUR conversion
+    std_price, currency = _detect_std_price(checkpoint_dir, data)
+    if std_price is not None:
+        print(f"Price conversion: 1 z-unit = {currency}{std_price:.2f}")
+
     results = _run_evaluation(
         data, multi_horizon, costs, confidence_thresholds,
         min_holds=min_holds, use_soft_positions=args.soft_positions,
@@ -584,7 +733,30 @@ def main():
     if args.sweep_thresholds and multi_horizon:
         _print_sweep_summary(results, confidence_thresholds, min_holds)
 
-    print(f"\nGenerating plots...")
+    # Reference baselines
+    if not args.no_baselines:
+        mid_prices = data["mid_prices"]
+        half_spreads = data.get("half_spreads")
+        z_half_spreads = data.get("z_half_spreads")
+        segment_boundaries = data.get("segment_boundaries")
+
+        if multi_horizon:
+            baselines_per_h = {}
+            for h, h_data in data["horizons"]:
+                targets = h_data.get("targets")
+                baselines_per_h[h] = _compute_baselines(
+                    mid_prices, targets, half_spreads, z_half_spreads, segment_boundaries,
+                )
+            _print_baselines(baselines_per_h, [h for h, _ in data["horizons"]], std_price, currency)
+        else:
+            targets = data.get("targets")
+            baselines = _compute_baselines(
+                mid_prices, targets, half_spreads, z_half_spreads, segment_boundaries,
+            )
+            baselines_per_h = {10: baselines}  # single horizon
+            _print_baselines(baselines_per_h, [10], std_price, currency)
+
+    print("\nGenerating plots...")
     _plot_cumulative_pnl(results, data, multi_horizon, checkpoint_dir)
     _plot_confidence_sweep(results, multi_horizon, costs, confidence_thresholds, checkpoint_dir)
     _plot_cost_sensitivity(results, multi_horizon, costs, checkpoint_dir)

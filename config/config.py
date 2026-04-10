@@ -222,6 +222,43 @@ class NexusLOBConfig(Model):
 
 
 @dataclass
+class TradeLOBConfig(Model):
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 4,
+            "hidden_dim": 40,
+            "num_heads": 1,
+            "is_sin_emb": True,
+            "lr": 0.0001,
+            "seq_size": 128,
+            "all_features": True,
+            "weight_decay": 0.01,
+            "dropout": 0.0,
+            "max_band_width": 1.5,
+            "pos_embed_dim": 8,
+            "band_hidden_dim": 64,
+            "signal_hidden_dim": 64,
+            "sharpness": 10.0,
+            "gumbel_temperature": 1.0,
+            "chunk_size": 64,
+            "encoder_checkpoint": "",
+            "encoder_freeze_epochs": 3,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [4],
+            "hidden_dim": [40, 64],
+            "num_heads": [1],
+            "lr": [0.0001],
+            "seq_size": [128],
+            "chunk_size": [64, 128],
+        }
+    )
+    type: ModelType = ModelType.TRADELOB
+
+
+@dataclass
 class Dataset:
     type: DatasetType = MISSING
     dates: list = MISSING
@@ -313,10 +350,23 @@ class Experiment:
     use_class_weights: bool = True
     label_mode: str = "absolute_change"  # "absolute_change" | "percent_change"
     multi_horizon: bool = False
-    loss_type: str = "cross_entropy"  # "cross_entropy" | "focal" | "focal_ordinal"
+    loss_type: str = "cross_entropy"  # "cross_entropy" | "focal" | "focal_ordinal" | "dfl_proxy" | "dfl_trading"
     focal_gamma: float = 2.0  # Unused if loss_type is not "focal" or "focal_ordinal"
     ordinal_smoothing: float = 0.15  # Unused if loss_type is not "focal_ordinal"
     trading_cost: float = 0.0  # Cost multiplier (x mean |Δmid|) for trading simulation
+    # DFL parameters (used when loss_type starts with "dfl_")
+    dfl_temperature: float = 1.0  # Gumbel-Softmax initial temperature
+    dfl_temperature_final: float = 0.1  # Final temperature after annealing
+    dfl_cost_multiplier: float = 1.0  # Transaction cost multiplier for spread-aware DFL
+    dfl_objective: str = "sharpe"  # "pnl" | "sharpe" | "sortino"
+    dfl_lambda_drawdown: float = 0.0  # Drawdown penalty weight
+    dfl_lambda_turnover: float = 0.0  # Turnover penalty weight
+    dfl_lambda_entropy: float = 0.01  # Entropy regularization (prevents position collapse)
+    # TradeLOB parameters
+    ntb_objective: str = "sharpe"  # "pnl" | "sharpe" | "sortino"
+    ntb_lambda_activity: float = 0.0  # Penalize always-hold collapse
+    ntb_lambda_ce: float = 0.0  # CE regularization weight (0 = pure PnL)
+    ntb_chunk_size: int = 64  # Number of consecutive steps per training chunk
 
 
 defaults = [Model, Experiment, Dataset]
@@ -347,6 +397,7 @@ cs.store(group="model", name="deeplob", node=DeepLOB)
 cs.store(group="model", name="patchlob", node=PatchLOBConfig)
 cs.store(group="model", name="fuselob", node=FuseLOBConfig)
 cs.store(group="model", name="nexuslob", node=NexusLOBConfig)
+cs.store(group="model", name="tradelob", node=TradeLOBConfig)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)
 cs.store(group="dataset", name="btc", node=BTC)

@@ -30,21 +30,49 @@ def btc_load(path, len_smooth, h, seq_size):
 def btc_load_multi(path, len_smooth, seq_size):
     """Load BTC data returning all 4 horizon labels stacked.
 
-    .npy last 4 cols: -4=h10, -3=h20, -2=h50, -1=h100.
+    Supports two .npy formats:
+      - 44 cols: [40 LOB | 4 labels]
+      - 49 cols: [40 LOB | 4 labels | 4 delta_mids | 1 half_spread]
+
     Returns:
-        input:  FloatTensor (N, num_features)
-        labels: LongTensor  (N_valid, 4)
+        input:    FloatTensor (N, 40)
+        labels:   LongTensor  (N_valid, 4)
+        dfl_data: tuple(delta_mids FloatTensor (N_valid, 4), half_spreads FloatTensor (N_valid,)) or None
     """
-    set = np.load(path)
+    arr = np.load(path)
+    ncols = arr.shape[1]
+    n_lob = cst.N_LOB_LEVELS * 4  # 40
+
+    if ncols == 49:
+        # [40 LOB | 4 labels | 4 delta_mids | 1 half_spread]
+        lob = arr[:, :n_lob]
+        label_arr = arr[:, n_lob:n_lob + 4]
+        delta_mids_arr = arr[:, n_lob + 4:n_lob + 8]
+        half_spreads_arr = arr[:, n_lob + 8].ravel()
+    else:
+        # [40 LOB | 4 labels] (legacy 44-col format)
+        lob = arr[:, :n_lob]
+        label_arr = arr[:, -4:]
+        delta_mids_arr = None
+        half_spreads_arr = None
+
     label_start = seq_size - len_smooth
-    all_labels = np.stack(
-        [set[label_start:, c] for c in [-4, -3, -2, -1]], axis=1
-    )  # (N_valid, 4)
+    all_labels = label_arr[label_start:]
     finite_mask = np.all(np.isfinite(all_labels), axis=1)
     all_labels = all_labels[finite_mask].astype(np.int64)
     labels = torch.from_numpy(all_labels).long()
-    input = torch.from_numpy(set[:, : cst.N_LOB_LEVELS * 4]).float()
-    return input, labels
+    input = torch.from_numpy(lob).float()
+
+    dfl_data = None
+    if delta_mids_arr is not None:
+        dm = delta_mids_arr[label_start:][finite_mask]
+        hs = half_spreads_arr[label_start:][finite_mask]
+        dfl_data = (
+            torch.from_numpy(dm.astype(np.float32)),
+            torch.from_numpy(hs.astype(np.float32)),
+        )
+
+    return input, labels, dfl_data
 
 
 class BTCDataBuilder:
@@ -225,15 +253,20 @@ class BTCDataBuilder:
         train_input = self.dataframes[0].values
         val_input = self.dataframes[1].values
         test_input = self.dataframes[2].values
-        self.train_set = np.concatenate(
-            [train_input, self.train_labels_horizons.values], axis=1
-        )
-        self.val_set = np.concatenate(
-            [val_input, self.val_labels_horizons.values], axis=1
-        )
-        self.test_set = np.concatenate(
-            [test_input, self.test_labels_horizons.values], axis=1
-        )
+
+        parts_train = [train_input, self.train_labels_horizons.values]
+        parts_val = [val_input, self.val_labels_horizons.values]
+        parts_test = [test_input, self.test_labels_horizons.values]
+
+        # Append DFL columns (delta_mids + half_spread) if available
+        if hasattr(self, "train_delta_mids"):
+            parts_train.extend([self.train_delta_mids, self.train_half_spreads.reshape(-1, 1)])
+            parts_val.extend([self.val_delta_mids, self.val_half_spreads.reshape(-1, 1)])
+            parts_test.extend([self.test_delta_mids, self.test_half_spreads.reshape(-1, 1)])
+
+        self.train_set = np.concatenate(parts_train, axis=1)
+        self.val_set = np.concatenate(parts_val, axis=1)
+        self.test_set = np.concatenate(parts_test, axis=1)
         self._save(path_where_to_save)
 
     def _prepare_dataframes(self, path):
@@ -289,27 +322,44 @@ class BTCDataBuilder:
         train_input = self.dataframes[0].values
         val_input = self.dataframes[1].values
         test_input = self.dataframes[2].values
+
+        # Extract DFL data (delta_mids, half_spreads) from raw prices before normalization
+        # LOB layout: [sell_p(0), sell_v(1), buy_p(2), buy_v(3)] × 10 levels
+        self.train_half_spreads = (train_input[:, 0] - train_input[:, 2]).astype(np.float32) / 2
+        self.val_half_spreads = (val_input[:, 0] - val_input[:, 2]).astype(np.float32) / 2
+        self.test_half_spreads = (test_input[:, 0] - test_input[:, 2]).astype(np.float32) / 2
+
+        train_deltas, val_deltas, test_deltas = [], [], []
+
         # create a dataframe for the labels
         for i in range(len(cst.LOBSTER_HORIZONS)):
             if i == 0:
-                train_labels = labeling(
+                train_labels, train_pc = labeling(
                     train_input,
                     cst.LEN_SMOOTH,
                     cst.LOBSTER_HORIZONS[i],
                     label_mode=self.label_mode,
+                    return_price_change=True,
                 )
-                val_labels = labeling(
+                val_labels, val_pc = labeling(
                     val_input,
                     cst.LEN_SMOOTH,
                     cst.LOBSTER_HORIZONS[i],
                     label_mode=self.label_mode,
+                    return_price_change=True,
                 )
-                test_labels = labeling(
+                test_labels, test_pc = labeling(
                     test_input,
                     cst.LEN_SMOOTH,
                     cst.LOBSTER_HORIZONS[i],
                     label_mode=self.label_mode,
+                    return_price_change=True,
                 )
+                # Pad delta_mids to full length (invalid positions = 0.0)
+                train_deltas.append(np.concatenate([train_pc, np.zeros(train_input.shape[0] - len(train_pc))]).astype(np.float32))
+                val_deltas.append(np.concatenate([val_pc, np.zeros(val_input.shape[0] - len(val_pc))]).astype(np.float32))
+                test_deltas.append(np.concatenate([test_pc, np.zeros(test_input.shape[0] - len(test_pc))]).astype(np.float32))
+
                 train_labels = np.concatenate(
                     [
                         train_labels,
@@ -347,24 +397,32 @@ class BTCDataBuilder:
                     test_labels, columns=["label_h{}".format(cst.LOBSTER_HORIZONS[i])]
                 )
             else:
-                train_labels = labeling(
+                train_labels, train_pc = labeling(
                     train_input,
                     cst.LEN_SMOOTH,
                     cst.LOBSTER_HORIZONS[i],
                     label_mode=self.label_mode,
+                    return_price_change=True,
                 )
-                val_labels = labeling(
+                val_labels, val_pc = labeling(
                     val_input,
                     cst.LEN_SMOOTH,
                     cst.LOBSTER_HORIZONS[i],
                     label_mode=self.label_mode,
+                    return_price_change=True,
                 )
-                test_labels = labeling(
+                test_labels, test_pc = labeling(
                     test_input,
                     cst.LEN_SMOOTH,
                     cst.LOBSTER_HORIZONS[i],
                     label_mode=self.label_mode,
+                    return_price_change=True,
                 )
+                # Pad delta_mids to full length
+                train_deltas.append(np.concatenate([train_pc, np.zeros(train_input.shape[0] - len(train_pc))]).astype(np.float32))
+                val_deltas.append(np.concatenate([val_pc, np.zeros(val_input.shape[0] - len(val_pc))]).astype(np.float32))
+                test_deltas.append(np.concatenate([test_pc, np.zeros(test_input.shape[0] - len(test_pc))]).astype(np.float32))
+
                 train_labels = np.concatenate(
                     [
                         train_labels,
@@ -401,6 +459,11 @@ class BTCDataBuilder:
                 self.test_labels_horizons[
                     "label_h{}".format(cst.LOBSTER_HORIZONS[i])
                 ] = test_labels
+
+        # Stack delta_mids: (N, 4) for horizons [10, 20, 50, 100]
+        self.train_delta_mids = np.stack(train_deltas, axis=1)
+        self.val_delta_mids = np.stack(val_deltas, axis=1)
+        self.test_delta_mids = np.stack(test_deltas, axis=1)
 
         # to conclude the preprocessing we normalize the dataframes
         self._normalize_dataframes()

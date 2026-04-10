@@ -44,31 +44,68 @@ def lobster_load(path, all_features, len_smooth, h, seq_size):
 def lobster_load_multi(path, all_features, len_smooth, seq_size):
     """Load LOBSTER data returning all 4 horizon labels stacked.
 
-    .npy last 5 cols: -5=h10, -4=h20, -3=h50, -2=h100, -1=h200.
-    We use [-5, -4, -3, -2] -> [h10, h20, h50, h100].
+    Supports two .npy formats:
+      - 51 cols: [6 msg | 40 LOB | 5 labels(h10,h20,h50,h100,h200)]
+      - 56 cols: [6 msg | 40 LOB | 5 labels | 4 delta_mids | 1 half_spread]
 
     Returns:
-        input:  FloatTensor (N, num_features)
-        labels: LongTensor  (N_valid, 4)
+        input:    FloatTensor (N, num_features)
+        labels:   LongTensor  (N_valid, 4)
+        dfl_data: tuple(delta_mids, half_spreads) or None
     """
-    set = np.load(path)
+    arr = np.load(path)
+    ncols = arr.shape[1]
+    n_msg = cst.LEN_ORDER  # 6
+    n_lob = 40
+    n_labels = 5  # h10,h20,h50,h100,h200
+
+    has_dfl = ncols == n_msg + n_lob + n_labels + 4 + 1  # 56
+
+    if has_dfl:
+        lob_start = n_msg
+        label_start_col = n_msg + n_lob
+        dfl_start = label_start_col + n_labels
+        delta_mids_arr = arr[:, dfl_start:dfl_start + 4]
+        half_spreads_arr = arr[:, dfl_start + 4].ravel()
+    else:
+        delta_mids_arr = None
+        half_spreads_arr = None
+
     label_start = seq_size - len_smooth
-    all_labels = np.stack(
-        [set[label_start:, c] for c in [-5, -4, -3, -2]], axis=1
-    )  # h10,h20,h50,h100
+    # Labels: use h10(-5), h20(-4/-9), h50(-3/-8), h100(-2/-7) depending on format
+    if has_dfl:
+        label_cols = arr[:, n_msg + n_lob:n_msg + n_lob + n_labels]
+        # h10=col0, h20=col1, h50=col2, h100=col3 (skip h200=col4)
+        all_labels = label_cols[label_start:, :4]
+    else:
+        # Legacy: labels are last 5 cols
+        all_labels = np.stack(
+            [arr[label_start:, c] for c in [-5, -4, -3, -2]], axis=1
+        )
+
     finite_mask = np.all(np.isfinite(all_labels), axis=1)
     all_labels = all_labels[finite_mask].astype(np.int64)
     labels = torch.from_numpy(all_labels).long()
+
     if all_features:
-        input = set[:, cst.LEN_ORDER : cst.LEN_ORDER + 40]
-        orders = set[:, : cst.LEN_ORDER]
-        input = torch.from_numpy(input).float()
+        lob = arr[:, n_msg:n_msg + n_lob]
+        orders = arr[:, :n_msg]
+        input = torch.from_numpy(lob).float()
         orders = torch.from_numpy(orders).float()
         input = torch.cat((input, orders), dim=1)
     else:
-        input = set[:, cst.LEN_ORDER : cst.LEN_ORDER + 40]
-        input = torch.from_numpy(input).float()
-    return input, labels
+        input = torch.from_numpy(arr[:, n_msg:n_msg + n_lob]).float()
+
+    dfl_data = None
+    if delta_mids_arr is not None:
+        dm = delta_mids_arr[label_start:][finite_mask]
+        hs = half_spreads_arr[label_start:][finite_mask]
+        dfl_data = (
+            torch.from_numpy(dm.astype(np.float32)),
+            torch.from_numpy(hs.astype(np.float32)),
+        )
+
+    return input, labels, dfl_data
 
 
 class LOBSTERDataBuilder:
@@ -115,24 +152,20 @@ class LOBSTERDataBuilder:
             self.train_input = pd.concat(self.dataframes[0], axis=1).values
             self.val_input = pd.concat(self.dataframes[1], axis=1).values
             self.test_input = pd.concat(self.dataframes[2], axis=1).values
-            self.train_set = pd.concat(
-                [
-                    pd.DataFrame(self.train_input),
-                    pd.DataFrame(self.train_labels_horizons),
-                ],
-                axis=1,
-            ).values
-            self.val_set = pd.concat(
-                [pd.DataFrame(self.val_input), pd.DataFrame(self.val_labels_horizons)],
-                axis=1,
-            ).values
-            self.test_set = pd.concat(
-                [
-                    pd.DataFrame(self.test_input),
-                    pd.DataFrame(self.test_labels_horizons),
-                ],
-                axis=1,
-            ).values
+
+            parts_train = [pd.DataFrame(self.train_input), pd.DataFrame(self.train_labels_horizons)]
+            parts_val = [pd.DataFrame(self.val_input), pd.DataFrame(self.val_labels_horizons)]
+            parts_test = [pd.DataFrame(self.test_input), pd.DataFrame(self.test_labels_horizons)]
+
+            # Append DFL columns (delta_mids + half_spread) if available
+            if hasattr(self, "train_delta_mids"):
+                parts_train.extend([pd.DataFrame(self.train_delta_mids), pd.DataFrame(self.train_half_spreads, columns=["half_spread"])])
+                parts_val.extend([pd.DataFrame(self.val_delta_mids), pd.DataFrame(self.val_half_spreads, columns=["half_spread"])])
+                parts_test.extend([pd.DataFrame(self.test_delta_mids), pd.DataFrame(self.test_half_spreads, columns=["half_spread"])])
+
+            self.train_set = pd.concat(parts_train, axis=1).values
+            self.val_set = pd.concat(parts_val, axis=1).values
+            self.test_set = pd.concat(parts_test, axis=1).values
             self._save(path_where_to_save)
 
     def _prepare_dataframes(self, path, stock):
@@ -192,54 +225,46 @@ class LOBSTERDataBuilder:
         train_input = self.dataframes[0][1].values
         val_input = self.dataframes[1][1].values
         test_input = self.dataframes[2][1].values
+
+        # Extract DFL data from raw prices before normalization
+        # LOB layout: [sell_p(0), sell_v(1), buy_p(2), buy_v(3)] × 10 levels
+        self.train_half_spreads = (train_input[:, 0] - train_input[:, 2]).astype(np.float32) / 2
+        self.val_half_spreads = (val_input[:, 0] - val_input[:, 2]).astype(np.float32) / 2
+        self.test_half_spreads = (test_input[:, 0] - test_input[:, 2]).astype(np.float32) / 2
+
+        train_deltas, val_deltas, test_deltas = [], [], []
+
         # create a dataframe for the labels
         for i in range(len(cst.LOBSTER_HORIZONS)):
             if i == 0:
-                train_labels = labeling(
-                    train_input,
-                    cst.LEN_SMOOTH,
-                    cst.LOBSTER_HORIZONS[i],
-                    label_mode=self.label_mode,
+                train_labels, train_pc = labeling(
+                    train_input, cst.LEN_SMOOTH, cst.LOBSTER_HORIZONS[i],
+                    label_mode=self.label_mode, return_price_change=True,
                 )
-                val_labels = labeling(
-                    val_input,
-                    cst.LEN_SMOOTH,
-                    cst.LOBSTER_HORIZONS[i],
-                    label_mode=self.label_mode,
+                val_labels, val_pc = labeling(
+                    val_input, cst.LEN_SMOOTH, cst.LOBSTER_HORIZONS[i],
+                    label_mode=self.label_mode, return_price_change=True,
                 )
-                test_labels = labeling(
-                    test_input,
-                    cst.LEN_SMOOTH,
-                    cst.LOBSTER_HORIZONS[i],
-                    label_mode=self.label_mode,
+                test_labels, test_pc = labeling(
+                    test_input, cst.LEN_SMOOTH, cst.LOBSTER_HORIZONS[i],
+                    label_mode=self.label_mode, return_price_change=True,
                 )
-                train_labels = np.concatenate(
-                    [
-                        train_labels,
-                        np.full(
-                            shape=(train_input.shape[0] - train_labels.shape[0]),
-                            fill_value=np.inf,
-                        ),
-                    ]
-                )
-                val_labels = np.concatenate(
-                    [
-                        val_labels,
-                        np.full(
-                            shape=(val_input.shape[0] - val_labels.shape[0]),
-                            fill_value=np.inf,
-                        ),
-                    ]
-                )
-                test_labels = np.concatenate(
-                    [
-                        test_labels,
-                        np.full(
-                            shape=(test_input.shape[0] - test_labels.shape[0]),
-                            fill_value=np.inf,
-                        ),
-                    ]
-                )
+                train_deltas.append(np.concatenate([train_pc, np.zeros(train_input.shape[0] - len(train_pc))]).astype(np.float32))
+                val_deltas.append(np.concatenate([val_pc, np.zeros(val_input.shape[0] - len(val_pc))]).astype(np.float32))
+                test_deltas.append(np.concatenate([test_pc, np.zeros(test_input.shape[0] - len(test_pc))]).astype(np.float32))
+
+                train_labels = np.concatenate([
+                    train_labels,
+                    np.full(shape=(train_input.shape[0] - train_labels.shape[0]), fill_value=np.inf),
+                ])
+                val_labels = np.concatenate([
+                    val_labels,
+                    np.full(shape=(val_input.shape[0] - val_labels.shape[0]), fill_value=np.inf),
+                ])
+                test_labels = np.concatenate([
+                    test_labels,
+                    np.full(shape=(test_input.shape[0] - test_labels.shape[0]), fill_value=np.inf),
+                ])
                 self.train_labels_horizons = pd.DataFrame(
                     train_labels, columns=["label_h{}".format(cst.LOBSTER_HORIZONS[i])]
                 )
@@ -250,51 +275,34 @@ class LOBSTERDataBuilder:
                     test_labels, columns=["label_h{}".format(cst.LOBSTER_HORIZONS[i])]
                 )
             else:
-                train_labels = labeling(
-                    train_input,
-                    cst.LEN_SMOOTH,
-                    cst.LOBSTER_HORIZONS[i],
-                    label_mode=self.label_mode,
+                train_labels, train_pc = labeling(
+                    train_input, cst.LEN_SMOOTH, cst.LOBSTER_HORIZONS[i],
+                    label_mode=self.label_mode, return_price_change=True,
                 )
-                val_labels = labeling(
-                    val_input,
-                    cst.LEN_SMOOTH,
-                    cst.LOBSTER_HORIZONS[i],
-                    label_mode=self.label_mode,
+                val_labels, val_pc = labeling(
+                    val_input, cst.LEN_SMOOTH, cst.LOBSTER_HORIZONS[i],
+                    label_mode=self.label_mode, return_price_change=True,
                 )
-                test_labels = labeling(
-                    test_input,
-                    cst.LEN_SMOOTH,
-                    cst.LOBSTER_HORIZONS[i],
-                    label_mode=self.label_mode,
+                test_labels, test_pc = labeling(
+                    test_input, cst.LEN_SMOOTH, cst.LOBSTER_HORIZONS[i],
+                    label_mode=self.label_mode, return_price_change=True,
                 )
-                train_labels = np.concatenate(
-                    [
-                        train_labels,
-                        np.full(
-                            shape=(train_input.shape[0] - train_labels.shape[0]),
-                            fill_value=np.inf,
-                        ),
-                    ]
-                )
-                val_labels = np.concatenate(
-                    [
-                        val_labels,
-                        np.full(
-                            shape=(val_input.shape[0] - val_labels.shape[0]),
-                            fill_value=np.inf,
-                        ),
-                    ]
-                )
-                test_labels = np.concatenate(
-                    [
-                        test_labels,
-                        np.full(
-                            shape=(test_input.shape[0] - test_labels.shape[0]),
-                            fill_value=np.inf,
-                        ),
-                    ]
-                )
+                train_deltas.append(np.concatenate([train_pc, np.zeros(train_input.shape[0] - len(train_pc))]).astype(np.float32))
+                val_deltas.append(np.concatenate([val_pc, np.zeros(val_input.shape[0] - len(val_pc))]).astype(np.float32))
+                test_deltas.append(np.concatenate([test_pc, np.zeros(test_input.shape[0] - len(test_pc))]).astype(np.float32))
+
+                train_labels = np.concatenate([
+                    train_labels,
+                    np.full(shape=(train_input.shape[0] - train_labels.shape[0]), fill_value=np.inf),
+                ])
+                val_labels = np.concatenate([
+                    val_labels,
+                    np.full(shape=(val_input.shape[0] - val_labels.shape[0]), fill_value=np.inf),
+                ])
+                test_labels = np.concatenate([
+                    test_labels,
+                    np.full(shape=(test_input.shape[0] - test_labels.shape[0]), fill_value=np.inf),
+                ])
                 self.train_labels_horizons[
                     "label_h{}".format(cst.LOBSTER_HORIZONS[i])
                 ] = train_labels
@@ -304,6 +312,11 @@ class LOBSTERDataBuilder:
                 self.test_labels_horizons[
                     "label_h{}".format(cst.LOBSTER_HORIZONS[i])
                 ] = test_labels
+
+        # Stack delta_mids: (N, 4) for horizons [10, 20, 50, 100]
+        self.train_delta_mids = np.stack(train_deltas, axis=1)
+        self.val_delta_mids = np.stack(val_deltas, axis=1)
+        self.test_delta_mids = np.stack(test_deltas, axis=1)
 
         # to conclude the preprocessing we normalize the dataframes
         self._normalize_dataframes()

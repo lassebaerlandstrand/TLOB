@@ -13,6 +13,7 @@ Examples:
 """
 
 import argparse
+import os
 import subprocess
 import sys
 
@@ -80,6 +81,11 @@ def base_command(args, is_preprocessed="True"):
         f"experiment.is_wandb={not args.no_wandb and IS_WANDB}",
     ]
     command += profile_overrides(args)
+    if args.loss_type is not None:
+        command.append(f"experiment.loss_type={args.loss_type}")
+    if args.encoder_checkpoint:
+        # Set via environment variable to avoid Hydra parsing issues with '=' in paths
+        os.environ["TRADELOB_ENCODER_CHECKPOINT"] = args.encoder_checkpoint
     return command
 
 
@@ -171,6 +177,18 @@ def main():
             "Preset policy for experiment overrides. "
             "auto keeps existing behavior; strict_original enforces paper-like baseline defaults."
         ),
+    )
+    parser.add_argument(
+        "--loss-type",
+        type=str,
+        default=None,
+        help="Override loss type (cross_entropy, focal, dfl_proxy, dfl_trading).",
+    )
+    parser.add_argument(
+        "--encoder-checkpoint",
+        type=str,
+        default="",
+        help="Path to pre-trained TLOB checkpoint for TradeLOB encoder loading.",
     )
 
     args = parser.parse_args()

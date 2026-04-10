@@ -7,6 +7,7 @@ from models.patchlob import PatchLOB  # noqa: F401
 from models.original.mlplob import MLPLOB as MLPLOBOriginal
 from models.original.tlob import TLOB as TLOBOriginal
 from models.tlob import TLOB
+from models.tradelob import TradeLOB
 
 
 def pick_model(
@@ -122,6 +123,25 @@ def pick_model(
             event_heads=kwargs.get("event_heads", 4),
             patch_size=kwargs.get("patch_size", 4),
             cross_attn_heads=kwargs.get("cross_attn_heads", 4),
+        )
+    elif model_type == "TRADELOB":
+        return TradeLOB(
+            hidden_dim,
+            num_layers,
+            seq_size,
+            num_features,
+            num_heads,
+            is_sin_emb,
+            dataset_type,
+            use_fast_attention=use_fast_attention,
+            num_horizons=num_horizons,
+            dropout=dropout,
+            max_band_width=kwargs.get("max_band_width", 1.5),
+            pos_embed_dim=kwargs.get("pos_embed_dim", 8),
+            band_hidden_dim=kwargs.get("band_hidden_dim", 64),
+            signal_hidden_dim=kwargs.get("signal_hidden_dim", 64),
+            sharpness=kwargs.get("sharpness", 10.0),
+            gumbel_temperature=kwargs.get("gumbel_temperature", 1.0),
         )
     else:
         raise ValueError("Model not found")

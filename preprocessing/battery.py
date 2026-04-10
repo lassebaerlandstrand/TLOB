@@ -49,8 +49,11 @@ log = logging.getLogger(__name__)
 _N_MSG = 18
 _N_LOB = cst.N_LOB_LEVELS * cst.LEN_LEVEL  # 40
 _N_LABELS = len(cst.LOBSTER_HORIZONS)  # 4
-_NCOLS_FULL = _N_MSG + _N_LOB + _N_LABELS  # 54
+_N_DFL = _N_LABELS + 1  # 4 delta_mids + 1 half_spread
+_NCOLS_FULL = _N_MSG + _N_LOB + _N_LABELS  # 62
 _NCOLS_LOB = _N_LOB + _N_LABELS  # 44
+_NCOLS_FULL_DFL = _NCOLS_FULL + _N_DFL  # 67
+_NCOLS_LOB_DFL = _NCOLS_LOB + _N_DFL  # 49
 _HORIZON_IDX = {
     h: i for i, h in enumerate(cst.LOBSTER_HORIZONS)
 }  # {10:0, 20:1, 50:2, 100:3}
@@ -93,7 +96,7 @@ def battery_load(path: str, all_features: bool, len_smooth: int, h: int, seq_siz
         )
 
     arr = np.load(path)
-    msg_cols, lob_cols, label_cols = _split_columns(arr, path)
+    msg_cols, lob_cols, label_cols, dfl_cols = _split_columns(arr, path)
 
     labels = label_cols[seq_size - len_smooth :, _HORIZON_IDX[h]]
     labels = labels[np.isfinite(labels)].astype(np.int64)
@@ -113,9 +116,11 @@ def battery_load_multi(path: str, all_features: bool, len_smooth: int, seq_size:
     -------
     input_ : FloatTensor (N, num_features)
     labels  : LongTensor  (N_valid, 4)   columns: h10, h20, h50, h100
+    dfl_data : tuple | None
+        If DFL data present: (delta_mids (N, 4), half_spreads (N,)) as FloatTensors.
     """
     arr = np.load(path)
-    msg_cols, lob_cols, label_cols = _split_columns(arr, path)
+    msg_cols, lob_cols, label_cols, dfl_cols = _split_columns(arr, path)
 
     label_start = seq_size - len_smooth
     all_labels = label_cols[label_start:]  # (N_valid, 4)
@@ -123,25 +128,51 @@ def battery_load_multi(path: str, all_features: bool, len_smooth: int, seq_size:
     all_labels = all_labels[finite_mask].astype(np.int64)
 
     input_ = _select_features(msg_cols, lob_cols, all_features, path)
-    return torch.from_numpy(input_).float(), torch.from_numpy(all_labels).long()
+
+    dfl_data = None
+    if dfl_cols is not None:
+        delta_mids, half_spreads = dfl_cols
+        delta_mids = delta_mids[label_start:][finite_mask].astype(np.float32)
+        half_spreads = half_spreads[label_start:][finite_mask].astype(np.float32)
+        dfl_data = (torch.from_numpy(delta_mids).float(), torch.from_numpy(half_spreads).float())
+
+    return torch.from_numpy(input_).float(), torch.from_numpy(all_labels).long(), dfl_data
 
 
 def _split_columns(arr: np.ndarray, path: str):
-    """Parse .npy into (msg_cols, lob_cols, label_cols) based on column count."""
+    """Parse .npy into (msg_cols, lob_cols, label_cols, dfl_cols) based on column count.
+
+    Returns dfl_cols=(delta_mids, half_spreads) when DFL data is present, else None.
+    """
     ncols = arr.shape[1]
-    if ncols == _NCOLS_FULL:  # 54: full format
+    dfl_cols = None
+
+    if ncols == _NCOLS_FULL_DFL:  # 67: full + DFL
+        msg_cols = arr[:, :_N_MSG]
+        lob_cols = arr[:, _N_MSG : _N_MSG + _N_LOB]
+        label_cols = arr[:, _N_MSG + _N_LOB : _N_MSG + _N_LOB + _N_LABELS]
+        dfl_start = _N_MSG + _N_LOB + _N_LABELS
+        dfl_cols = (arr[:, dfl_start : dfl_start + _N_LABELS], arr[:, dfl_start + _N_LABELS])
+    elif ncols == _NCOLS_LOB_DFL:  # 49: LOB-only + DFL
+        msg_cols = None
+        lob_cols = arr[:, :_N_LOB]
+        label_cols = arr[:, _N_LOB : _N_LOB + _N_LABELS]
+        dfl_start = _N_LOB + _N_LABELS
+        dfl_cols = (arr[:, dfl_start : dfl_start + _N_LABELS], arr[:, dfl_start + _N_LABELS])
+    elif ncols == _NCOLS_FULL:  # 62: full format (no DFL)
         msg_cols = arr[:, :_N_MSG]
         lob_cols = arr[:, _N_MSG : _N_MSG + _N_LOB]
         label_cols = arr[:, _N_MSG + _N_LOB :]
-    elif ncols == _NCOLS_LOB:  # 44: LOB-only format
+    elif ncols == _NCOLS_LOB:  # 44: LOB-only (no DFL)
         msg_cols = None
         lob_cols = arr[:, :_N_LOB]
         label_cols = arr[:, _N_LOB:]
     else:
         raise ValueError(
-            f"Unexpected column count {ncols} in {path}. Expected {_NCOLS_FULL} (full) or {_NCOLS_LOB} (LOB-only)."
+            f"Unexpected column count {ncols} in {path}. Expected {_NCOLS_FULL}/{_NCOLS_FULL_DFL} (full) "
+            f"or {_NCOLS_LOB}/{_NCOLS_LOB_DFL} (LOB-only)."
         )
-    return msg_cols, lob_cols, label_cols
+    return msg_cols, lob_cols, label_cols, dfl_cols
 
 
 def _select_features(msg_cols, lob_cols, all_features: bool, path: str) -> np.ndarray:
@@ -998,9 +1029,9 @@ class BatteryDataBuilder:
 
         # Compute labels on raw LOB (before normalisation)
         print("  Computing labels...")
-        train_labels = self._build_labels(train_raw_lob)
-        val_labels = self._build_labels(val_raw_lob)
-        test_labels = self._build_labels(test_raw_lob)
+        train_labels, train_dmid, train_hspread = self._build_labels(train_raw_lob)
+        val_labels, val_dmid, val_hspread = self._build_labels(val_raw_lob)
+        test_labels, test_dmid, test_hspread = self._build_labels(test_raw_lob)
 
         # Normalise
         print("  Normalising features...")
@@ -1008,10 +1039,10 @@ class BatteryDataBuilder:
             train_features, val_features, test_features
         )
 
-        # Save
-        self._save_split(train_norm, train_labels, out_dir / "train.npy")
-        self._save_split(val_norm, val_labels, out_dir / "val.npy")
-        self._save_split(test_norm, test_labels, out_dir / "test.npy")
+        # Save (with DFL data: delta_mids + half_spreads)
+        self._save_split(train_norm, train_labels, out_dir / "train.npy", train_dmid, train_hspread)
+        self._save_split(val_norm, val_labels, out_dir / "val.npy", val_dmid, val_hspread)
+        self._save_split(test_norm, test_labels, out_dir / "test.npy", test_dmid, test_hspread)
 
         self._validate_and_report(out_dir)
 
@@ -1147,15 +1178,15 @@ class BatteryDataBuilder:
         else:
             features = lobs.astype(np.float32)
 
-        labels = self._build_labels(lobs.astype(np.float32))
+        labels, delta_mids, half_spreads = self._build_labels(lobs.astype(np.float32))
         if global_stats:
             norm_features, _ = self._normalise_features(features, stats=global_stats)
         else:
             norm_features, _, _ = self._normalise_single(features)
-        self._save_split(norm_features, labels, prod_dir / f"{split_name}.npy")
+        self._save_split(norm_features, labels, prod_dir / f"{split_name}.npy", delta_mids, half_spreads)
 
         # Save empty placeholders for the other two splits
-        ncols = _NCOLS_FULL if self.all_features else _NCOLS_LOB
+        ncols = _NCOLS_FULL_DFL if self.all_features else _NCOLS_LOB_DFL
         for sname in ("train", "val", "test"):
             path = prod_dir / f"{sname}.npy"
             if not path.exists():
@@ -1184,23 +1215,42 @@ class BatteryDataBuilder:
             n_test = n - n_train - n_val
         return days[:n_train], days[n_train : n_train + n_val], days[n_train + n_val :]
 
-    def _build_labels(self, raw_lob: np.ndarray) -> np.ndarray:
-        """Compute multi-horizon labels from raw (un-normalised) LOB array.
+    def _build_labels(self, raw_lob: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute multi-horizon labels and raw price changes from raw LOB.
 
-        Returns (N, 4) float array with np.inf for invalid positions.
+        Returns:
+            labels: (N, 4) float array with np.inf for invalid positions.
+            delta_mids: (N, 4) float array of raw mid-price changes per horizon.
+            half_spreads: (N,) float array of half bid-ask spread at each timestep.
         """
         if raw_lob.shape[0] == 0:
-            return np.full((0, _N_LABELS), np.inf, dtype=np.float32)
+            return (
+                np.full((0, _N_LABELS), np.inf, dtype=np.float32),
+                np.full((0, _N_LABELS), 0.0, dtype=np.float32),
+                np.zeros(0, dtype=np.float32),
+            )
 
         label_cols = []
+        delta_mid_cols = []
         for h in tqdm(cst.LOBSTER_HORIZONS, desc="  Computing labels", leave=False):
-            lbls = labeling(
-                raw_lob, cst.LEN_SMOOTH, h, label_mode=self.label_mode
-            )  # (N - h - LEN_SMOOTH + 1,)
-            pad = np.full(raw_lob.shape[0] - lbls.shape[0], np.inf, dtype=np.float64)
-            label_cols.append(np.concatenate([lbls.astype(np.float64), pad]))
+            lbls, price_change = labeling(
+                raw_lob, cst.LEN_SMOOTH, h, label_mode=self.label_mode,
+                return_price_change=True,
+            )  # each (N - h - LEN_SMOOTH + 1,)
+            n_valid = lbls.shape[0]
+            pad_len = raw_lob.shape[0] - n_valid
+            label_pad = np.full(pad_len, np.inf, dtype=np.float64)
+            delta_pad = np.full(pad_len, 0.0, dtype=np.float64)
+            label_cols.append(np.concatenate([lbls.astype(np.float64), label_pad]))
+            delta_mid_cols.append(np.concatenate([price_change.astype(np.float64), delta_pad]))
 
-        return np.stack(label_cols, axis=1).astype(np.float32)  # (N, 4)
+        labels = np.stack(label_cols, axis=1).astype(np.float32)  # (N, 4)
+        delta_mids = np.stack(delta_mid_cols, axis=1).astype(np.float32)  # (N, 4)
+
+        # Half spread: (ask1 - bid1) / 2 from raw LOB (col 0 = sell1, col 2 = buy1)
+        half_spreads = ((raw_lob[:, 0] - raw_lob[:, 2]) / 2).astype(np.float32)  # (N,)
+
+        return labels, delta_mids, half_spreads
 
     def _normalise_splits(
         self,
@@ -1356,20 +1406,37 @@ class BatteryDataBuilder:
         df_out.fillna(0.0, inplace=True)
         return df_out, means, safe_stds
 
-    def _save_split(self, features: np.ndarray, labels: np.ndarray, path: Path):
-        """Concatenate features and labels and save as .npy."""
+    def _save_split(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        path: Path,
+        delta_mids: np.ndarray | None = None,
+        half_spreads: np.ndarray | None = None,
+    ):
+        """Concatenate features, labels, and optional DFL data, then save as .npy."""
         if features.shape[0] == 0:
-            ncols = _NCOLS_FULL if self.all_features else _NCOLS_LOB
+            if delta_mids is not None:
+                ncols = _NCOLS_FULL_DFL if self.all_features else _NCOLS_LOB_DFL
+            else:
+                ncols = _NCOLS_FULL if self.all_features else _NCOLS_LOB
             np.save(path, np.zeros((0, ncols), dtype=np.float32))
             return
-        arr = np.concatenate([features, labels], axis=1).astype(np.float32)
+        parts = [features, labels]
+        if delta_mids is not None:
+            parts.append(delta_mids)
+        if half_spreads is not None:
+            parts.append(half_spreads.reshape(-1, 1))
+        arr = np.concatenate(parts, axis=1).astype(np.float32)
         np.save(path, arr)
 
     # ── Validation ────────────────────────────────────────────────────────────
 
     def _validate_and_report(self, out_dir: Path):
         """Load saved .npy files and run shape, value, and LOB structure checks."""
-        expected_ncols = _NCOLS_FULL if self.all_features else _NCOLS_LOB
+        expected_ncols_base = _NCOLS_FULL if self.all_features else _NCOLS_LOB
+        expected_ncols_dfl = _NCOLS_FULL_DFL if self.all_features else _NCOLS_LOB_DFL
+        valid_ncols = {expected_ncols_base, expected_ncols_dfl}
         print(f"\n[BATTERY] Validating output in {out_dir}...")
 
         for split in ("train", "val", "test"):
@@ -1383,20 +1450,24 @@ class BatteryDataBuilder:
                 continue
 
             # Column count
-            assert arr.shape[1] == expected_ncols, (
-                f"{split}.npy has {arr.shape[1]} columns, expected {expected_ncols}"
+            assert arr.shape[1] in valid_ncols, (
+                f"{split}.npy has {arr.shape[1]} columns, expected one of {valid_ncols}"
             )
 
-            # Features finite
-            feat = arr[:, :-_N_LABELS]
+            # Use _split_columns to correctly parse both old and new formats
+            _, _, label_arr_parsed, _ = _split_columns(arr, str(path))
+
+            # Features finite (everything before labels)
+            n_feat = arr.shape[1] - _N_LABELS - (_N_DFL if arr.shape[1] in {_NCOLS_FULL_DFL, _NCOLS_LOB_DFL} else 0)
+            feat = arr[:, :n_feat]
             non_finite_pct = (~np.isfinite(feat)).mean() * 100
             if non_finite_pct > 0:
                 print(
                     f"  WARNING {split}.npy: {non_finite_pct:.2f}% non-finite feature values"
                 )
 
-            # Labels
-            label_arr = arr[:, -_N_LABELS:]
+            # Labels (correctly extracted via _split_columns)
+            label_arr = label_arr_parsed
             for i, h in enumerate(cst.LOBSTER_HORIZONS):
                 col = label_arr[:, i]
                 valid = col[np.isfinite(col)]

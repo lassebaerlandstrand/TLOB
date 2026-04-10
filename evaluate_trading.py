@@ -104,6 +104,11 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
     boundaries_path = os.path.join(checkpoint_dir, "product_boundaries.npy")
     data["segment_boundaries"] = np.load(boundaries_path) if os.path.exists(boundaries_path) else None
 
+    # Load spread data for spread-aware evaluation
+    for name in ["half_spreads", "z_half_spreads"]:
+        path = os.path.join(checkpoint_dir, f"{name}.npy")
+        data[name] = np.load(path) if os.path.exists(path) else None
+
     if multi_horizon:
         data["horizons"] = []
         for h in HORIZONS:
@@ -119,6 +124,9 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
             proba_path = os.path.join(checkpoint_dir, f"probabilities_h{h}.npy")
             h_data["probabilities"] = np.load(proba_path) if os.path.exists(proba_path) else None
 
+            logits_path = os.path.join(checkpoint_dir, f"logits_h{h}.npy")
+            h_data["logits"] = np.load(logits_path) if os.path.exists(logits_path) else None
+
             data["horizons"].append((h, h_data))
     else:
         data["predictions"] = np.load(os.path.join(checkpoint_dir, "predictions.npy"))
@@ -129,6 +137,9 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
         proba_path = os.path.join(checkpoint_dir, "probabilities.npy")
         data["probabilities"] = np.load(proba_path) if os.path.exists(proba_path) else None
 
+        logits_path = os.path.join(checkpoint_dir, "logits.npy")
+        data["logits"] = np.load(logits_path) if os.path.exists(logits_path) else None
+
     return data
 
 
@@ -137,11 +148,17 @@ def _run_evaluation(
     multi_horizon: bool,
     costs: list[float],
     confidence_thresholds: list[float],
+    min_holds: list[int] | None = None,
+    use_soft_positions: bool = False,
 ) -> dict:
     """Run trading simulation for all parameter combinations."""
+    if min_holds is None:
+        min_holds = [0]
     results = {}
     mid_prices = data["mid_prices"]
     segment_boundaries = data["segment_boundaries"]
+    half_spreads = data.get("half_spreads")
+    z_half_spreads = data.get("z_half_spreads")
 
     if multi_horizon:
         for cost in costs:
@@ -151,25 +168,35 @@ def _run_evaluation(
             for conf_thresh in confidence_thresholds:
                 conf_key = f"conf_{conf_thresh}"
                 results[cost_key][conf_key] = {}
-                metrics_list = []
-                horizons_found = []
 
-                for h, h_data in data["horizons"]:
-                    tm = compute_trading_metrics(
-                        mid_prices,
-                        h_data["predictions"],
-                        probabilities=h_data.get("probabilities"),
-                        cost_per_trade=cost,
-                        confidence_threshold=conf_thresh,
-                        segment_boundaries=segment_boundaries,
-                    )
-                    # Store serializable metrics (drop arrays)
-                    results[cost_key][conf_key][f"h{h}"] = _serializable(tm)
-                    metrics_list.append(tm)
-                    horizons_found.append(h)
+                for mh in min_holds:
+                    mh_key = f"hold_{mh}"
+                    metrics_list = []
+                    horizons_found = []
 
-                results[cost_key][conf_key]["_metrics_list"] = metrics_list
-                results[cost_key][conf_key]["_horizons"] = horizons_found
+                    for h, h_data in data["horizons"]:
+                        tm = compute_trading_metrics(
+                            mid_prices,
+                            h_data["predictions"],
+                            probabilities=h_data.get("probabilities"),
+                            logits=h_data.get("logits"),
+                            half_spreads=half_spreads,
+                            z_half_spreads=z_half_spreads,
+                            cost_per_trade=cost,
+                            confidence_threshold=conf_thresh,
+                            min_hold=mh,
+                            segment_boundaries=segment_boundaries,
+                            use_soft_positions=use_soft_positions,
+                        )
+                        metrics_list.append(tm)
+                        horizons_found.append(h)
+
+                    results[cost_key][conf_key][mh_key] = {
+                        "_metrics_list": metrics_list,
+                        "_horizons": horizons_found,
+                    }
+                    for tm, h in zip(metrics_list, horizons_found):
+                        results[cost_key][conf_key][mh_key][f"h{h}"] = _serializable(tm)
     else:
         for cost in costs:
             cost_key = f"cost_{cost}"
@@ -177,16 +204,25 @@ def _run_evaluation(
 
             for conf_thresh in confidence_thresholds:
                 conf_key = f"conf_{conf_thresh}"
-                tm = compute_trading_metrics(
-                    mid_prices,
-                    data["predictions"],
-                    probabilities=data.get("probabilities"),
-                    cost_per_trade=cost,
-                    confidence_threshold=conf_thresh,
-                    segment_boundaries=segment_boundaries,
-                )
-                results[cost_key][conf_key] = _serializable(tm)
-                results[cost_key][conf_key]["_metrics"] = tm
+                results[cost_key][conf_key] = {}
+
+                for mh in min_holds:
+                    mh_key = f"hold_{mh}"
+                    tm = compute_trading_metrics(
+                        mid_prices,
+                        data["predictions"],
+                        probabilities=data.get("probabilities"),
+                        logits=data.get("logits"),
+                        half_spreads=half_spreads,
+                        z_half_spreads=z_half_spreads,
+                        cost_per_trade=cost,
+                        confidence_threshold=conf_thresh,
+                        min_hold=mh,
+                        segment_boundaries=segment_boundaries,
+                        use_soft_positions=use_soft_positions,
+                    )
+                    results[cost_key][conf_key][mh_key] = _serializable(tm)
+                    results[cost_key][conf_key][mh_key]["_metrics"] = tm
 
     return results
 
@@ -196,52 +232,116 @@ def _serializable(tm: dict) -> dict:
     return {k: v for k, v in tm.items() if not isinstance(v, np.ndarray)}
 
 
-def _print_results(results: dict, multi_horizon: bool, costs: list[float], confidence_thresholds: list[float]):
+def _print_results(
+    results: dict,
+    multi_horizon: bool,
+    costs: list[float],
+    confidence_thresholds: list[float],
+    min_holds: list[int] | None = None,
+):
     """Print formatted results to terminal."""
+    if min_holds is None:
+        min_holds = [0]
     for cost in costs:
         cost_key = f"cost_{cost}"
         for conf_thresh in confidence_thresholds:
             conf_key = f"conf_{conf_thresh}"
+            for mh in min_holds:
+                mh_key = f"hold_{mh}"
 
-            header = f"Cost={cost}"
-            if conf_thresh > 0:
-                header += f"  Confidence threshold={conf_thresh}"
-            print(f"\n{'=' * 80}")
-            print(f"  {header}")
-            print(f"{'=' * 80}")
+                header = f"Cost={cost}"
+                if conf_thresh > 0:
+                    header += f"  Confidence={conf_thresh}"
+                if mh > 0:
+                    header += f"  MinHold={mh}"
+                print(f"\n{'=' * 90}")
+                print(f"  {header}")
+                print(f"{'=' * 90}")
 
-            if multi_horizon:
-                entry = results[cost_key][conf_key]
-                metrics_list = entry["_metrics_list"]
-                horizons = entry["_horizons"]
-                print(format_trading_table(metrics_list, horizons))
-            else:
-                tm = results[cost_key][conf_key]["_metrics"]
-                pf = "inf" if tm["profit_factor"] == float("inf") else f"{tm['profit_factor']:.2f}"
-                print(
-                    f"PnL(norm)={tm['total_pnl']:.4f}  Sharpe/step={tm['sharpe']:.2e}  "
-                    f"Sortino/step={tm['sortino']:.2e}  MaxDD={tm['max_drawdown_pct']:.1f}%  "
-                    f"WinRate={tm['win_rate'] * 100:.1f}%  ProfitF={pf}  "
-                    f"Trades={tm['n_trades']}  Exposure={tm['exposure_pct']:.1f}%  "
-                    f"p-value={tm['p_value']:.4f}"
-                )
+                if multi_horizon:
+                    entry = results[cost_key][conf_key][mh_key]
+                    metrics_list = entry["_metrics_list"]
+                    horizons = entry["_horizons"]
+                    print(format_trading_table(metrics_list, horizons))
+                else:
+                    tm = results[cost_key][conf_key][mh_key]["_metrics"]
+                    pf = "inf" if tm["profit_factor"] == float("inf") else f"{tm['profit_factor']:.2f}"
+                    print(
+                        f"PnL(norm)={tm['total_pnl']:.4f}  Sharpe/step={tm['sharpe']:.2e}  "
+                        f"Sortino/step={tm['sortino']:.2e}  MaxDD={tm['max_drawdown_pct']:.1f}%  "
+                        f"WinRate={tm['win_rate'] * 100:.1f}%  ProfitF={pf}  "
+                        f"Trades={tm['n_trades']}  AvgHold={tm['avg_hold_duration']:.1f}  "
+                        f"Exposure={tm['exposure_pct']:.1f}%  p-value={tm['p_value']:.4f}"
+                    )
+
+
+def _print_sweep_summary(
+    results: dict,
+    confidence_thresholds: list[float],
+    min_holds: list[int],
+):
+    """Print a compact summary of the threshold sweep with best operating points."""
+    cost_key = "cost_0.0"
+    print(f"\n{'=' * 90}")
+    print("  SWEEP SUMMARY — Best operating points per horizon (by PnL)")
+    print(f"{'=' * 90}")
+
+    # Find all horizons from the first entry
+    first_conf = f"conf_{confidence_thresholds[0]}"
+    first_hold = f"hold_{min_holds[0]}"
+    horizons = results[cost_key][first_conf][first_hold]["_horizons"]
+
+    for h_idx, h in enumerate(horizons):
+        best_pnl = -float("inf")
+        best_params = {}
+        best_tm = None
+
+        for conf in confidence_thresholds:
+            for mh in min_holds:
+                conf_key = f"conf_{conf}"
+                mh_key = f"hold_{mh}"
+                tm = results[cost_key][conf_key][mh_key]["_metrics_list"][h_idx]
+                if tm["total_pnl"] > best_pnl:
+                    best_pnl = tm["total_pnl"]
+                    best_params = {"conf": conf, "min_hold": mh}
+                    best_tm = tm
+
+        if best_tm is not None:
+            pf = f"{best_tm['profit_factor']:.2f}" if best_tm["profit_factor"] != float("inf") else "inf"
+            print(
+                f"  h{h:<4} | Best: conf={best_params['conf']}, hold={best_params['min_hold']:<3} | "
+                f"PnL={best_pnl:>9.4f} Sharpe={best_tm['sharpe']:.2e} "
+                f"Trades={best_tm['n_trades']:>6} AvgHold={best_tm['avg_hold_duration']:>6.1f} "
+                f"ProfitF={pf:>6} Exposure={best_tm['exposure_pct']:.1f}%"
+            )
+
+    # Also show baseline (no filtering)
+    baseline = results[cost_key]["conf_0.0"]["hold_0"]
+    print(f"\n  Baseline (no filtering):")
+    for h_idx, h in enumerate(horizons):
+        tm = baseline["_metrics_list"][h_idx]
+        print(
+            f"  h{h:<4} | PnL={tm['total_pnl']:>9.4f} Sharpe={tm['sharpe']:.2e} "
+            f"Trades={tm['n_trades']:>6}"
+        )
 
 
 def _plot_cumulative_pnl(results: dict, data: dict, multi_horizon: bool, save_dir: str):
-    """Plot cumulative PnL curves (zero-cost, zero-confidence-threshold baseline)."""
+    """Plot cumulative PnL curves (zero-cost, zero-confidence-threshold, zero-hold baseline)."""
     baseline_key = "cost_0.0"
     conf_key = "conf_0.0"
+    hold_key = "hold_0"
 
     fig, ax = plt.subplots(figsize=(12, 6), dpi=140)
 
     if multi_horizon:
-        entry = results[baseline_key][conf_key]
+        entry = results[baseline_key][conf_key][hold_key]
         for tm, h in zip(entry["_metrics_list"], entry["_horizons"]):
             cum_pnl = tm["cumulative_pnl"]
             if len(cum_pnl) > 0:
                 ax.plot(cum_pnl, label=f"h{h} (Sharpe={tm['sharpe']:.2f})", linewidth=1.2)
     else:
-        tm = results[baseline_key][conf_key]["_metrics"]
+        tm = results[baseline_key][conf_key][hold_key]["_metrics"]
         cum_pnl = tm["cumulative_pnl"]
         if len(cum_pnl) > 0:
             ax.plot(cum_pnl, label=f"Model (Sharpe={tm['sharpe']:.2f})", linewidth=1.2)
@@ -279,30 +379,30 @@ def _plot_confidence_sweep(
     if len(confidence_thresholds) < 2:
         return
 
-    # Use zero-cost for the sweep plot
+    # Use zero-cost, zero-hold for the sweep plot
     cost_key = "cost_0.0"
     if cost_key not in results:
         cost_key = f"cost_{costs[0]}"
+    hold_key = "hold_0"
 
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
 
     if multi_horizon:
-        # Get horizons from the first confidence threshold entry
         first_conf = f"conf_{confidence_thresholds[0]}"
-        horizons = results[cost_key][first_conf]["_horizons"]
+        horizons = results[cost_key][first_conf][hold_key]["_horizons"]
 
         for h_idx, h in enumerate(horizons):
             sharpes = []
             for conf in confidence_thresholds:
                 conf_key = f"conf_{conf}"
-                entry = results[cost_key][conf_key]
+                entry = results[cost_key][conf_key][hold_key]
                 sharpes.append(entry["_metrics_list"][h_idx]["sharpe"])
             ax.plot(confidence_thresholds, sharpes, marker="o", label=f"h{h}", linewidth=1.5)
     else:
         sharpes = []
         for conf in confidence_thresholds:
             conf_key = f"conf_{conf}"
-            sharpes.append(results[cost_key][conf_key]["_metrics"]["sharpe"])
+            sharpes.append(results[cost_key][conf_key][hold_key]["_metrics"]["sharpe"])
         ax.plot(confidence_thresholds, sharpes, marker="o", label="Model", linewidth=1.5)
 
     ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.8)
@@ -330,22 +430,23 @@ def _plot_cost_sensitivity(
         return
 
     conf_key = "conf_0.0"
+    hold_key = "hold_0"
     fig, ax = plt.subplots(figsize=(8, 5), dpi=140)
 
     if multi_horizon:
-        horizons = results[f"cost_{costs[0]}"][conf_key]["_horizons"]
+        horizons = results[f"cost_{costs[0]}"][conf_key][hold_key]["_horizons"]
         for h_idx, h in enumerate(horizons):
             sharpes = []
             for cost in costs:
                 cost_key = f"cost_{cost}"
-                entry = results[cost_key][conf_key]
+                entry = results[cost_key][conf_key][hold_key]
                 sharpes.append(entry["_metrics_list"][h_idx]["sharpe"])
             ax.plot(costs, sharpes, marker="s", label=f"h{h}", linewidth=1.5)
     else:
         sharpes = []
         for cost in costs:
             cost_key = f"cost_{cost}"
-            sharpes.append(results[cost_key][conf_key]["_metrics"]["sharpe"])
+            sharpes.append(results[cost_key][conf_key][hold_key]["_metrics"]["sharpe"])
         ax.plot(costs, sharpes, marker="s", label="Model", linewidth=1.5)
 
     ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.8)
@@ -406,6 +507,23 @@ def main():
         default=[0.0],
         help="Confidence thresholds to evaluate (default: 0.0)",
     )
+    parser.add_argument(
+        "--min-holds",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Minimum hold steps before allowing position change (default: 0)",
+    )
+    parser.add_argument(
+        "--soft-positions",
+        action="store_true",
+        help="Use continuous positions from logits instead of hard argmax (for DFL models)",
+    )
+    parser.add_argument(
+        "--sweep-thresholds",
+        action="store_true",
+        help="Run a predefined grid search over min_hold and confidence_threshold",
+    )
     args = parser.parse_args()
 
     checkpoint_dir = args.checkpoint_dir
@@ -413,9 +531,15 @@ def main():
         print(f"Error: {checkpoint_dir} is not a directory")
         sys.exit(1)
 
-    # Ensure 0.0 is always in the sweep lists (baseline)
-    costs = sorted(set([0.0] + args.costs))
-    confidence_thresholds = sorted(set([0.0] + args.confidence_thresholds))
+    if args.sweep_thresholds:
+        # Predefined grid for Phase 1 validation
+        costs = [0.0]
+        confidence_thresholds = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9]
+        min_holds = [0, 5, 10, 20, 50, 100]
+    else:
+        costs = sorted(set([0.0] + args.costs))
+        confidence_thresholds = sorted(set([0.0] + args.confidence_thresholds))
+        min_holds = sorted(set([0] + args.min_holds))
 
     multi_horizon = _detect_multi_horizon(checkpoint_dir)
     mode_str = "multi-horizon" if multi_horizon else "single-horizon"
@@ -425,6 +549,7 @@ def main():
         print(f"Loading per-horizon arrays for horizons: {HORIZONS}")
     print(f"Cost levels: {costs}")
     print(f"Confidence thresholds: {confidence_thresholds}")
+    print(f"Min hold steps: {min_holds}")
 
     data = _load_arrays(checkpoint_dir, multi_horizon)
     print(f"Loaded {len(data['mid_prices']):,} mid-price steps")
@@ -434,9 +559,30 @@ def main():
         print(f"Mean |Δmid| = {mean_abs_change:.6f} (cost multiplier base)")
     if data["segment_boundaries"] is not None:
         print(f"Loaded {len(data['segment_boundaries'])} product boundaries (EPEX per-product mode)")
+    if data.get("half_spreads") is not None:
+        print(f"Loaded raw half-spreads (spread-aware costs enabled)")
+    if data.get("z_half_spreads") is not None:
+        print(f"Loaded z-scored half-spreads (spread-aware costs enabled)")
+    if args.soft_positions:
+        has_logits = False
+        if multi_horizon:
+            has_logits = any(h_data.get("logits") is not None for _, h_data in data.get("horizons", []))
+        else:
+            has_logits = data.get("logits") is not None
+        if has_logits:
+            print("Using soft (continuous) positions from logits")
+        else:
+            print("Warning: --soft-positions requested but no logits found, falling back to hard positions")
 
-    results = _run_evaluation(data, multi_horizon, costs, confidence_thresholds)
-    _print_results(results, multi_horizon, costs, confidence_thresholds)
+    results = _run_evaluation(
+        data, multi_horizon, costs, confidence_thresholds,
+        min_holds=min_holds, use_soft_positions=args.soft_positions,
+    )
+    _print_results(results, multi_horizon, costs, confidence_thresholds, min_holds=min_holds)
+
+    # Print sweep summary if running threshold sweep
+    if args.sweep_thresholds and multi_horizon:
+        _print_sweep_summary(results, confidence_thresholds, min_holds)
 
     print(f"\nGenerating plots...")
     _plot_cumulative_pnl(results, data, multi_horizon, checkpoint_dir)

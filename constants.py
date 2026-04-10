@@ -20,6 +20,7 @@ class ModelType(Enum):
     PATCHLOB = "PATCHLOB"
     FUSELOB = "FUSELOB"
     NEXUSLOB = "NEXUSLOB"
+    TRADELOB = "TRADELOB"
 
 
 class SamplingType(Enum):

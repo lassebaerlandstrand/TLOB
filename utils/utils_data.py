@@ -175,7 +175,7 @@ def to_sparse_representation(lob, n_levels):
     return sparse_lob
 
 
-def labeling(X, len, h, label_mode: str = "absolute_change"):
+def labeling(X, len, h, label_mode: str = "absolute_change", return_price_change: bool = False):
     # X is the orderbook
     # len is the time window smoothing length
     # h is the prediction horizon
@@ -225,4 +225,8 @@ def labeling(X, len, h, label_mode: str = "absolute_change"):
     alpha = np.abs(price_change).mean() / 2
 
     labels = np.where(price_change < -alpha, 2, np.where(price_change > alpha, 0, 1))
+
+    if return_price_change:
+        return labels, price_change
+
     return labels

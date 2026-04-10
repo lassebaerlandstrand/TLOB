@@ -329,60 +329,119 @@ def compute_trading_metrics(
     mid_prices: np.ndarray,
     predictions: np.ndarray,
     probabilities: np.ndarray | None = None,
+    logits: np.ndarray | None = None,
+    half_spreads: np.ndarray | None = None,
+    z_half_spreads: np.ndarray | None = None,
     cost_per_trade: float = 0.0,
     confidence_threshold: float = 0.0,
+    min_hold: int = 0,
     segment_boundaries: np.ndarray | None = None,
+    use_soft_positions: bool = False,
 ) -> dict[str, Any]:
     """Simulate a directional trading strategy and compute performance metrics.
 
-    Follows the Zhang et al. (2019) DeepLOB protocol:
-    UP(0) -> long +1, STATIONARY(1) -> flat 0, DOWN(2) -> short -1.
+    Extends the Zhang et al. (2019) DeepLOB protocol with:
+    - Spread-aware transaction costs using actual bid-ask spreads
+    - Soft (continuous) positions from logits for DFL models
+    - Position persistence with minimum hold period
 
     Parameters
     ----------
-    mid_prices : (N,) array of sequential (normalized) mid-prices.
+    mid_prices : (N,) array of sequential (z-score normalized) mid-prices.
     predictions : (N,) array with values in {0, 1, 2}.
     probabilities : (N, 3) softmax probabilities, optional.
-        Used for confidence thresholding.
-    cost_per_trade : Cost multiplier (x mean |Δmid|) per unit of position change.
+        Used for confidence thresholding (hard positions only).
+    logits : (N, 3) raw model logits, optional.
+        Required when use_soft_positions=True.
+    half_spreads : (N,) raw (unnormalized) half bid-ask spread, optional.
+        Used with z_half_spreads for spread-aware transaction costs.
+    z_half_spreads : (N,) z-score normalized half spread, optional.
+        Computed from input tensor as (x[:,-1,0] - x[:,-1,2]) / 2.
+        Used to estimate the price normalization scale factor.
+    cost_per_trade : Legacy cost multiplier (x mean |Δmid|) per unit of
+        position change. Only used when spread data is not available.
     confidence_threshold : Minimum max-class probability to act.
         Predictions below this threshold are treated as STATIONARY.
+        Not applied when use_soft_positions=True.
+    min_hold : Minimum number of steps to hold a position before allowing
+        a change. When > 0, positions persist until min_hold steps have
+        elapsed AND the new prediction differs. Segment boundaries reset
+        the hold counter.
     segment_boundaries : 1-D array of cumulative boundary indices, optional.
         Positions are forced to zero at each boundary (e.g. EPEX product
         boundaries).  Values are exclusive end indices of each segment.
+    use_soft_positions : If True and logits provided, use continuous
+        positions in [-1, +1] via softmax(logits) @ [+1, 0, -1].
     """
     mid_prices = _to_numpy(mid_prices).astype(np.float64, copy=False).ravel()
     predictions = _to_numpy(predictions).astype(np.int64, copy=False).ravel()
     n = min(len(mid_prices), len(predictions))
+    if logits is not None:
+        logits = _to_numpy(logits).astype(np.float64, copy=False)
+        n = min(n, len(logits))
     if n < 2:
         return _empty_trading_metrics()
 
     mid_prices = mid_prices[:n]
     predictions = predictions[:n]
+    if logits is not None:
+        logits = logits[:n]
+    if half_spreads is not None:
+        half_spreads = _to_numpy(half_spreads).astype(np.float64, copy=False).ravel()[:n]
+    if z_half_spreads is not None:
+        z_half_spreads = _to_numpy(z_half_spreads).astype(np.float64, copy=False).ravel()[:n]
 
-    # --- confidence filtering ---
-    if probabilities is not None and confidence_threshold > 0.0:
-        probabilities = _to_numpy(probabilities).astype(np.float64, copy=False)
-        if probabilities.ndim == 2:
-            max_conf = probabilities[:n].max(axis=1)
-        else:
-            max_conf = probabilities[:n]
-        low_conf = max_conf < confidence_threshold
-        predictions = predictions.copy()
-        predictions[low_conf] = 1  # treat as STATIONARY
+    # --- build raw signal series ---
+    if use_soft_positions and logits is not None:
+        # Continuous positions from softmax(logits) @ [+1, 0, -1]
+        shifted = logits - logits.max(axis=1, keepdims=True)
+        exp_l = np.exp(shifted)
+        probs = exp_l / exp_l.sum(axis=1, keepdims=True)
+        raw_positions = probs @ _POSITION_MAP  # continuous in [-1, +1]
+    else:
+        # Hard discrete positions from class predictions
+        if probabilities is not None and confidence_threshold > 0.0:
+            probabilities = _to_numpy(probabilities).astype(np.float64, copy=False)
+            if probabilities.ndim == 2:
+                max_conf = probabilities[:n].max(axis=1)
+            else:
+                max_conf = probabilities[:n]
+            low_conf = max_conf < confidence_threshold
+            predictions = predictions.copy()
+            predictions[low_conf] = 1  # treat as STATIONARY
+        raw_positions = _POSITION_MAP[predictions]  # (N,)
 
-    # --- build position series ---
-    positions = _POSITION_MAP[predictions]  # (N,)
+    # --- apply min_hold persistence ---
+    if min_hold > 0:
+        boundary_set = set()
+        if segment_boundaries is not None:
+            boundary_set = set(np.asarray(segment_boundaries, dtype=np.int64).tolist())
+        positions = np.empty(n, dtype=np.float64)
+        current_pos = 0.0
+        steps_held = min_hold  # allow trading on first step
+        for t in range(n):
+            if t in boundary_set:
+                # Segment boundary: force flat, reset hold counter
+                current_pos = 0.0
+                steps_held = min_hold
+            target = raw_positions[t]
+            if target != current_pos and steps_held >= min_hold:
+                current_pos = target
+                steps_held = 0
+            positions[t] = current_pos
+            steps_held += 1
+    else:
+        positions = raw_positions
 
     # --- force close at segment boundaries ---
     if segment_boundaries is not None:
         segment_boundaries = np.asarray(segment_boundaries, dtype=np.int64)
         for b in segment_boundaries:
             if 0 < b < n:
-                positions[b - 1] = 0  # close position at end of segment
+                positions[b - 1] = 0.0
 
     # force close at the very end
-    positions[-1] = 0
+    positions[-1] = 0.0
 
     # --- step returns ---
     price_changes = np.diff(mid_prices)  # (N-1,)
@@ -390,17 +449,76 @@ def compute_trading_metrics(
     step_positions = positions[:-1]  # position held during [t, t+1)
     gross_returns = step_positions * price_changes  # (N-1,)
 
-    # --- transaction costs (relative to mean |Δmid|) ---
-    effective_cost = cost_per_trade * mean_abs_price_change
-    position_changes = np.abs(np.diff(positions))  # (N-1,)
-    # first step: change from flat (0)
-    first_change = np.abs(positions[0])
-    costs = np.empty(n - 1, dtype=np.float64)
-    costs[0] = effective_cost * first_change
-    costs[1:] = effective_cost * position_changes[:-1]
-    # Add final closing cost (going from positions[-2] to positions[-1]=0)
-    if n > 2:
-        costs[-1] += effective_cost * position_changes[-1]
+    # --- transaction costs ---
+    # For soft positions: threshold for detecting a meaningful position/change
+    _POS_EPS = 0.01
+
+    has_spread_costs = False
+    std_price = None
+    total_spread_cost = 0.0
+
+    if half_spreads is not None and z_half_spreads is not None:
+        # Spread-aware costs: convert raw half_spread to z-score units
+        valid = np.abs(z_half_spreads) > 1e-10
+        if valid.sum() > 10:
+            std_price = float(np.median(half_spreads[valid] / z_half_spreads[valid]))
+        else:
+            std_price = None
+
+        if std_price is not None and std_price > 1e-10:
+            has_spread_costs = True
+            half_spreads_z = half_spreads / std_price
+
+            # Cost = |position_change| × half_spread_z at each step
+            first_change = np.abs(positions[0])
+            pos_changes = np.abs(np.diff(positions))  # (N-1,)
+
+            costs = np.empty(n - 1, dtype=np.float64)
+            costs[0] = first_change * half_spreads_z[0]
+            costs[1:] = pos_changes[:-1] * half_spreads_z[1:n - 1]
+            # Closing cost (going to positions[-1]=0)
+            if n > 2:
+                costs[-1] += pos_changes[-1] * half_spreads_z[n - 2]
+
+            total_spread_cost = float(costs.sum())
+        else:
+            # Fallback: z_half_spreads only (no raw half_spreads or bad scale)
+            first_change = np.abs(positions[0])
+            pos_changes = np.abs(np.diff(positions))
+            z_hs = np.abs(z_half_spreads)
+
+            has_spread_costs = True
+            costs = np.empty(n - 1, dtype=np.float64)
+            costs[0] = first_change * z_hs[0]
+            costs[1:] = pos_changes[:-1] * z_hs[1:n - 1]
+            if n > 2:
+                costs[-1] += pos_changes[-1] * z_hs[n - 2]
+            total_spread_cost = float(costs.sum())
+    elif z_half_spreads is not None:
+        # Only z-scored spread available (e.g., CE runs without DFL data)
+        has_spread_costs = True
+        z_hs = np.abs(z_half_spreads)
+        first_change = np.abs(positions[0])
+        pos_changes = np.abs(np.diff(positions))
+
+        costs = np.empty(n - 1, dtype=np.float64)
+        costs[0] = first_change * z_hs[0]
+        costs[1:] = pos_changes[:-1] * z_hs[1:n - 1]
+        if n > 2:
+            costs[-1] += pos_changes[-1] * z_hs[n - 2]
+        total_spread_cost = float(costs.sum())
+    elif cost_per_trade > 0.0:
+        # Legacy cost model (proportional to mean |Δmid|)
+        effective_cost = cost_per_trade * mean_abs_price_change
+        first_change = np.abs(positions[0])
+        pos_changes = np.abs(np.diff(positions))
+        costs = np.empty(n - 1, dtype=np.float64)
+        costs[0] = effective_cost * first_change
+        costs[1:] = effective_cost * pos_changes[:-1]
+        if n > 2:
+            costs[-1] += effective_cost * pos_changes[-1]
+    else:
+        costs = np.zeros(n - 1, dtype=np.float64)
 
     # Zero out gross returns at boundary crossings (artificial price change
     # spanning two different products) but keep costs (closing cost is real).
@@ -417,7 +535,10 @@ def compute_trading_metrics(
     total_pnl = float(cumulative_pnl[-1]) if len(cumulative_pnl) > 0 else 0.0
 
     # --- active steps (non-zero position) ---
-    active_mask = step_positions != 0
+    if use_soft_positions:
+        active_mask = np.abs(step_positions) > _POS_EPS
+    else:
+        active_mask = step_positions != 0
     n_active = int(active_mask.sum())
     active_returns = net_returns[active_mask]
 
@@ -462,7 +583,22 @@ def compute_trading_metrics(
     profit_factor = (gross_profit / gross_loss) if gross_loss > 1e-12 else float("inf") if gross_profit > 0 else 0.0
 
     # --- Trade count (number of position changes) ---
-    n_trades = int(first_change != 0) + int(position_changes.sum())
+    if use_soft_positions:
+        pos_changes_all = np.abs(np.diff(positions))
+        n_trades = int((pos_changes_all > _POS_EPS).sum())
+    else:
+        position_changes = np.abs(np.diff(positions))
+        n_trades = int(positions[0] != 0) + int((position_changes > 0).sum())
+
+    # --- Average hold duration (steps between position changes) ---
+    change_indices = np.where(position_changes > (_POS_EPS if use_soft_positions else 0))[0]
+    if len(change_indices) > 1:
+        hold_durations = np.diff(change_indices)
+        avg_hold_duration = float(hold_durations.mean())
+    elif n_trades > 0:
+        avg_hold_duration = float(n - 1)  # single trade held for entire period
+    else:
+        avg_hold_duration = 0.0
 
     # --- Exposure ---
     exposure_pct = (n_active / len(step_positions) * 100.0) if len(step_positions) > 0 else 0.0
@@ -486,6 +622,7 @@ def compute_trading_metrics(
         "win_rate": win_rate,
         "profit_factor": profit_factor,
         "n_trades": n_trades,
+        "avg_hold_duration": avg_hold_duration,
         "exposure_pct": exposure_pct,
         "t_stat": t_stat,
         "p_value": p_value,
@@ -494,6 +631,9 @@ def compute_trading_metrics(
         "returns_series": net_returns,
         "cumulative_pnl": cumulative_pnl,
         "positions": positions,
+        "has_spread_costs": has_spread_costs,
+        "total_spread_cost": total_spread_cost,
+        "std_price": std_price,
     }
 
 
@@ -508,6 +648,7 @@ def _empty_trading_metrics() -> dict[str, Any]:
         "win_rate": 0.0,
         "profit_factor": 0.0,
         "n_trades": 0,
+        "avg_hold_duration": 0.0,
         "exposure_pct": 0.0,
         "t_stat": 0.0,
         "p_value": 1.0,
@@ -516,15 +657,18 @@ def _empty_trading_metrics() -> dict[str, Any]:
         "returns_series": np.array([], dtype=np.float64),
         "cumulative_pnl": np.array([], dtype=np.float64),
         "positions": np.array([], dtype=np.float64),
+        "has_spread_costs": False,
+        "total_spread_cost": 0.0,
+        "std_price": None,
     }
 
 
 def format_trading_table(trading_metrics_list: list[dict], horizons: list[int]) -> str:
     header = (
-        "Horizon | PnL(norm) |   Sharpe/step |  Sortino/step | MaxDD%  | WinRate | ProfitF | Trades | Exposure |  p-value"
+        "Horizon | PnL(norm) |   Sharpe/step |  Sortino/step | MaxDD%  | WinRate | ProfitF | Trades | AvgHold | Exposure |  p-value"
     )
     separator = (
-        "--------|-----------|--------------|--------------|---------|---------|---------|--------|----------|----------"
+        "--------|-----------|--------------|--------------|---------|---------|---------|--------|---------|----------|----------"
     )
     lines = [header, separator]
 
@@ -540,6 +684,7 @@ def format_trading_table(trading_metrics_list: list[dict], horizons: list[int]) 
             f" {m['win_rate'] * 100:>6.1f}% |"
             f" {pf} |"
             f" {_format_int_space(m['n_trades']):>6} |"
+            f" {m['avg_hold_duration']:>7.1f} |"
             f" {m['exposure_pct']:>7.1f}% |"
             f" {m['p_value']:>9.4f}"
         )

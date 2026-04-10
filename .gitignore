@@ -244,6 +244,8 @@ notebooks/battery_checks_concat.ipynb
 notebooks/btc_checks.ipynb
 notebooks/data_analysis.ipynb
 notebooks/figures/
+analysis_figures/
+analysis_scripts/
 
 # Large local archive
 data/battery_market.zip

@@ -152,7 +152,7 @@ class Engine(LightningModule):
             self.class_weights = None
 
         self.is_dfl = loss_type.startswith("dfl_")
-        if self.loss_type == "cross_entropy":
+        if self.loss_type in ("cross_entropy", "cost_aware_ce"):
             if self.multi_horizon:
                 # Per-horizon weights applied manually in _multi_horizon_loss
                 self.loss_function = nn.CrossEntropyLoss()
@@ -382,7 +382,28 @@ class Engine(LightningModule):
                     # dfl_proxy (or dfl_trading fallback): uses labels as direction signal
                     dfl_loss_h, _ = self.dfl_loss(y_hat_h, y_multi[:, horizon_index])
                 horizon_losses.append(dfl_loss_h)
-            elif self.loss_type == "cross_entropy":
+            elif self.loss_type == "cost_aware_ce" and dfl_data is not None:
+                # Cost-aware CE: weight each sample by |delta_mid| / half_spread
+                delta_mids, half_spreads = dfl_data
+                dm_h = delta_mids[:, horizon_index].abs()
+                hs = half_spreads.clamp(min=1e-8)
+                sample_w = (dm_h / hs).clamp(min=0.01, max=10.0)
+                horizon_weight = None
+                if self.class_weights is not None:
+                    if self.class_weights.ndim == 2:
+                        horizon_weight = self.class_weights[horizon_index]
+                    else:
+                        horizon_weight = self.class_weights
+                ce_unreduced = torch.nn.functional.cross_entropy(
+                    y_hat_h,
+                    y_multi[:, horizon_index],
+                    weight=horizon_weight,
+                    reduction="none",
+                )
+                ce_h = (ce_unreduced * sample_w).mean()
+                horizon_losses.append(ce_h)
+            elif self.loss_type in ("cross_entropy", "cost_aware_ce"):
+                # Standard CE (also fallback if cost_aware_ce has no dfl_data)
                 horizon_weight = None
                 if self.class_weights is not None:
                     if self.class_weights.ndim == 2:
@@ -495,7 +516,7 @@ class Engine(LightningModule):
         self.total_train_samples += self.epoch_sample_count
         self.total_train_steps += self.epoch_iteration_count
         self._console(
-            f"Epoch {self.current_epoch} throughput - samples/s: {samples_per_sec:.2f}, it/s: {it_per_sec:.2f}"
+            f"Epoch {self.current_epoch} throughput - {epoch_duration:.1f}s, samples/s: {samples_per_sec:.2f}, it/s: {it_per_sec:.2f}"
         )
 
     # ------------------------------------------------------------------
@@ -896,6 +917,7 @@ class Engine(LightningModule):
         # Lightning monitoring (EarlyStopping watches val_loss)
         self.log("val_loss", self.val_loss)
         self._console(f"Validation loss on epoch {self.current_epoch}: {self.val_loss}")
+        self._console("")
 
         # Classification metrics (compact — no verbose per-class report)
         targets = torch.cat(self.val_targets).cpu().numpy()
@@ -917,6 +939,7 @@ class Engine(LightningModule):
 
             self._console("Validation summary by horizon")
             self._console(format_horizon_table(val_metrics, HORIZONS, val_baselines))
+            self._console("")
 
             # Trading simulation per horizon
             val_mid = np.concatenate(self.val_mid_prices)

@@ -115,6 +115,7 @@ def hydra_app(config: Config):
             label_mode=config.experiment.label_mode,
             extract_events=getattr(config.dataset, "extract_events", False),
             max_events_per_window=getattr(config.dataset, "max_events_per_window", 64),
+            max_hours_before_delivery=getattr(config.dataset, "max_hours_before_delivery", 0.0),
         )
         data_builder.prepare_save_datasets()
 

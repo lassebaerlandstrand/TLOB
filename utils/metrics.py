@@ -337,6 +337,8 @@ def compute_trading_metrics(
     min_hold: int = 0,
     segment_boundaries: np.ndarray | None = None,
     use_soft_positions: bool = False,
+    hysteresis_entry: float = 0.0,
+    hysteresis_exit: float = 0.0,
 ) -> dict[str, Any]:
     """Simulate a directional trading strategy and compute performance metrics.
 
@@ -372,6 +374,12 @@ def compute_trading_metrics(
         boundaries).  Values are exclusive end indices of each segment.
     use_soft_positions : If True and logits provided, use continuous
         positions in [-1, +1] via softmax(logits) @ [+1, 0, -1].
+    hysteresis_entry : Minimum max-class probability to ENTER a new position
+        (transition from flat, or change direction). Requires probabilities.
+    hysteresis_exit : Minimum max-class probability to STAY in current
+        position. If confidence drops below this, position goes flat.
+        When both > 0, creates a Schmitt-trigger effect: strong signal to
+        enter, weaker signal sufficient to hold.
     """
     mid_prices = _to_numpy(mid_prices).astype(np.float64, copy=False).ravel()
     predictions = _to_numpy(predictions).astype(np.int64, copy=False).ravel()
@@ -410,6 +418,36 @@ def compute_trading_metrics(
             predictions = predictions.copy()
             predictions[low_conf] = 1  # treat as STATIONARY
         raw_positions = _POSITION_MAP[predictions]  # (N,)
+
+    # --- apply hysteresis (Schmitt trigger) ---
+    if (hysteresis_entry > 0 or hysteresis_exit > 0) and probabilities is not None:
+        probs_arr = _to_numpy(probabilities).astype(np.float64, copy=False)
+        if probs_arr.ndim == 2:
+            max_conf = probs_arr[:n].max(axis=1)
+        else:
+            max_conf = probs_arr[:n]
+        boundary_set_h = set()
+        if segment_boundaries is not None:
+            boundary_set_h = set(np.asarray(segment_boundaries, dtype=np.int64).tolist())
+        hyst_positions = np.empty(n, dtype=np.float64)
+        current_pos = 0.0
+        for t in range(n):
+            if t in boundary_set_h:
+                current_pos = 0.0
+            target = raw_positions[t]
+            if target != current_pos:
+                # Entering or changing direction: need high confidence
+                if max_conf[t] >= hysteresis_entry:
+                    current_pos = target
+                elif current_pos != 0.0 and max_conf[t] < hysteresis_exit:
+                    # Confidence too low to even hold — go flat
+                    current_pos = 0.0
+            else:
+                # Same direction: check if confidence enough to hold
+                if current_pos != 0.0 and max_conf[t] < hysteresis_exit:
+                    current_pos = 0.0
+            hyst_positions[t] = current_pos
+        raw_positions = hyst_positions
 
     # --- apply min_hold persistence ---
     if min_hold > 0:
@@ -478,7 +516,7 @@ def compute_trading_metrics(
             costs[1:] = pos_changes[:-1] * half_spreads_z[1:n - 1]
             # Closing cost (going to positions[-1]=0)
             if n > 2:
-                costs[-1] += pos_changes[-1] * half_spreads_z[n - 2]
+                costs[-1] += pos_changes[-1] * half_spreads_z[n - 1]
 
             total_spread_cost = float(costs.sum())
         else:
@@ -492,7 +530,7 @@ def compute_trading_metrics(
             costs[0] = first_change * z_hs[0]
             costs[1:] = pos_changes[:-1] * z_hs[1:n - 1]
             if n > 2:
-                costs[-1] += pos_changes[-1] * z_hs[n - 2]
+                costs[-1] += pos_changes[-1] * z_hs[n - 1]
             total_spread_cost = float(costs.sum())
     elif z_half_spreads is not None:
         # Only z-scored spread available (e.g., CE runs without DFL data)
@@ -505,7 +543,7 @@ def compute_trading_metrics(
         costs[0] = first_change * z_hs[0]
         costs[1:] = pos_changes[:-1] * z_hs[1:n - 1]
         if n > 2:
-            costs[-1] += pos_changes[-1] * z_hs[n - 2]
+            costs[-1] += pos_changes[-1] * z_hs[n - 1]
         total_spread_cost = float(costs.sum())
     elif cost_per_trade > 0.0:
         # Legacy cost model (proportional to mean |Δmid|)
@@ -634,6 +672,96 @@ def compute_trading_metrics(
         "has_spread_costs": has_spread_costs,
         "total_spread_cost": total_spread_cost,
         "std_price": std_price,
+    }
+
+
+def compute_dp_optimal(
+    z_mid: np.ndarray,
+    z_half_spread: np.ndarray,
+    segment_boundaries: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Find the position sequence {-1, 0, +1} that maximizes net PnL via DP.
+
+    This is the true theoretical ceiling — no strategy can beat it.
+    Runs in O(9N) time where N is the number of timesteps.
+
+    Returns dict with total_pnl, n_trades, positions.
+    """
+
+    def _dp_segment(mid: np.ndarray, hs: np.ndarray) -> tuple[float, int, np.ndarray]:
+        n = len(mid)
+        if n < 2:
+            return 0.0, 0, np.zeros(n)
+        returns = np.diff(mid)  # length n-1
+        pos_vals = np.array([-1.0, 0.0, 1.0])
+        # dp[pos_idx] = best cumulative PnL ending at this step with this position
+        dp = np.full(3, -np.inf)
+        dp[1] = 0.0  # start flat
+        backtrack = np.empty((n - 1, 3), dtype=np.int8)
+        for t in range(n - 1):
+            new_dp = np.full(3, -np.inf)
+            for j in range(3):  # new position
+                best_val = -np.inf
+                best_prev = 0
+                for i in range(3):  # previous position
+                    cost = abs(pos_vals[j] - pos_vals[i]) * hs[t]
+                    val = dp[i] + pos_vals[j] * returns[t] - cost
+                    if val > best_val:
+                        best_val = val
+                        best_prev = i
+                new_dp[j] = best_val
+                backtrack[t, j] = best_prev
+            dp = new_dp
+        # Force close: best ending position accounting for closing cost
+        best_end = -1
+        best_pnl = -np.inf
+        for j in range(3):
+            close_cost = abs(pos_vals[j]) * hs[-1]
+            val = dp[j] - close_cost
+            if val > best_pnl:
+                best_pnl = val
+                best_end = j
+        # Backtrack
+        positions = np.zeros(n)
+        positions[-1] = 0.0  # closed at end
+        path = [best_end]
+        for t in range(n - 2, -1, -1):
+            path.append(backtrack[t, path[-1]])
+        path.reverse()
+        for t in range(n):
+            positions[t] = pos_vals[path[t]]
+        n_trades = int(np.sum(np.abs(np.diff(positions)) > 0))
+        return best_pnl, n_trades, positions
+
+    z_mid = np.asarray(z_mid, dtype=np.float64)
+    z_half_spread = np.asarray(z_half_spread, dtype=np.float64)
+
+    if segment_boundaries is not None:
+        boundaries = np.asarray(segment_boundaries, dtype=np.int64)
+        segments = []
+        prev = 0
+        for b in boundaries:
+            if b > prev:
+                segments.append((prev, b))
+            prev = b
+        if prev < len(z_mid):
+            segments.append((prev, len(z_mid)))
+    else:
+        segments = [(0, len(z_mid))]
+
+    total_pnl = 0.0
+    total_trades = 0
+    all_positions = np.zeros(len(z_mid))
+    for start, end in segments:
+        pnl, trades, pos = _dp_segment(z_mid[start:end], z_half_spread[start:end])
+        total_pnl += pnl
+        total_trades += trades
+        all_positions[start:end] = pos
+
+    return {
+        "total_pnl": total_pnl,
+        "n_trades": total_trades,
+        "positions": all_positions,
     }
 
 

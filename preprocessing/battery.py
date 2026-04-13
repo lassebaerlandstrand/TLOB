@@ -194,14 +194,13 @@ def battery_cache_subdir(
     dates: list[str],
     sampling_type: str = "time",
     all_features: bool = False,
+    max_hours_before_delivery: float = 0.0,
 ) -> str:
-    """Return a human-readable subdirectory name encoding sampling_time, dates, sampling_type, and all_features.
+    """Return a human-readable subdirectory name encoding sampling config.
 
     Examples:
-        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"])                        -> "10s_20210111_20210122"
-        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"], "time_dedup")          -> "10s_20210111_20210122_dedup"
-        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"], "time", True)          -> "10s_20210111_20210122_msg"
-        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"], "time_dedup", True)    -> "10s_20210111_20210122_dedup_msg"
+        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"], "time_dedup", True)       -> "10s_20210111_20210122_dedup_msg"
+        battery_cache_subdir("10s", ["2021-01-11", "2021-01-22"], "time_dedup", True, 6.0)  -> "10s_20210111_20210122_dedup_msg_last6h"
     """
     start = dates[0].replace("-", "")
     end = dates[1].replace("-", "")
@@ -210,6 +209,11 @@ def battery_cache_subdir(
         base += "_dedup"
     if all_features:
         base += "_msg"
+    if 0 < max_hours_before_delivery < 100:
+        # Format as integer if whole number, otherwise 1 decimal
+        h = max_hours_before_delivery
+        h_str = f"{int(h)}" if h == int(h) else f"{h:.1f}"
+        base += f"_last{h_str}h"
     return base
 
 
@@ -273,6 +277,7 @@ class BatteryDataBuilder:
         label_mode: str = "absolute_change",
         extract_events: bool = False,
         max_events_per_window: int = 64,
+        max_hours_before_delivery: float = 0.0,
     ):
         self.data_dir = data_dir
         self.sampling_time_str = sampling_time
@@ -298,6 +303,7 @@ class BatteryDataBuilder:
         self.n_lob_levels = cst.N_LOB_LEVELS  # 10
         self.extract_events = extract_events
         self.max_events_per_window = max_events_per_window
+        self.max_hours_before_delivery = max_hours_before_delivery
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -369,6 +375,7 @@ class BatteryDataBuilder:
                 self.date_strs,
                 self.sampling_type.value,
                 self.all_features,
+                self.max_hours_before_delivery,
             )
             products_dir = (
                 Path(self.data_dir)
@@ -972,6 +979,23 @@ class BatteryDataBuilder:
         lobs = snapshots["lobs"]
         msgs = snapshots.get("msgs")
 
+        # Filter to last N hours before delivery (drops early uninformative period)
+        if 0 < self.max_hours_before_delivery < 100:
+            max_ns = int(self.max_hours_before_delivery * 3.6e12)
+            ttd_ns = deliv_times - snap_times
+            ttd_mask = ttd_ns <= max_ns
+            n_before = len(snap_times)
+            snap_times = snap_times[ttd_mask]
+            deliv_times = deliv_times[ttd_mask]
+            lobs = lobs[ttd_mask]
+            if msgs is not None:
+                msgs = msgs[ttd_mask]
+            print(
+                f"  Filtered to last {self.max_hours_before_delivery}h before delivery: "
+                f"{n_before:,} → {len(snap_times):,} snapshots "
+                f"({len(snap_times)/n_before*100:.1f}%)"
+            )
+
         # Sort by (snapshot_time, delivery_time)
         sort_idx = np.lexsort((deliv_times, snap_times))
         snap_times = snap_times[sort_idx]
@@ -1011,6 +1035,7 @@ class BatteryDataBuilder:
             self.date_strs,
             self.sampling_type.value,
             self.all_features,
+            self.max_hours_before_delivery,
         )
         out_dir = Path(self.data_dir) / "battery_markets" / "concat" / subdir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1058,6 +1083,24 @@ class BatteryDataBuilder:
         lobs = snapshots["lobs"]  # float32 (N, 40)
         msgs = snapshots.get("msgs")  # float32 (N, 10) or None
 
+        # Filter to last N hours before delivery (drops early uninformative period)
+        if 0 < self.max_hours_before_delivery < 100:
+            max_ns = int(self.max_hours_before_delivery * 3.6e12)  # hours → nanoseconds
+            ttd_ns = deliv_times - snap_times
+            ttd_mask = ttd_ns <= max_ns
+            n_before = len(snap_times)
+            snap_times = snap_times[ttd_mask]
+            deliv_times = deliv_times[ttd_mask]
+            deliv_dates = deliv_dates[ttd_mask]
+            lobs = lobs[ttd_mask]
+            if msgs is not None:
+                msgs = msgs[ttd_mask]
+            print(
+                f"  Filtered to last {self.max_hours_before_delivery}h before delivery: "
+                f"{n_before:,} → {len(snap_times):,} snapshots "
+                f"({len(snap_times)/n_before*100:.1f}%)"
+            )
+
         # Group by unique delivery contract (one per delivery_time)
         unique_dt, inverse = np.unique(deliv_times, return_inverse=True)
 
@@ -1080,6 +1123,7 @@ class BatteryDataBuilder:
             self.date_strs,
             self.sampling_type.value,
             self.all_features,
+            self.max_hours_before_delivery,
         )
         out_root = Path(self.data_dir) / "battery_markets" / "per_product" / subdir
         out_root.mkdir(parents=True, exist_ok=True)

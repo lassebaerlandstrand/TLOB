@@ -318,6 +318,7 @@ class BATTERY(Dataset):
     all_features: bool = True
     extract_events: bool = True
     max_events_per_window: int = 64
+    max_hours_before_delivery: float = 6.0
     model_overrides: dict = field(
         default_factory=lambda: {
             "_default": {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1},
@@ -350,7 +351,7 @@ class Experiment:
     use_class_weights: bool = True
     label_mode: str = "absolute_change"  # "absolute_change" | "percent_change"
     multi_horizon: bool = False
-    loss_type: str = "cross_entropy"  # "cross_entropy" | "focal" | "focal_ordinal" | "dfl_proxy" | "dfl_trading"
+    loss_type: str = "cross_entropy"  # "cross_entropy" | "cost_aware_ce" | "focal" | "focal_ordinal" | "dfl_proxy" | "dfl_trading"
     focal_gamma: float = 2.0  # Unused if loss_type is not "focal" or "focal_ordinal"
     ordinal_smoothing: float = 0.15  # Unused if loss_type is not "focal_ordinal"
     trading_cost: float = 0.0  # Cost multiplier (x mean |Δmid|) for trading simulation

@@ -269,6 +269,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
             config.dataset.dates,
             config.dataset.sampling_type.value,
             all_features,
+            getattr(config.dataset, "max_hours_before_delivery", 0.0),
         )
 
         if product_mode == ProductMode.PER_PRODUCT:

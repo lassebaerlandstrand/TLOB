@@ -11,19 +11,18 @@ from utils.utils_data import labeling, z_score_orderbook
 
 
 def btc_load(path, len_smooth, h, seq_size):
-    set = np.load(path)
-    if h == 10:
-        tmp = 4
-    elif h == 20:
-        tmp = 3
-    elif h == 50:
-        tmp = 2
-    elif h == 100:
-        tmp = 1
-    labels = set[seq_size - len_smooth :, -tmp]
+    arr = np.load(path)
+    n_lob = cst.N_LOB_LEVELS * 4  # 40
+    # Labels always occupy the 4 columns immediately after the LOB block,
+    # in canonical order [h10, h20, h50, h100]. Older .npy files were 44 cols
+    # (labels at the tail); newer 49-col files append delta_mids + half_spread,
+    # which pushed the labels away from the tail and broke -tmp indexing.
+    horizon_to_idx = {10: 0, 20: 1, 50: 2, 100: 3}
+    label_col = n_lob + horizon_to_idx[h]
+    labels = arr[seq_size - len_smooth :, label_col]
     labels = labels[np.isfinite(labels)]
     labels = torch.from_numpy(labels).long()
-    input = torch.from_numpy(set[:, : cst.N_LOB_LEVELS * 4]).float()
+    input = torch.from_numpy(arr[:, :n_lob]).float()
     return input, labels
 
 

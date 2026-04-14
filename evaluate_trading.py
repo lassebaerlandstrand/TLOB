@@ -85,6 +85,150 @@ from utils.metrics import compute_dp_optimal, compute_trading_metrics, format_tr
 HORIZONS = [10, 20, 50, 100]
 SMA_WINDOWS = [10, 20]
 PF_MIN_HOLDS = [0, 10, 20, 30, 50, 100]
+_DPVN_ACTIONS = np.array([-1.0, 0.0, 1.0], dtype=np.float64)
+
+
+def _spread_argmax_predictions(
+    v_values: np.ndarray,
+    z_half_spread: np.ndarray,
+    segment_boundaries: np.ndarray | None = None,
+) -> np.ndarray:
+    """DPVN spread-aware decision rule. Returns predictions in label space.
+
+    For each t, choose a* = argmax_a [V(t, a) - |a - pos_prev| * z_half_spread[t]],
+    with pos_prev reset to 0 at segment boundaries (Battery per-product).
+
+    Label mapping: position +1 -> 0 (up), 0 -> 1 (stat), -1 -> 2 (down).
+    """
+    n = v_values.shape[0]
+    if z_half_spread is None:
+        z_half_spread = np.zeros(n, dtype=np.float64)
+    z_half_spread = np.abs(z_half_spread.astype(np.float64))
+    seg_starts = set(int(b) for b in segment_boundaries) if segment_boundaries is not None else set()
+    positions = np.zeros(n, dtype=np.float64)
+    pos_prev = 0.0
+    for t in range(n):
+        if t in seg_starts:
+            pos_prev = 0.0
+        best_a_idx = 0
+        best_score = -np.inf
+        for a_idx in range(3):
+            a = _DPVN_ACTIONS[a_idx]
+            score = v_values[t, a_idx] - abs(a - pos_prev) * z_half_spread[t]
+            if score > best_score:
+                best_score = score
+                best_a_idx = a_idx
+        positions[t] = _DPVN_ACTIONS[best_a_idx]
+        pos_prev = positions[t]
+    predictions = np.ones(n, dtype=np.int64)
+    predictions[positions > 0.5] = 0
+    predictions[positions < -0.5] = 2
+    return predictions
+
+
+def _dpvn_audit(data: dict, raw_preds: np.ndarray, spread_preds: np.ndarray, seed: int = 0) -> None:
+    """Falsifiability audit for DPVN spread_argmax results.
+
+    Prints:
+      - Prediction distribution (raw argmax vs spread_argmax)
+      - Accuracy-by-|delta-mid| decile
+      - Per-product PnL distribution
+      - Shuffled-V sanity test (should be ~0)
+    """
+    mid_prices = data["mid_prices"]
+    v_values = data.get("dpvn_values")
+    z_hs = data.get("z_half_spreads")
+    targets = data.get("targets")
+    boundaries = data.get("segment_boundaries")
+
+    print(f"\n{'=' * 90}")
+    print("  DPVN Audit — F1 vs PnL Disconnect Diagnostics")
+    print(f"{'=' * 90}")
+
+    # D2. Prediction distribution
+    def _dist(preds):
+        n = len(preds)
+        long_pct = (preds == 0).mean() * 100
+        flat_pct = (preds == 1).mean() * 100
+        short_pct = (preds == 2).mean() * 100
+        changes = int((np.diff(preds) != 0).sum())
+        return long_pct, flat_pct, short_pct, changes
+
+    print("\n  [D2] Prediction distribution")
+    print(f"  {'strategy':<16} | {'long%':>6} | {'flat%':>6} | {'short%':>6} | {'changes':>8}")
+    print(f"  {'-' * 62}")
+    for name, preds in (("argmax", raw_preds), ("spread_argmax", spread_preds)):
+        lp, fp, sp, ch = _dist(preds)
+        print(f"  {name:<16} | {lp:>5.1f}% | {fp:>5.1f}% | {sp:>5.1f}% | {ch:>8,}")
+
+    # D1. Accuracy-by-|delta-mid| decile (needs targets + mid sequence)
+    if targets is not None and len(mid_prices) > 1:
+        dmid = np.abs(np.diff(mid_prices, prepend=mid_prices[0]))
+        n_align = min(len(targets), len(spread_preds), len(dmid))
+        dmid_a = dmid[:n_align]
+        preds_a = spread_preds[:n_align]
+        tgt_a = targets[:n_align]
+        order = np.argsort(dmid_a)
+        buckets = np.array_split(order, 10)
+        print("\n  [D1] Accuracy by |Δmid| decile (spread_argmax predictions)")
+        print(f"  {'decile':<8} | {'|Δmid| mean':>12} | {'acc%':>6} | {'n':>6}")
+        print(f"  {'-' * 42}")
+        for i, idx in enumerate(buckets):
+            if len(idx) == 0:
+                continue
+            acc = (preds_a[idx] == tgt_a[idx]).mean() * 100
+            dmid_mean = dmid_a[idx].mean()
+            print(f"  d{i + 1:<7} | {dmid_mean:>12.5f} | {acc:>5.1f}% | {len(idx):>6,}")
+
+    # D4. Per-product PnL
+    if boundaries is not None and len(boundaries) > 1:
+        starts = np.concatenate([[0], boundaries[:-1]])
+        ends = boundaries
+        per_product = []
+        for s, e in zip(starts, ends):
+            if e - s < 10:
+                continue
+            sub_mid = mid_prices[s:e]
+            sub_preds = spread_preds[s:e]
+            sub_z_hs = z_hs[s:e] if z_hs is not None else None
+            tm = compute_trading_metrics(
+                sub_mid, sub_preds,
+                z_half_spreads=sub_z_hs,
+            )
+            per_product.append(tm["total_pnl"])
+        if per_product:
+            arr = np.asarray(per_product)
+            print(f"\n  [D4] Per-product PnL (N={len(arr)} products, spread_argmax)")
+            print(f"  mean={arr.mean():>+8.3f}  std={arr.std():>7.3f}  "
+                  f"min={arr.min():>+8.3f}  max={arr.max():>+8.3f}  "
+                  f"frac>0={float((arr > 0).mean()):.2f}")
+            print(f"  top 3 products by PnL: {np.sort(arr)[::-1][:3].round(2).tolist()}")
+            print(f"  bot 3 products by PnL: {np.sort(arr)[:3].round(2).tolist()}")
+
+    # D3. Shuffled-V sanity test
+    if v_values is not None and z_hs is not None:
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(v_values.shape[0])
+        v_shuf = v_values[perm]
+        shuf_preds = _spread_argmax_predictions(v_shuf, z_hs, boundaries)
+        tm = compute_trading_metrics(
+            mid_prices, shuf_preds,
+            z_half_spreads=z_hs,
+            segment_boundaries=boundaries,
+        )
+        real_tm = compute_trading_metrics(
+            mid_prices, spread_preds,
+            z_half_spreads=z_hs,
+            segment_boundaries=boundaries,
+        )
+        print("\n  [D3] Shuffled-V sanity test (time-permuted V, spread_argmax rule)")
+        print(f"  {'version':<14} | {'PnL(z)':>10} | {'Trades':>7} | {'Sharpe':>10}")
+        print(f"  {'-' * 50}")
+        print(f"  {'real':<14} | {real_tm['total_pnl']:>+10.3f} | {real_tm['n_trades']:>7} | {real_tm['sharpe']:>10.2e}")
+        print(f"  {'shuffled':<14} | {tm['total_pnl']:>+10.3f} | {tm['n_trades']:>7} | {tm['sharpe']:>10.2e}")
+        print("  Expected: shuffled PnL near zero. Large positive shuffled PnL ⇒ decision rule alone")
+        print("  is picking up a timing signal (leakage red flag).")
+    print()
 
 
 def _detect_std_price(checkpoint_dir: str, data: dict) -> tuple[float | None, str]:
@@ -301,6 +445,9 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
 
         logits_path = os.path.join(checkpoint_dir, "logits.npy")
         data["logits"] = np.load(logits_path) if os.path.exists(logits_path) else None
+
+        dpvn_path = os.path.join(checkpoint_dir, "dpvn_values.npy")
+        data["dpvn_values"] = np.load(dpvn_path) if os.path.exists(dpvn_path) else None
 
     return data
 
@@ -712,6 +859,21 @@ def main():
              "or 'learned' (CostLOB trained confidence). When 'learned', replaces "
              "softmax probabilities with the model's confidence_h*.npy arrays.",
     )
+    parser.add_argument(
+        "--decision_rule",
+        type=str,
+        choices=["argmax", "spread_argmax"],
+        default="argmax",
+        help="Decision rule for single-horizon DPVN: 'argmax' (naive V argmax) or "
+             "'spread_argmax' (subtract |Delta pos| * half_spread before argmax). "
+             "Requires dpvn_values.npy in the checkpoint directory.",
+    )
+    parser.add_argument(
+        "--audit_seed",
+        type=int,
+        default=0,
+        help="Seed for the shuffled-V sanity test (D3) in the DPVN audit.",
+    )
     args = parser.parse_args()
 
     checkpoint_dir = args.checkpoint_dir
@@ -748,9 +910,9 @@ def main():
     if data["segment_boundaries"] is not None:
         print(f"Loaded {len(data['segment_boundaries'])} product boundaries (EPEX per-product mode)")
     if data.get("half_spreads") is not None:
-        print(f"Loaded raw half-spreads (spread-aware costs enabled)")
+        print("Loaded raw half-spreads (spread-aware costs enabled)")
     if data.get("z_half_spreads") is not None:
-        print(f"Loaded z-scored half-spreads (spread-aware costs enabled)")
+        print("Loaded z-scored half-spreads (spread-aware costs enabled)")
     if args.soft_positions:
         has_logits = False
         if multi_horizon:
@@ -785,6 +947,40 @@ def main():
         trade_rate = (data["filter_probs"] > filter_threshold).mean()
         print(f"CPT trade filter detected ({n_filter:,} probs, threshold={filter_threshold}, "
               f"trade_rate={trade_rate:.1%})")
+
+    # DPVN spread-aware decision rule: recompute predictions from V values + spread.
+    raw_argmax_preds = None
+    if args.decision_rule == "spread_argmax":
+        if multi_horizon:
+            print("Error: --decision_rule spread_argmax is only valid for single-horizon DPVN runs.")
+            sys.exit(1)
+        v_values = data.get("dpvn_values")
+        if v_values is None:
+            print("Error: dpvn_values.npy not found. Was this run a DPVN model?")
+            sys.exit(1)
+        z_hs = data.get("z_half_spreads")
+        if z_hs is None:
+            print("Error: z_half_spreads.npy not found. Cannot apply spread-aware decision rule.")
+            sys.exit(1)
+        n_v = v_values.shape[0]
+        n_pred = len(data["predictions"])
+        if n_v != n_pred:
+            print(f"Warning: dpvn_values length ({n_v}) != predictions length ({n_pred}); truncating to min.")
+            m = min(n_v, n_pred)
+            v_values = v_values[:m]
+            z_hs = z_hs[:m]
+        # Re-align everything to the truncated length so the audit is consistent.
+        raw_argmax_preds = data["predictions"][: v_values.shape[0]].copy()
+        if data.get("targets") is not None:
+            data["targets"] = data["targets"][: v_values.shape[0]]
+        data["dpvn_values"] = v_values
+        data["z_half_spreads"] = z_hs
+        print(f"Applying spread-aware decision rule to {v_values.shape[0]:,} timesteps...")
+        new_preds = _spread_argmax_predictions(v_values, z_hs, data.get("segment_boundaries"))
+        n_changed = int(np.sum(new_preds != raw_argmax_preds))
+        data["predictions"] = new_preds
+        print(f"Predictions updated by spread-aware rule: {n_changed:,} changed "
+              f"({n_changed / max(new_preds.shape[0], 1) * 100:.2f}%)")
 
     # Detect dataset and std_price for dollar/EUR conversion
     std_price, currency = _detect_std_price(checkpoint_dir, data)
@@ -824,6 +1020,9 @@ def main():
             )
             baselines_per_h = {10: baselines}  # single horizon
             _print_baselines(baselines_per_h, [10], std_price, currency)
+
+    if args.decision_rule == "spread_argmax" and raw_argmax_preds is not None:
+        _dpvn_audit(data, raw_argmax_preds, data["predictions"], seed=args.audit_seed)
 
     print("\nGenerating plots...")
     _plot_cumulative_pnl(results, data, multi_horizon, checkpoint_dir)

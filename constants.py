@@ -23,6 +23,7 @@ class ModelType(Enum):
     TRADELOB = "TRADELOB"
     CPT = "CPT"
     COSTLOB = "COSTLOB"
+    DPVN = "DPVN"
 
 
 class SamplingType(Enum):

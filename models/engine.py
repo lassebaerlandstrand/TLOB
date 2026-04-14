@@ -234,6 +234,20 @@ class Engine(LightningModule):
             self.loss_type = "cost_aware_conf"
             self.is_dfl = False
 
+        # --- DPVN: DP-distilled value network ---
+        self.is_dpvn = str(model_type).upper() == "DPVN"
+        if self.is_dpvn:
+            self.dpvn_gamma = model_kwargs.get("dpvn_gamma", 1.0)
+            self.dpvn_huber_delta = model_kwargs.get("dpvn_huber_delta", 1.0)
+            self.dpvn_label_normalize = model_kwargs.get("dpvn_label_normalize", True)
+            self.loss_type = "dpvn_huber"
+            self.is_dfl = False
+            self.loss_function = None
+            self.register_buffer("_dpvn_target_std", torch.tensor(1.0))
+            self._dpvn_target_std_init = False
+            self._batch_q_target = None
+            self.test_v_values = []
+
         # Learnable log-variance parameters for homoscedastic uncertainty weighting.
         # One scalar per horizon; initialised to 0 (σ_h = 1, equal initial weights).
         # Stored in Engine (not the backbone) so ONNX export is unaffected.
@@ -356,7 +370,14 @@ class Engine(LightningModule):
         DFL multi-horizon:      batch = (x, y, delta_mids, half_spread)
         TradeLOB chunks:        batch = (x_chunk, y_chunk, dm_chunk, hs_chunk)
         CPT with DP labels:     batch = (x, y, dm, hs, dp_trade, dp_prev_pos)
+        DPVN:                   batch = (x, y, q_target)
         """
+        # DPVN single-horizon with Q targets: 3-element batch
+        if self.is_dpvn and len(batch) == 3:
+            x, y, q_target = batch
+            self._batch_q_target = q_target
+            return x, y, None, None, None
+
         # CPT with DP labels: 6-element batch (training only)
         if self.is_cpt and len(batch) == 6:
             x, y, delta_mids, half_spread, dp_trade, dp_prev_pos = batch
@@ -489,6 +510,10 @@ class Engine(LightningModule):
         # --- CostLOB: cost-conditioned confidence ---
         if self.is_costlob:
             return self._costlob_training_step(x, y, dfl_data)
+
+        # --- DPVN: DP-distilled value regression ---
+        if self.is_dpvn:
+            return self._dpvn_training_step(x, y)
 
         if self.multi_horizon:
             y_hat_list = self.forward(x, events=events, event_mask=mask)
@@ -875,6 +900,88 @@ class Engine(LightningModule):
         self.test_losses.append(batch_loss.detach())
         return batch_loss
 
+    # ------------------------------------------------------------------
+    # DPVN steps
+    # ------------------------------------------------------------------
+    def _dpvn_training_step(self, x, y):
+        """Huber regression on per-action DP-distilled Q targets."""
+        import torch.nn.functional as F
+
+        q_target = self._batch_q_target
+        v_pred = self.model(x)  # (B, 3) raw values
+
+        if self.dpvn_label_normalize and not self._dpvn_target_std_init:
+            std = q_target.detach().std().clamp(min=1e-4)
+            self._dpvn_target_std.copy_(std)
+            self._dpvn_target_std_init = True
+
+        if self.dpvn_label_normalize:
+            scale = self._dpvn_target_std.clamp(min=1e-4)
+            loss = F.huber_loss(v_pred / scale, q_target / scale, delta=self.dpvn_huber_delta)
+        else:
+            loss = F.huber_loss(v_pred, q_target, delta=self.dpvn_huber_delta)
+
+        self.train_losses.append(loss.detach())
+        self.epoch_iteration_count += 1
+        self.epoch_sample_count += int(y.shape[0])
+        self.ema.update()
+        return loss
+
+    def _dpvn_validation_step(self, x, y):
+        import torch.nn.functional as F
+
+        q_target = self._batch_q_target
+        v_pred = self.model(x)  # (B, 3)
+
+        if self.dpvn_label_normalize:
+            scale = self._dpvn_target_std.clamp(min=1e-4)
+            loss = F.huber_loss(v_pred / scale, q_target / scale, delta=self.dpvn_huber_delta)
+        else:
+            loss = F.huber_loss(v_pred, q_target, delta=self.dpvn_huber_delta)
+
+        # Map argmax(V) (action index 0/1/2 = -1/0/+1) to label (down=2, stat=1, up=0)
+        action_idx = v_pred.argmax(dim=1)
+        _IDX_TO_LABEL = torch.tensor([2, 1, 0], device=x.device, dtype=torch.long)
+        pred = _IDX_TO_LABEL[action_idx]
+
+        self.val_targets.append(y)
+        self.val_predictions.append(pred)
+        self.val_losses.append(loss.detach())
+        return loss
+
+    def _dpvn_test_step(self, x, y):
+        import torch.nn.functional as F
+        from contextlib import nullcontext
+
+        if self.experiment_type == "TRAINING":
+            ctx = self.ema.average_parameters()
+        else:
+            ctx = nullcontext()
+        with ctx:
+            v_pred = self.model(x)
+
+        # Classification-style predictions (raw argmax, no spread rule)
+        action_idx = v_pred.argmax(dim=1)
+        _IDX_TO_LABEL = torch.tensor([2, 1, 0], device=x.device, dtype=torch.long)
+        pred = _IDX_TO_LABEL[action_idx]
+
+        # Batch loss for logging (Huber on normalized targets if available)
+        q_target = self._batch_q_target
+        if q_target is not None:
+            if self.dpvn_label_normalize:
+                scale = self._dpvn_target_std.clamp(min=1e-4)
+                batch_loss = F.huber_loss(v_pred / scale, q_target / scale, delta=self.dpvn_huber_delta)
+            else:
+                batch_loss = F.huber_loss(v_pred, q_target, delta=self.dpvn_huber_delta)
+        else:
+            batch_loss = v_pred.abs().mean()  # fallback
+
+        self.test_targets.append(y)
+        self.test_predictions.append(pred)
+        self.test_v_values.append(v_pred.detach().cpu())
+        self.test_losses.append(batch_loss.detach())
+        return batch_loss
+
     def _tradelob_validation_step(self, x, y, dfl_data):
         """Validation for TradeLOB: per-sample, derive predictions from NTB positions."""
         B = x.shape[0]
@@ -935,6 +1042,8 @@ class Engine(LightningModule):
                 return self._cpt_validation_step(x, y, dfl_data)
             if self.is_costlob:
                 return self._costlob_validation_step(x, y, dfl_data)
+            if self.is_dpvn:
+                return self._dpvn_validation_step(x, y)
             if self.multi_horizon:
                 y_hat_list = self.forward(x, events=events, event_mask=mask)
                 batch_loss, _ = self._multi_horizon_loss(y_hat_list, y, dfl_data)
@@ -1125,6 +1234,8 @@ class Engine(LightningModule):
             return self._cpt_test_step(x, y, dfl_data)
         if self.is_costlob:
             return self._costlob_test_step(x, y, dfl_data)
+        if self.is_dpvn:
+            return self._dpvn_test_step(x, y)
 
         if self.multi_horizon:
             if self.experiment_type == "TRAINING":
@@ -1477,14 +1588,36 @@ class Engine(LightningModule):
                             f"(n={len(product_sharpes)})"
                         )
         else:
+            preds_for_trading = predictions
+            decision_label = "argmax"
+            if self.is_dpvn and self.test_v_values and z_half_spreads_all is not None:
+                v_values = torch.cat(self.test_v_values).float().numpy()
+                np.save(os.path.join(save_dir, "dpvn_values"), v_values)
+                self._console(f"DPVN values saved: {v_values.shape} to {save_dir}/dpvn_values.npy")
+                self.test_v_values = []
+                preds_for_trading = _dpvn_spread_argmax_predictions(
+                    v_values, z_half_spreads_all, segment_boundaries
+                )
+                np.save(os.path.join(save_dir, "predictions_spread_argmax"), preds_for_trading)
+                decision_label = "spread_argmax"
+                tm_argmax = compute_trading_metrics(
+                    mid_prices, predictions,
+                    half_spreads=half_spreads_all,
+                    z_half_spreads=z_half_spreads_all,
+                    segment_boundaries=segment_boundaries,
+                )
+                self._console(
+                    f"[argmax]       PnL(norm)={tm_argmax['total_pnl']:.4f}  "
+                    f"Sharpe/step={tm_argmax['sharpe']:.2e}  Trades={tm_argmax['n_trades']}"
+                )
             tm = compute_trading_metrics(
-                mid_prices, predictions,
+                mid_prices, preds_for_trading,
                 half_spreads=half_spreads_all,
                 z_half_spreads=z_half_spreads_all,
                 segment_boundaries=segment_boundaries,
             )
             self._console(
-                f"PnL(norm)={tm['total_pnl']:.4f}  Sharpe/step={tm['sharpe']:.2e}  "
+                f"[{decision_label}] PnL(norm)={tm['total_pnl']:.4f}  Sharpe/step={tm['sharpe']:.2e}  "
                 f"Sortino/step={tm['sortino']:.2e}  MaxDD={tm['max_drawdown_pct']:.1f}%  "
                 f"WinRate={tm['win_rate'] * 100:.1f}%  Trades={tm['n_trades']}  "
                 f"p-value={tm['p_value']:.4f}"
@@ -1517,6 +1650,10 @@ class Engine(LightningModule):
         if not self.multi_horizon and self.test_proba_full:
             full_proba = torch.cat(self.test_proba_full).cpu().numpy()
             np.save(os.path.join(save_dir, "probabilities"), full_proba)
+
+        # DPVN values are saved earlier (alongside the spread_argmax trading log).
+        if self.is_dpvn:
+            self.test_v_values = []
 
         self.test_proba = []
         self.test_proba_full = []
@@ -1649,7 +1786,7 @@ class Engine(LightningModule):
 
             # ONNX export — single-head only (multi-horizon output is a list, not yet ONNX-friendly)
             # Skip for FuseLOB (multi-input forward signature not ONNX-compatible)
-            if not self.multi_horizon and self.model_type not in ("FUSELOB", "NEXUSLOB"):
+            if not self.multi_horizon and self.model_type not in ("FUSELOB", "NEXUSLOB", "DPVN"):
                 onnx_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "onnx")
                 os.makedirs(onnx_dir, exist_ok=True)
                 onnx_filename = "val_loss=" + str(round(loss, 3)) + "_epoch=" + str(self.current_epoch) + ".onnx"
@@ -1709,6 +1846,43 @@ class Engine(LightningModule):
             cst.DIR_SAVED_MODEL + "/" + str(self.model_type) + "/" + f"precision_recall_curve_{self.dataset_type}.svg"
         )
         plt.close()
+
+
+_DPVN_ACTION_VALUES = np.array([-1.0, 0.0, 1.0], dtype=np.float64)
+
+
+def _dpvn_spread_argmax_predictions(
+    v_values: np.ndarray,
+    z_half_spread: np.ndarray,
+    segment_boundaries: np.ndarray | None = None,
+) -> np.ndarray:
+    """Sequential spread-aware argmax decision rule for DPVN.
+
+    Mirrors evaluate_trading._spread_argmax_predictions so the training-time
+    trading log reflects the architecture's intended inference path.
+    """
+    n = v_values.shape[0]
+    z_hs = np.abs(np.asarray(z_half_spread, dtype=np.float64))
+    seg_starts = set(int(b) for b in segment_boundaries) if segment_boundaries is not None else set()
+    positions = np.zeros(n, dtype=np.float64)
+    pos_prev = 0.0
+    for t in range(n):
+        if t in seg_starts:
+            pos_prev = 0.0
+        best_idx = 0
+        best_score = -np.inf
+        for a_idx in range(3):
+            a = _DPVN_ACTION_VALUES[a_idx]
+            score = v_values[t, a_idx] - abs(a - pos_prev) * z_hs[t]
+            if score > best_score:
+                best_score = score
+                best_idx = a_idx
+        positions[t] = _DPVN_ACTION_VALUES[best_idx]
+        pos_prev = positions[t]
+    predictions = np.ones(n, dtype=np.int64)
+    predictions[positions > 0.5] = 0
+    predictions[positions < -0.5] = 2
+    return predictions
 
 
 def compute_most_attended(att_feature):

@@ -7,9 +7,18 @@ import constants as cst
 from torch.utils import data
 
 class Dataset(data.Dataset):
-    """Characterizes a dataset for PyTorch"""
-    def __init__(self, x, y, seq_size):
-        """Initialization""" 
+    """Characterizes a dataset for PyTorch.
+
+    Args:
+        x: Input tensor/array (N, num_features).
+        y: Label tensor/array (N,) — single horizon.
+        seq_size: Sliding window length.
+        q_targets: Optional (N, 3) array of DP-distilled Q targets for DPVN.
+                   When present, __getitem__ also returns the target aligned
+                   with the last-step index of the window.
+    """
+
+    def __init__(self, x, y, seq_size, q_targets=None):
         self.seq_size = seq_size
         self.x = x
         self.y = y
@@ -19,6 +28,10 @@ class Dataset(data.Dataset):
             self.y = torch.from_numpy(y).long()
         self.length = min(y.shape[0], self.x.shape[0] - seq_size + 1)
         self.data = self.x
+        self.has_q_targets = q_targets is not None
+        if self.has_q_targets:
+            qt = q_targets if isinstance(q_targets, torch.Tensor) else torch.from_numpy(q_targets)
+            self.q_targets = qt.float()
 
     def __len__(self):
         """Denotes the total number of samples"""
@@ -26,6 +39,8 @@ class Dataset(data.Dataset):
 
     def __getitem__(self, i):
         input = self.x[i:i+self.seq_size, :]
+        if self.has_q_targets:
+            return input, self.y[i], self.q_targets[i]
         return input, self.y[i]
 
 

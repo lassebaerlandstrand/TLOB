@@ -324,6 +324,7 @@ class BATTERY(Dataset):
             "_default": {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1},
             "FUSELOB": {"hidden_dim": 64, "num_heads": 1, "dropout": 0.1},
             "NEXUSLOB": {"hidden_dim": 64, "num_heads": 1, "dropout": 0.1},
+            "DPVN": {"hidden_dim": 64, "num_heads": 4, "dropout": 0.1, "all_features": False},
         }
     )
 
@@ -386,6 +387,42 @@ class CostLOBConfig(Model):
         }
     )
     type: ModelType = ModelType.COSTLOB
+
+
+@dataclass
+class DPVNConfig(Model):
+    """DP-Distilled Value Network.
+
+    Predicts per-action value V(s, a) for a in {-1, 0, +1} and decides via a
+    spread-aware argmax at inference. Supervised against truncated-horizon Q
+    targets bootstrapped from the DP-optimal trajectory.
+    """
+
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 4,
+            "hidden_dim": 64,
+            "num_heads": 4,
+            "lr": 0.0003,
+            "seq_size": 128,
+            "all_features": False,
+            "weight_decay": 0.01,
+            "dropout": 0.0,
+            "dpvn_gamma": 1.0,
+            "dpvn_huber_delta": 1.0,
+            "dpvn_label_normalize": True,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [4],
+            "hidden_dim": [64, 96],
+            "num_heads": [4],
+            "lr": [0.0003],
+            "seq_size": [128],
+        }
+    )
+    type: ModelType = ModelType.DPVN
 
 
 @dataclass
@@ -467,6 +504,7 @@ cs.store(group="model", name="nexuslob", node=NexusLOBConfig)
 cs.store(group="model", name="tradelob", node=TradeLOBConfig)
 cs.store(group="model", name="cpt", node=CPTConfig)
 cs.store(group="model", name="costlob", node=CostLOBConfig)
+cs.store(group="model", name="dpvn", node=DPVNConfig)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)
 cs.store(group="dataset", name="btc", node=BTC)

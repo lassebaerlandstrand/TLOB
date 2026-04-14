@@ -42,6 +42,21 @@ _EVENT_MODELS = {cst.ModelType.FUSELOB, cst.ModelType.NEXUSLOB}
 _N_MSG_FEATURES = 18
 
 
+def _compute_dpvn_q_targets(inp: torch.Tensor, seq_size: int, horizon: int, gamma: float = 1.0):
+    """DP-distilled Q targets for DPVN, aligned to Dataset indexing.
+
+    Returns (N_valid, 3) float32 array where row i corresponds to the window
+    [i : i + seq_size] whose last step is at raw time (i + seq_size - 1).
+    """
+    from models.dp_targets import compute_q_targets, extract_z_mid_z_half_spread
+
+    z_mid, z_hs = extract_z_mid_z_half_spread(inp.numpy() if isinstance(inp, torch.Tensor) else inp)
+    if len(z_mid) < seq_size + horizon:
+        return None
+    q_raw = compute_q_targets(z_mid, z_hs, horizon=horizon, gamma=gamma)
+    return q_raw[seq_size - 1:]
+
+
 def _compute_dp_labels(inp: torch.Tensor, seq_size: int):
     """Compute DP optimal trade/hold labels for CPT filter supervision.
 
@@ -288,12 +303,17 @@ def train(config: Config, trainer: L.Trainer, run=None):
             train_input, train_labels = btc_load(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, horizon, seq_size)
             val_input, val_labels = btc_load(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, horizon, seq_size)
             test_input, test_labels = btc_load(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, horizon, seq_size)
+            train_q = val_q = test_q = None
+            if model_type == cst.ModelType.DPVN:
+                train_q = _compute_dpvn_q_targets(train_input, seq_size, horizon)
+                val_q = _compute_dpvn_q_targets(val_input, seq_size, horizon)
+                test_q = _compute_dpvn_q_targets(test_input, seq_size, horizon)
             train_input = maybe_add_diff_features(train_input)
             val_input = maybe_add_diff_features(val_input)
             test_input = maybe_add_diff_features(test_input)
-            train_set = Dataset(train_input, train_labels, seq_size)
-            val_set = Dataset(val_input, val_labels, seq_size)
-            test_set = Dataset(test_input, test_labels, seq_size)
+            train_set = Dataset(train_input, train_labels, seq_size, q_targets=train_q)
+            val_set = Dataset(val_input, val_labels, seq_size, q_targets=val_q)
+            test_set = Dataset(test_input, test_labels, seq_size, q_targets=test_q)
         if config.experiment.is_debug:
             train_set.length = 1000
             val_set.length = 1000
@@ -382,7 +402,12 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     elif multi_horizon:
                         ds = MultiHorizonDataset(inp, lab, seq_size, dfl_data=prod_dfl, dp_data=dp_data)
                     else:
-                        ds = Dataset(inp, lab, seq_size)
+                        q_targets = None
+                        if model_type == cst.ModelType.DPVN:
+                            q_targets = _compute_dpvn_q_targets(inp, seq_size, horizon)
+                            if q_targets is None:
+                                continue  # product too small for DP targets
+                        ds = Dataset(inp, lab, seq_size, q_targets=q_targets)
 
                     if split == "train":
                         train_datasets.append(ds)
@@ -490,12 +515,17 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     horizon,
                     seq_size,
                 )
+                train_q = val_q = test_q = None
+                if model_type == cst.ModelType.DPVN:
+                    train_q = _compute_dpvn_q_targets(train_input, seq_size, horizon)
+                    val_q = _compute_dpvn_q_targets(val_input, seq_size, horizon)
+                    test_q = _compute_dpvn_q_targets(test_input, seq_size, horizon)
                 train_input = maybe_add_diff_features(train_input)
                 val_input = maybe_add_diff_features(val_input)
                 test_input = maybe_add_diff_features(test_input)
-                train_set = Dataset(train_input, train_labels, seq_size)
-                val_set = Dataset(val_input, val_labels, seq_size)
-                test_set = Dataset(test_input, test_labels, seq_size)
+                train_set = Dataset(train_input, train_labels, seq_size, q_targets=train_q)
+                val_set = Dataset(val_input, val_labels, seq_size, q_targets=val_q)
+                test_set = Dataset(test_input, test_labels, seq_size, q_targets=test_q)
             if config.experiment.is_debug:
                 train_set.length = 1000
                 val_set.length = 1000
@@ -1501,6 +1531,37 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 costlob_conf_margin=config.experiment.costlob_conf_margin,
             )
 
+        elif model_type == cst.ModelType.DPVN:
+            hp = config.model.hyperparameters_fixed
+            model = Engine(
+                seq_size=seq_size,
+                horizon=horizon,
+                max_epochs=config.experiment.max_epochs,
+                model_type=config.model.type.value,
+                is_wandb=config.experiment.is_wandb,
+                experiment_type=experiment_type,
+                lr=hp["lr"],
+                optimizer=config.experiment.optimizer,
+                dir_ckpt=config.experiment.dir_ckpt,
+                hidden_dim=hp["hidden_dim"],
+                num_layers=hp["num_layers"],
+                num_features=train_input.shape[1],
+                dataset_type=dataset_type,
+                num_heads=hp["num_heads"],
+                is_sin_emb=False,
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=False,
+                use_fast_attention=config.experiment.use_fast_attention,
+                weight_decay=hp.get("weight_decay", 0.01),
+                dropout=hp.get("dropout", 0.0),
+                multi_horizon=False,
+                class_weights=None,
+                loss_type=config.experiment.loss_type,
+                dpvn_gamma=hp.get("dpvn_gamma", 1.0),
+                dpvn_huber_delta=hp.get("dpvn_huber_delta", 1.0),
+                dpvn_label_normalize=hp.get("dpvn_label_normalize", True),
+            )
+
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))
     train_dataloader, val_dataloader = (
         data_module.train_dataloader(),
@@ -1522,16 +1583,17 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     weights_only=False,
                 )
             else:
+                _load_class_weights = None if model_type == cst.ModelType.DPVN else class_weights
                 best_model = Engine.load_from_checkpoint(
                     best_model_path,
                     map_location=cst.DEVICE,
                     weights_only=False,
-                    use_torch_compile=config.experiment.use_torch_compile,
+                    use_torch_compile=config.experiment.use_torch_compile if model_type != cst.ModelType.DPVN else False,
                     torch_compile_mode=config.experiment.torch_compile_mode,
                     torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                     torch_compile_backend=config.experiment.torch_compile_backend,
                     use_fast_attention=config.experiment.use_fast_attention,
-                    class_weights=class_weights,
+                    class_weights=_load_class_weights,
                     loss_type=config.experiment.loss_type,
                     focal_gamma=config.experiment.focal_gamma,
                     ordinal_smoothing=config.experiment.ordinal_smoothing,

@@ -393,3 +393,73 @@ class CPTFilterLoss(nn.Module):
             }
 
         return loss, info
+
+
+class CostAwareLoss(nn.Module):
+    """CE + cost-conditioned confidence penalty for CostLOB.
+
+    Term 1: Standard CE on direction logits (proven training signal).
+    Term 2: BCE on confidence, supervised by per-sample profitability:
+            "would my own argmax prediction be profitable after spread costs?"
+
+    The confidence target is computed with no_grad from the model's own
+    prediction, teaching it to be high only when direction is correct AND
+    the expected move exceeds the spread.
+    """
+
+    def __init__(self, lambda_conf: float = 0.5, conf_margin: float = 0.0):
+        super().__init__()
+        self.lambda_conf = lambda_conf
+        self.conf_margin = conf_margin
+        self.register_buffer("position_map", _POSITION_MAP)
+
+    def forward(
+        self,
+        direction_logits: torch.Tensor,
+        conf_logit: torch.Tensor,
+        labels: torch.Tensor,
+        delta_mid: torch.Tensor,
+        half_spread: torch.Tensor,
+        class_weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        Args:
+            direction_logits: (B, 3) raw direction output
+            conf_logit: (B,) raw confidence logit (pre-sigmoid)
+            labels: (B,) integer class labels {0, 1, 2}
+            delta_mid: (B,) raw mid-price change at horizon h
+            half_spread: (B,) half bid-ask spread
+            class_weights: optional (3,) class weights for CE
+
+        Returns:
+            loss: scalar
+            info: dict with diagnostics
+        """
+        # Term 1: standard CE
+        ce_loss = F.cross_entropy(direction_logits, labels, weight=class_weights)
+
+        # Term 2: cost-conditioned confidence
+        with torch.no_grad():
+            pred_class = direction_logits.argmax(dim=1)  # (B,)
+            position = self.position_map[pred_class]  # (B,) in {-1, 0, +1}
+
+            # Per-sample profit if we traded this prediction
+            gross_pnl = position * delta_mid  # (B,)
+            trade_cost = position.abs() * half_spread.abs()  # (B,)
+            net_pnl = gross_pnl - trade_cost  # (B,)
+
+            # Binary: 1 if profitable after costs + margin
+            profitable = (net_pnl > self.conf_margin * half_spread.abs()).float()
+
+        # binary_cross_entropy_with_logits is autocast-safe (unlike BCE after sigmoid)
+        conf_loss = F.binary_cross_entropy_with_logits(conf_logit, profitable, reduction="mean")
+
+        total_loss = ce_loss + self.lambda_conf * conf_loss
+
+        info = {
+            "ce_loss": ce_loss.detach(),
+            "conf_loss": conf_loss.detach(),
+            "mean_confidence": torch.sigmoid(conf_logit).mean().detach(),
+            "profitable_frac": profitable.mean().detach(),
+        }
+        return total_loss, info

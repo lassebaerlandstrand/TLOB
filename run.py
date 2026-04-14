@@ -1467,6 +1467,40 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     print(f"  Warning: encoder_freeze_epochs={freeze_epochs} but no pretrained encoder — ignoring freeze")
                 print()
 
+        elif model_type == cst.ModelType.COSTLOB:
+            hp = config.model.hyperparameters_fixed
+            model = Engine(
+                seq_size=seq_size,
+                horizon=horizon,
+                max_epochs=config.experiment.max_epochs,
+                model_type=config.model.type.value,
+                is_wandb=config.experiment.is_wandb,
+                experiment_type=experiment_type,
+                lr=hp["lr"],
+                optimizer=config.experiment.optimizer,
+                dir_ckpt=config.experiment.dir_ckpt,
+                hidden_dim=hp["hidden_dim"],
+                num_layers=hp["num_layers"],
+                num_features=train_input.shape[1],
+                dataset_type=dataset_type,
+                num_heads=hp["num_heads"],
+                is_sin_emb=hp["is_sin_emb"],
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
+                weight_decay=hp.get("weight_decay", 0.01),
+                dropout=hp.get("dropout", 0.0),
+                multi_horizon=multi_horizon,
+                class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                cost_embed_dim=hp.get("cost_embed_dim", 8),
+                costlob_lambda_conf=config.experiment.costlob_lambda_conf,
+                costlob_conf_margin=config.experiment.costlob_conf_margin,
+            )
+
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))
     train_dataloader, val_dataloader = (
         data_module.train_dataloader(),

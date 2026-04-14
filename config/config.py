@@ -361,6 +361,34 @@ class CPTConfig(Model):
 
 
 @dataclass
+class CostLOBConfig(Model):
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 4,
+            "hidden_dim": 40,
+            "num_heads": 1,
+            "is_sin_emb": True,
+            "lr": 0.0001,
+            "seq_size": 128,
+            "all_features": True,
+            "weight_decay": 0.01,
+            "dropout": 0.0,
+            "cost_embed_dim": 8,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [4],
+            "hidden_dim": [40, 64],
+            "num_heads": [1],
+            "lr": [0.0001],
+            "seq_size": [128],
+        }
+    )
+    type: ModelType = ModelType.COSTLOB
+
+
+@dataclass
 class Experiment:
     is_data_preprocessed: bool = False
     is_wandb: bool = True
@@ -403,6 +431,9 @@ class Experiment:
     # CPT parameters
     cpt_lambda_filter: float = 1.0  # Trade filter BCE weight
     cpt_filter_threshold: float = 0.5  # Trade filter threshold at inference
+    # CostLOB parameters
+    costlob_lambda_conf: float = 0.5  # Confidence BCE weight
+    costlob_conf_margin: float = 0.0  # Margin above spread to count as profitable
 
 
 defaults = [Model, Experiment, Dataset]
@@ -435,6 +466,7 @@ cs.store(group="model", name="fuselob", node=FuseLOBConfig)
 cs.store(group="model", name="nexuslob", node=NexusLOBConfig)
 cs.store(group="model", name="tradelob", node=TradeLOBConfig)
 cs.store(group="model", name="cpt", node=CPTConfig)
+cs.store(group="model", name="costlob", node=CostLOBConfig)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)
 cs.store(group="dataset", name="btc", node=BTC)

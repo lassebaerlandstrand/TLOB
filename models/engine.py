@@ -223,6 +223,17 @@ class Engine(LightningModule):
             self.is_dfl = False
             self._batch_dp_data = None
 
+        # --- CostLOB: cost-conditioned confidence ---
+        self.is_costlob = str(model_type).upper() == "COSTLOB"
+        if self.is_costlob:
+            from models.trading_loss import CostAwareLoss
+            self.cost_aware_loss = CostAwareLoss(
+                lambda_conf=model_kwargs.get("costlob_lambda_conf", 0.5),
+                conf_margin=model_kwargs.get("costlob_conf_margin", 0.0),
+            )
+            self.loss_type = "cost_aware_conf"
+            self.is_dfl = False
+
         # Learnable log-variance parameters for homoscedastic uncertainty weighting.
         # One scalar per horizon; initialised to 0 (σ_h = 1, equal initial weights).
         # Stored in Engine (not the backbone) so ONNX export is unaffected.
@@ -259,6 +270,8 @@ class Engine(LightningModule):
         self.test_half_spreads = []
         self.test_z_half_spreads = []
         self.test_filter_probs = []
+        self.test_confidences = []  # CostLOB learned confidence per-horizon
+        self.val_confidences = []
         self.train_epoch_start_time = None
         self.epoch_sample_count = 0
         self.epoch_iteration_count = 0
@@ -315,7 +328,7 @@ class Engine(LightningModule):
             except Exception as e:
                 self._console(f"torch.compile skipped for TradeLOB: {e}")
             return
-        if self.model_type not in {"TLOB", "MLPLOB", "PATCHLOB", "FUSELOB", "NEXUSLOB"}:
+        if self.model_type not in {"TLOB", "MLPLOB", "PATCHLOB", "FUSELOB", "NEXUSLOB", "COSTLOB"}:
             return
         try:
             self.model = torch.compile(
@@ -350,8 +363,8 @@ class Engine(LightningModule):
             self._batch_dp_data = (dp_trade, dp_prev_pos)
             return x, y, None, None, (delta_mids, half_spread)
 
-        # TradeLOB/CPT: always interpret 4-element batch as DFL data
-        if (self.is_tradelob or self.is_cpt) and len(batch) == 4:
+        # TradeLOB/CPT/CostLOB: always interpret 4-element batch as DFL data
+        if (self.is_tradelob or self.is_cpt or self.is_costlob) and len(batch) == 4:
             x, y, delta_mids, half_spread = batch
             self._batch_dp_data = None
             return x, y, None, None, (delta_mids, half_spread)
@@ -472,6 +485,10 @@ class Engine(LightningModule):
         # --- CPT: sequential chunk training with commitment + hold ---
         if self.is_cpt:
             return self._cpt_training_step(x, y, dfl_data)
+
+        # --- CostLOB: cost-conditioned confidence ---
+        if self.is_costlob:
+            return self._costlob_training_step(x, y, dfl_data)
 
         if self.multi_horizon:
             y_hat_list = self.forward(x, events=events, event_mask=mask)
@@ -745,6 +762,119 @@ class Engine(LightningModule):
         self.val_losses.append(batch_loss.detach())
         return batch_loss
 
+    # ------------------------------------------------------------------
+    # CostLOB steps
+    # ------------------------------------------------------------------
+    def _costlob_training_step(self, x, y, dfl_data):
+        """Per-sample training for CostLOB: CE + cost-conditioned confidence."""
+        num_horizons = len(HORIZONS) if self.multi_horizon else 1
+        result = self.model(x)
+
+        if dfl_data is None:
+            raise RuntimeError("CostLOB requires DFL data (delta_mids, half_spreads). "
+                               "Rebuild data with --rebuild-data.")
+        delta_mids, half_spreads = dfl_data
+
+        horizon_losses = []
+        for h_idx in range(num_horizons):
+            w = self.class_weights[h_idx] if self.class_weights is not None and self.class_weights.ndim == 2 else self.class_weights
+            dm_h = delta_mids[:, h_idx] if delta_mids.dim() == 2 else delta_mids
+            loss_h, _ = self.cost_aware_loss(
+                result["directions"][h_idx], result["confidences"][h_idx],
+                y[:, h_idx] if y.dim() == 2 else y,
+                dm_h, half_spreads, class_weights=w,
+            )
+            horizon_losses.append(loss_h)
+
+        if self.multi_horizon:
+            loss_per_h = torch.stack(horizon_losses)
+            # Kendall uncertainty weighting (CostAwareLoss returns positive losses)
+            sigma2 = torch.exp(self.log_vars)
+            batch_loss = (loss_per_h / (2.0 * sigma2) + 0.5 * self.log_vars).sum()
+            for i, lv in enumerate(loss_per_h.detach().unbind()):
+                self.train_losses_per_h[i].append(lv)
+        else:
+            batch_loss = horizon_losses[0]
+
+        self.train_losses.append(batch_loss.detach())
+        self.epoch_iteration_count += 1
+        self.epoch_sample_count += int(y.shape[0])
+        self.ema.update()
+        return batch_loss
+
+    def _costlob_validation_step(self, x, y, dfl_data):
+        """Validation for CostLOB: direction logits for classification metrics."""
+        num_horizons = len(HORIZONS) if self.multi_horizon else 1
+        result = self.model(x)
+
+        # Store confidences for trading evaluation (sigmoid for interpretability)
+        for h_idx in range(num_horizons):
+            self.val_confidences.append(torch.sigmoid(result["confidences"][h_idx]).detach().float().cpu().numpy())
+
+        for h_idx in range(num_horizons):
+            dir_logits = result["directions"][h_idx]
+            pred = dir_logits.argmax(dim=1)
+            if self.multi_horizon:
+                self.val_predictions_per_h[h_idx].append(pred)
+                self.val_targets_per_h[h_idx].append(y[:, h_idx])
+
+        self.val_targets.append(y[:, 0] if self.multi_horizon else y)
+        self.val_predictions.append(result["directions"][0].argmax(dim=1))
+
+        # Validation loss: CE only (no confidence loss) for clean comparison
+        batch_loss = torch.tensor(0.0, device=x.device)
+        for h_idx in range(num_horizons):
+            w = self.class_weights[h_idx] if self.class_weights is not None and self.class_weights.ndim == 2 else self.class_weights
+            batch_loss = batch_loss + torch.nn.functional.cross_entropy(
+                result["directions"][h_idx], y[:, h_idx] if y.dim() == 2 else y, weight=w,
+            )
+        batch_loss = batch_loss / num_horizons
+        self.val_losses.append(batch_loss.detach())
+        return batch_loss
+
+    def _costlob_test_step(self, x, y, dfl_data):
+        """Test step for CostLOB: save direction logits + confidences."""
+        num_horizons = len(HORIZONS) if self.multi_horizon else 1
+
+        if self.experiment_type == "TRAINING":
+            ctx = self.ema.average_parameters()
+        else:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+        with ctx:
+            result = self.model(x)
+
+        for h_idx in range(num_horizons):
+            dir_logits = result["directions"][h_idx]
+            pred = dir_logits.argmax(dim=1)
+            proba = torch.softmax(dir_logits, dim=1)
+
+            if self.multi_horizon:
+                self.test_targets_per_h[h_idx].append(y[:, h_idx])
+                self.test_predictions_per_h[h_idx].append(pred)
+                self.test_proba_per_h[h_idx].append(proba)
+                self.test_logits_per_h[h_idx].append(dir_logits.detach().cpu())
+
+        # Store confidences per horizon (sigmoid applied for saving)
+        conf_per_h = {}
+        for h_idx in range(num_horizons):
+            conf_per_h[h_idx] = torch.sigmoid(result["confidences"][h_idx]).detach().float().cpu().numpy()
+        self.test_confidences.append(conf_per_h)
+
+        # Primary horizon
+        self.test_targets.append(y[:, 0] if self.multi_horizon else y)
+        self.test_predictions.append(result["directions"][0].argmax(dim=1))
+
+        # Batch loss: direction CE for logging
+        ce = torch.tensor(0.0, device=x.device)
+        for h_idx in range(num_horizons):
+            ce = ce + torch.nn.functional.cross_entropy(
+                result["directions"][h_idx], y[:, h_idx] if y.dim() == 2 else y,
+            )
+        batch_loss = ce / num_horizons
+        self.test_losses.append(batch_loss.detach())
+        return batch_loss
+
     def _tradelob_validation_step(self, x, y, dfl_data):
         """Validation for TradeLOB: per-sample, derive predictions from NTB positions."""
         B = x.shape[0]
@@ -803,6 +933,8 @@ class Engine(LightningModule):
                 return self._tradelob_validation_step(x, y, dfl_data)
             if self.is_cpt:
                 return self._cpt_validation_step(x, y, dfl_data)
+            if self.is_costlob:
+                return self._costlob_validation_step(x, y, dfl_data)
             if self.multi_horizon:
                 y_hat_list = self.forward(x, events=events, event_mask=mask)
                 batch_loss, _ = self._multi_horizon_loss(y_hat_list, y, dfl_data)
@@ -991,6 +1123,8 @@ class Engine(LightningModule):
             return self._tradelob_test_step(x, y, dfl_data)
         if self.is_cpt:
             return self._cpt_test_step(x, y, dfl_data)
+        if self.is_costlob:
+            return self._costlob_test_step(x, y, dfl_data)
 
         if self.multi_horizon:
             if self.experiment_type == "TRAINING":
@@ -1147,6 +1281,7 @@ class Engine(LightningModule):
         self.val_mid_prices = []
         self.val_z_half_spreads = []
         self.val_filter_probs = []
+        self.val_confidences = []
         if self.multi_horizon:
             self.val_targets_per_h = [[] for _ in HORIZONS]
             self.val_predictions_per_h = [[] for _ in HORIZONS]
@@ -1210,6 +1345,13 @@ class Engine(LightningModule):
                 np.save(os.path.join(save_dir, f"predictions_h{h}"), h_preds)
                 np.save(os.path.join(save_dir, f"targets_h{h}"), h_targets)
                 np.save(os.path.join(save_dir, f"probabilities_h{h}"), h_proba)
+
+            # Save CostLOB learned confidences
+            if self.is_costlob and self.test_confidences:
+                for i, h in enumerate(HORIZONS):
+                    h_conf = np.concatenate([batch[i] for batch in self.test_confidences])
+                    np.save(os.path.join(save_dir, f"confidence_h{h}"), h_conf)
+                self._console(f"Saved learned confidence arrays to {save_dir}")
 
             self._console("Test summary by horizon")
             self._console(format_horizon_table(metrics_per_h, HORIZONS, baselines_per_h))
@@ -1438,7 +1580,7 @@ class Engine(LightningModule):
             }
 
         # TLOB benefits from validation-aware LR drops when the larger model plateaus early.
-        if self.model_type in ("TLOB", "PATCHLOB", "FUSELOB", "NEXUSLOB", "CPT"):
+        if self.model_type in ("TLOB", "PATCHLOB", "FUSELOB", "NEXUSLOB", "CPT", "COSTLOB"):
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",

@@ -285,6 +285,10 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
             logits_path = os.path.join(checkpoint_dir, f"logits_h{h}.npy")
             h_data["logits"] = np.load(logits_path) if os.path.exists(logits_path) else None
 
+            # CostLOB learned confidence (if present)
+            conf_path = os.path.join(checkpoint_dir, f"confidence_h{h}.npy")
+            h_data["confidence"] = np.load(conf_path) if os.path.exists(conf_path) else None
+
             data["horizons"].append((h, h_data))
     else:
         data["predictions"] = np.load(os.path.join(checkpoint_dir, "predictions.npy"))
@@ -699,6 +703,15 @@ def main():
         action="store_true",
         help="Skip reference baselines (Buy & Hold, SMA, Perfect Foresight)",
     )
+    parser.add_argument(
+        "--confidence-mode",
+        type=str,
+        choices=["softmax", "learned"],
+        default="softmax",
+        help="Confidence source for hysteresis: 'softmax' (default, max softmax prob) "
+             "or 'learned' (CostLOB trained confidence). When 'learned', replaces "
+             "softmax probabilities with the model's confidence_h*.npy arrays.",
+    )
     args = parser.parse_args()
 
     checkpoint_dir = args.checkpoint_dir
@@ -748,6 +761,22 @@ def main():
             print("Using soft (continuous) positions from logits")
         else:
             print("Warning: --soft-positions requested but no logits found, falling back to hard positions")
+
+    # CostLOB learned confidence: replace softmax probabilities with confidence scalars
+    # so the existing hysteresis and confidence_threshold logic uses them automatically.
+    if args.confidence_mode == "learned" and multi_horizon:
+        n_replaced = 0
+        for h, h_data in data["horizons"]:
+            if h_data.get("confidence") is not None:
+                # Expand scalar confidence to (N, 1) so max(axis=1) returns the confidence
+                # The hysteresis code uses max_conf = probabilities.max(axis=1)
+                conf = h_data["confidence"]
+                h_data["probabilities"] = conf.reshape(-1, 1)
+                n_replaced += 1
+        if n_replaced > 0:
+            print(f"CostLOB: Replaced softmax probabilities with learned confidence for {n_replaced} horizons")
+        else:
+            print("Warning: --confidence-mode=learned but no confidence_h*.npy found, using softmax")
 
     filter_threshold = None
     if data.get("filter_probs") is not None:

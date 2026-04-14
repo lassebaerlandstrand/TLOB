@@ -38,6 +38,52 @@ def _fmt_float_space(value: float, decimals: int = 1) -> str:
 
 _EVENT_MODELS = {cst.ModelType.FUSELOB, cst.ModelType.NEXUSLOB}
 
+# Number of message features in Battery preprocessing (before LOB columns)
+_N_MSG_FEATURES = 18
+
+
+def _compute_dp_labels(inp: torch.Tensor, seq_size: int):
+    """Compute DP optimal trade/hold labels for CPT filter supervision.
+
+    Extracts mid-price and half-spread from columns 0 and 2 of the input
+    tensor (consistent with engine test_step's extraction). Runs DP optimal
+    and returns per-timestep binary trade labels.
+
+    Args:
+        inp: (N, num_features) full feature tensor (z-scored).
+             Columns 0 and 2 are used for mid-price and half-spread, matching
+             the engine test_step which uses x[:,-1,0] and x[:,-1,2].
+        seq_size: Sequence window size for label offset.
+
+    Returns:
+        (dp_trade, dp_prev_pos) each shape (N_trimmed,), or None.
+    """
+    from utils.metrics import compute_dp_optimal
+
+    col0 = inp[:, 0].numpy().astype(np.float64)
+    col2 = inp[:, 2].numpy().astype(np.float64)
+    z_mid = (col0 + col2) / 2.0
+    z_hs = np.abs((col0 - col2) / 2.0)  # abs ensures non-negative cost
+
+    if len(z_mid) < seq_size + 2:
+        return None
+
+    dp_result = compute_dp_optimal(z_mid, z_hs)
+    dp_positions = dp_result["positions"]
+
+    dp_trade = np.zeros(len(dp_positions), dtype=np.float32)
+    dp_trade[1:] = (np.abs(np.diff(dp_positions)) > 0).astype(np.float32)
+
+    dp_prev_pos = np.zeros(len(dp_positions), dtype=np.float32)
+    dp_prev_pos[1:] = dp_positions[:-1]
+
+    # Trim to align with direction labels (which start at label_start offset)
+    label_start = seq_size - cst.LEN_SMOOTH
+    dp_trade = dp_trade[label_start:]
+    dp_prev_pos = dp_prev_pos[label_start:]
+
+    return (dp_trade, dp_prev_pos)
+
 
 def _dataset_labels(dataset):
     if hasattr(dataset, "y_multi") and dataset.y_multi is not None:
@@ -227,11 +273,16 @@ def train(config: Config, trainer: L.Trainer, run=None):
             )
             val_input, val_labels, val_dfl = btc_load_multi(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, seq_size)
             test_input, test_labels, test_dfl = btc_load_multi(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, seq_size)
+            # Compute DP labels for CPT (before diff features, needs raw cols 0/2)
+            train_dp, val_dp = None, None
+            if model_type == cst.ModelType.CPT:
+                train_dp = _compute_dp_labels(train_input, seq_size)
+                val_dp = _compute_dp_labels(val_input, seq_size)
             train_input = maybe_add_diff_features(train_input)
             val_input = maybe_add_diff_features(val_input)
             test_input = maybe_add_diff_features(test_input)
-            train_set = MultiHorizonDataset(train_input, train_labels, seq_size, dfl_data=train_dfl)
-            val_set = MultiHorizonDataset(val_input, val_labels, seq_size, dfl_data=val_dfl)
+            train_set = MultiHorizonDataset(train_input, train_labels, seq_size, dfl_data=train_dfl, dp_data=train_dp)
+            val_set = MultiHorizonDataset(val_input, val_labels, seq_size, dfl_data=val_dfl, dp_data=val_dp)
             test_set = MultiHorizonDataset(test_input, test_labels, seq_size, dfl_data=test_dfl)
         else:
             train_input, train_labels = btc_load(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, horizon, seq_size)
@@ -314,6 +365,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     if inp.shape[0] < seq_size:
                         continue
 
+                    # Compute DP labels for CPT trade filter supervision
+                    dp_data = None
+                    if model_type == cst.ModelType.CPT and multi_horizon:
+                        dp_data = _compute_dp_labels(inp, seq_size)
+
                     if uses_events and product_events is not None:
                         ds = EventSnapshotDataset(
                             snapshot_input=inp,
@@ -324,7 +380,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                             event_aggregates=product_events.get("event_aggregates"),
                         )
                     elif multi_horizon:
-                        ds = MultiHorizonDataset(inp, lab, seq_size, dfl_data=prod_dfl)
+                        ds = MultiHorizonDataset(inp, lab, seq_size, dfl_data=prod_dfl, dp_data=dp_data)
                     else:
                         ds = Dataset(inp, lab, seq_size)
 
@@ -400,11 +456,17 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 test_input, test_labels, test_dfl = battery_load_multi(
                     concat_dir + "/test.npy", all_features, cst.LEN_SMOOTH, seq_size
                 )
+                # Compute DP labels for CPT
+                train_dp, val_dp = None, None
+                if model_type == cst.ModelType.CPT:
+                    train_dp = _compute_dp_labels(train_input, seq_size)
+                    val_dp = _compute_dp_labels(val_input, seq_size)
+
                 train_input = maybe_add_diff_features(train_input)
                 val_input = maybe_add_diff_features(val_input)
                 test_input = maybe_add_diff_features(test_input)
-                train_set = MultiHorizonDataset(train_input, train_labels, seq_size, dfl_data=train_dfl)
-                val_set = MultiHorizonDataset(val_input, val_labels, seq_size, dfl_data=val_dfl)
+                train_set = MultiHorizonDataset(train_input, train_labels, seq_size, dfl_data=train_dfl, dp_data=train_dp)
+                val_set = MultiHorizonDataset(val_input, val_labels, seq_size, dfl_data=val_dfl, dp_data=val_dp)
                 test_set = MultiHorizonDataset(test_input, test_labels, seq_size, dfl_data=test_dfl)
             else:
                 train_input, train_labels = battery_load(
@@ -904,7 +966,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 )
                 data_module.train_set = chunk_train
                 data_module.is_shuffle_train = False
-                print(f"TradeLOB: wrapped training set in SequentialChunkDataset "
+                print(f"{model_type.value}: wrapped training set in SequentialChunkDataset "
                       f"(chunk_size={chunk_size}, {len(chunk_train)} chunks)")
             elif isinstance(old_train, ConcatDataset):
                 chunk_datasets = []
@@ -921,7 +983,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     data_module.train_set = ConcatDataset(chunk_datasets)
                     data_module.is_shuffle_train = False
                     total_chunks = sum(len(cd) for cd in chunk_datasets)
-                    print(f"TradeLOB: wrapped {len(chunk_datasets)} products -> "
+                    print(f"{model_type.value}: wrapped {len(chunk_datasets)} products -> "
                           f"{total_chunks} chunks (chunk_size={chunk_size})")
 
         if model_type == cst.ModelType.MLPLOB_ORIGINAL:
@@ -1310,6 +1372,100 @@ def train(config: Config, trainer: L.Trainer, run=None):
             if config.experiment.ntb_lambda_ce > 0:
                 model.model.enable_classification_heads()
                 print(f"  CE regularization enabled (lambda_ce={config.experiment.ntb_lambda_ce})")
+
+        elif model_type == cst.ModelType.CPT:
+            hp = config.model.hyperparameters_fixed
+            # Compute DP trade rate from training data for filter loss pos_weight
+            _dp_trade_rate = 0.06  # default estimate
+            _train_data = data_module.train_set
+            if isinstance(_train_data, ConcatDataset):
+                _dp_counts = [ds.dp_trade.sum().item() for ds in _train_data.datasets if hasattr(ds, 'dp_trade') and ds.has_dp]
+                _dp_totals = [len(ds.dp_trade) for ds in _train_data.datasets if hasattr(ds, 'dp_trade') and ds.has_dp]
+                if _dp_totals:
+                    _dp_trade_rate = sum(_dp_counts) / max(sum(_dp_totals), 1)
+            elif hasattr(_train_data, 'dp_trade') and _train_data.has_dp:
+                _dp_trade_rate = _train_data.dp_trade.sum().item() / max(len(_train_data.dp_trade), 1)
+            print(f"CPT: DP trade rate = {_dp_trade_rate:.4f} ({_dp_trade_rate*100:.1f}% of timesteps are trades)")
+
+            model = Engine(
+                seq_size=seq_size,
+                horizon=horizon,
+                max_epochs=config.experiment.max_epochs,
+                model_type=config.model.type.value,
+                is_wandb=config.experiment.is_wandb,
+                experiment_type=experiment_type,
+                lr=hp["lr"],
+                optimizer=config.experiment.optimizer,
+                dir_ckpt=config.experiment.dir_ckpt,
+                hidden_dim=hp["hidden_dim"],
+                num_layers=hp["num_layers"],
+                num_features=train_input.shape[1],
+                dataset_type=dataset_type,
+                num_heads=hp["num_heads"],
+                is_sin_emb=hp["is_sin_emb"],
+                len_test_dataloader=len(test_loaders[0]),
+                use_torch_compile=config.experiment.use_torch_compile,
+                torch_compile_mode=config.experiment.torch_compile_mode,
+                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
+                torch_compile_backend=config.experiment.torch_compile_backend,
+                use_fast_attention=config.experiment.use_fast_attention,
+                weight_decay=hp.get("weight_decay", 0.01),
+                dropout=hp.get("dropout", 0.0),
+                multi_horizon=multi_horizon,
+                class_weights=class_weights,
+                loss_type=config.experiment.loss_type,
+                spread_embed_dim=hp.get("spread_embed_dim", 16),
+                pos_embed_dim=hp.get("pos_embed_dim", 16),
+                head_hidden_dim=hp.get("head_hidden_dim", 64),
+                cpt_lambda_filter=config.experiment.cpt_lambda_filter,
+                cpt_filter_threshold=config.experiment.cpt_filter_threshold,
+                dp_trade_rate=_dp_trade_rate,
+                encoder_freeze_epochs=hp.get("encoder_freeze_epochs", 0),
+            )
+
+            # Load pre-trained encoder weights from TLOB checkpoint
+            encoder_ckpt = os.environ.get("CPT_ENCODER_CHECKPOINT", "") or hp.get("encoder_checkpoint", "")
+            freeze_epochs = hp.get("encoder_freeze_epochs", 0)
+            if encoder_ckpt:
+                import torch as _torch
+                print(f"\n{'='*60}")
+                print(f"  CPT: Loading pre-trained encoder")
+                print(f"{'='*60}")
+                print(f"  Checkpoint: {encoder_ckpt}")
+                ckpt = _torch.load(encoder_ckpt, map_location="cpu", weights_only=False)
+                sd = ckpt.get("state_dict", ckpt)
+                encoder_prefixes = ("order_type_embedder", "norm_layer", "emb_layer", "pos_encoder", "layers")
+                encoder_sd = {}
+                for k, v in sd.items():
+                    clean_key = k.replace("model.", "", 1).replace("_orig_mod.", "", 1)
+                    if any(clean_key.startswith(ep) for ep in encoder_prefixes):
+                        encoder_sd[clean_key] = v
+                n_encoder_params = sum(v.numel() for v in encoder_sd.values())
+                loaded_keys = model.model.load_state_dict(encoder_sd, strict=False)
+                if loaded_keys.unexpected_keys:
+                    print(f"  Warning: {len(loaded_keys.unexpected_keys)} unexpected keys (shape mismatch?)")
+                    print(f"    First 3: {loaded_keys.unexpected_keys[:3]}")
+                print(f"  Loaded {len(encoder_sd)} encoder tensors ({n_encoder_params:,} parameters)")
+
+                # Freeze encoder
+                if freeze_epochs > 0:
+                    n_frozen = 0
+                    for name, p in model.model.named_parameters():
+                        if any(name.startswith(ep) for ep in encoder_prefixes):
+                            p.requires_grad = False
+                            n_frozen += 1
+                    n_head_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
+                    print(f"  Frozen {n_frozen} encoder tensors for {freeze_epochs} epochs")
+                    print(f"  Trainable (heads only): {n_head_params:,} parameters")
+                    print(f"  Unfreeze at epoch {freeze_epochs} for end-to-end fine-tuning")
+                else:
+                    print(f"  Encoder NOT frozen (encoder_freeze_epochs=0)")
+                print(f"{'='*60}\n")
+            else:
+                print(f"\n  CPT: Training encoder from scratch (no encoder_checkpoint)")
+                if freeze_epochs > 0:
+                    print(f"  Warning: encoder_freeze_epochs={freeze_epochs} but no pretrained encoder — ignoring freeze")
+                print()
 
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))
     train_dataloader, val_dataloader = (

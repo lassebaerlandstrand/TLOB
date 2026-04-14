@@ -39,8 +39,11 @@ class MultiHorizonDataset(data.Dataset):
         dfl_data: Optional (delta_mids, half_spreads) for DFL trading loss.
                   delta_mids: (N, num_horizons) raw mid-price changes.
                   half_spreads: (N,) half bid-ask spread at each timestep.
+        dp_data:  Optional (dp_trade, dp_prev_pos) for CPT trade filter supervision.
+                  dp_trade: (N,) binary {0=hold, 1=trade} from DP optimal.
+                  dp_prev_pos: (N,) DP previous position {-1, 0, +1}.
     """
-    def __init__(self, x, y_multi, seq_size, dfl_data=None):
+    def __init__(self, x, y_multi, seq_size, dfl_data=None, dp_data=None):
         self.seq_size = seq_size
         self.x = x if isinstance(x, torch.Tensor) else torch.from_numpy(x).float()
         self.y_multi = y_multi if isinstance(y_multi, torch.Tensor) else torch.from_numpy(y_multi).long()
@@ -50,6 +53,10 @@ class MultiHorizonDataset(data.Dataset):
         if self.has_dfl:
             self.delta_mids = dfl_data[0] if isinstance(dfl_data[0], torch.Tensor) else torch.from_numpy(dfl_data[0]).float()
             self.half_spreads = dfl_data[1] if isinstance(dfl_data[1], torch.Tensor) else torch.from_numpy(dfl_data[1]).float()
+        self.has_dp = dp_data is not None
+        if self.has_dp:
+            self.dp_trade = dp_data[0] if isinstance(dp_data[0], torch.Tensor) else torch.from_numpy(dp_data[0]).float()
+            self.dp_prev_pos = dp_data[1] if isinstance(dp_data[1], torch.Tensor) else torch.from_numpy(dp_data[1]).float()
 
     def __len__(self):
         return self.length
@@ -57,6 +64,8 @@ class MultiHorizonDataset(data.Dataset):
     def __getitem__(self, i):
         x_window = self.x[i:i + self.seq_size, :]   # (seq_size, num_features)
         y_all = self.y_multi[i]                       # (num_horizons,)
+        if self.has_dfl and self.has_dp:
+            return x_window, y_all, self.delta_mids[i], self.half_spreads[i], self.dp_trade[i], self.dp_prev_pos[i]
         if self.has_dfl:
             return x_window, y_all, self.delta_mids[i], self.half_spreads[i]
         return x_window, y_all

@@ -80,7 +80,7 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 
-from utils.metrics import compute_trading_metrics, format_trading_table
+from utils.metrics import compute_dp_optimal, compute_trading_metrics, format_trading_table
 
 HORIZONS = [10, 20, 50, 100]
 SMA_WINDOWS = [10, 20]
@@ -123,6 +123,21 @@ def _compute_baselines(
     """Compute reference baselines: Buy & Hold, SMA, Perfect Foresight + min_hold."""
     baselines = []
     n = len(mid_prices)
+
+    # DP optimal (true ceiling — horizon-independent)
+    if z_half_spreads is not None:
+        dp_result = compute_dp_optimal(mid_prices, z_half_spreads, segment_boundaries)
+        dp_pos = dp_result["positions"]
+        # Convert positions {-1, 0, +1} to predictions {2, 1, 0}
+        dp_preds = np.ones(n, dtype=np.int64)
+        dp_preds[dp_pos > 0.5] = 0   # up
+        dp_preds[dp_pos < -0.5] = 2  # down
+        dp_tm = compute_trading_metrics(
+            mid_prices, dp_preds,
+            z_half_spreads=z_half_spreads,
+            segment_boundaries=segment_boundaries,
+        )
+        baselines.append(("DP optimal", dp_tm))
 
     # Buy & Hold (always long = always predict UP)
     bnh_preds = np.zeros(n, dtype=np.int64)  # label 0 = up → position +1
@@ -248,6 +263,10 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
         path = os.path.join(checkpoint_dir, f"{name}.npy")
         data[name] = np.load(path) if os.path.exists(path) else None
 
+    # Load CPT trade filter probabilities (if present)
+    filter_path = os.path.join(checkpoint_dir, "filter_probs.npy")
+    data["filter_probs"] = np.load(filter_path) if os.path.exists(filter_path) else None
+
     if multi_horizon:
         data["horizons"] = []
         for h in HORIZONS:
@@ -289,6 +308,7 @@ def _run_evaluation(
     confidence_thresholds: list[float],
     min_holds: list[int] | None = None,
     use_soft_positions: bool = False,
+    filter_threshold: float | None = None,
 ) -> dict:
     """Run trading simulation for all parameter combinations."""
     if min_holds is None:
@@ -298,6 +318,7 @@ def _run_evaluation(
     segment_boundaries = data["segment_boundaries"]
     half_spreads = data.get("half_spreads")
     z_half_spreads = data.get("z_half_spreads")
+    filter_probs = data.get("filter_probs")
 
     if multi_horizon:
         for cost in costs:
@@ -326,6 +347,8 @@ def _run_evaluation(
                             min_hold=mh,
                             segment_boundaries=segment_boundaries,
                             use_soft_positions=use_soft_positions,
+                            filter_probs=filter_probs,
+                            filter_threshold=filter_threshold,
                         )
                         metrics_list.append(tm)
                         horizons_found.append(h)
@@ -359,6 +382,8 @@ def _run_evaluation(
                         min_hold=mh,
                         segment_boundaries=segment_boundaries,
                         use_soft_positions=use_soft_positions,
+                        filter_probs=filter_probs,
+                        filter_threshold=filter_threshold,
                     )
                     results[cost_key][conf_key][mh_key] = _serializable(tm)
                     results[cost_key][conf_key][mh_key]["_metrics"] = tm
@@ -659,6 +684,12 @@ def main():
         help="Use continuous positions from logits instead of hard argmax (for DFL models)",
     )
     parser.add_argument(
+        "--filter-threshold",
+        type=float,
+        default=0.5,
+        help="CPT trade filter threshold (default: 0.5). Only used when filter_probs.npy exists.",
+    )
+    parser.add_argument(
         "--sweep-thresholds",
         action="store_true",
         help="Run a predefined grid search over min_hold and confidence_threshold",
@@ -718,6 +749,14 @@ def main():
         else:
             print("Warning: --soft-positions requested but no logits found, falling back to hard positions")
 
+    filter_threshold = None
+    if data.get("filter_probs") is not None:
+        filter_threshold = args.filter_threshold
+        n_filter = len(data["filter_probs"])
+        trade_rate = (data["filter_probs"] > filter_threshold).mean()
+        print(f"CPT trade filter detected ({n_filter:,} probs, threshold={filter_threshold}, "
+              f"trade_rate={trade_rate:.1%})")
+
     # Detect dataset and std_price for dollar/EUR conversion
     std_price, currency = _detect_std_price(checkpoint_dir, data)
     if std_price is not None:
@@ -726,6 +765,7 @@ def main():
     results = _run_evaluation(
         data, multi_horizon, costs, confidence_thresholds,
         min_holds=min_holds, use_soft_positions=args.soft_positions,
+        filter_threshold=filter_threshold,
     )
     _print_results(results, multi_horizon, costs, confidence_thresholds, min_holds=min_holds)
 

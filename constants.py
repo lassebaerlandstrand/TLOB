@@ -21,6 +21,7 @@ class ModelType(Enum):
     FUSELOB = "FUSELOB"
     NEXUSLOB = "NEXUSLOB"
     TRADELOB = "TRADELOB"
+    CPT = "CPT"
 
 
 class SamplingType(Enum):

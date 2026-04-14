@@ -8,6 +8,7 @@ from models.original.mlplob import MLPLOB as MLPLOBOriginal
 from models.original.tlob import TLOB as TLOBOriginal
 from models.tlob import TLOB
 from models.tradelob import TradeLOB
+from models.cpt import CPT
 
 
 def pick_model(
@@ -142,6 +143,22 @@ def pick_model(
             signal_hidden_dim=kwargs.get("signal_hidden_dim", 64),
             sharpness=kwargs.get("sharpness", 10.0),
             gumbel_temperature=kwargs.get("gumbel_temperature", 1.0),
+        )
+    elif model_type == "CPT":
+        return CPT(
+            hidden_dim,
+            num_layers,
+            seq_size,
+            num_features,
+            num_heads,
+            is_sin_emb,
+            dataset_type,
+            use_fast_attention=use_fast_attention,
+            num_horizons=num_horizons,
+            dropout=dropout,
+            spread_embed_dim=kwargs.get("spread_embed_dim", 16),
+            pos_embed_dim=kwargs.get("pos_embed_dim", 16),
+            head_hidden_dim=kwargs.get("head_hidden_dim", 64),
         )
     else:
         raise ValueError("Model not found")

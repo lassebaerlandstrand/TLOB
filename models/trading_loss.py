@@ -1,11 +1,10 @@
-"""Decision-Focused Learning losses for LOB trading.
+"""Trading losses for LOB models.
 
-Two variants:
-  - DFLProxyLoss: Uses classification labels as direction signal. No raw price
-    data needed — works with existing .npy format. Rewards the model for aligning
-    soft positions with the true direction.
-  - DFLTradingLoss: Uses raw delta_mid and spread for realistic PnL computation.
-    Requires preprocessing to store raw price changes in the data.
+Variants:
+  - DFLProxyLoss: Direction-alignment using classification labels as proxy.
+  - DFLTradingLoss: Spread-aware PnL with raw price changes.
+  - NTBTradingLoss: Sequential no-transaction band loss for TradeLOB.
+  - CPTTradingLoss: Committed Position Transformer loss (CE + Sharpe + hold supervision).
 """
 
 import torch
@@ -337,3 +336,60 @@ class NTBTradingLoss(nn.Module):
             "std_net_return": stacked.std().detach(),
         }
         return total_loss, info
+
+
+class CPTFilterLoss(nn.Module):
+    """Trade filter loss for CPT: weighted BCE on DP optimal trade/hold labels.
+
+    DP optimal trades are ~6% of timesteps (heavily imbalanced), so the
+    positive class weight is computed from the trade rate to balance gradients.
+    """
+
+    def __init__(self, pos_weight: float = 16.0):
+        super().__init__()
+        self.register_buffer("pos_weight", torch.tensor([pos_weight]))
+
+    def forward(
+        self,
+        filter_logits: list[torch.Tensor],
+        dp_trade_labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        Args:
+            filter_logits: [H] of (B,) — raw logits from trade filter (pre-sigmoid)
+            dp_trade_labels: (B,) — binary {0=hold, 1=trade} from DP optimal
+
+        Returns:
+            loss: scalar BCE
+            info: dict with diagnostics
+        """
+        n_horizons = len(filter_logits)
+        total_loss = torch.tensor(0.0, device=dp_trade_labels.device)
+
+        # Trade filter is horizon-independent (DP labels don't vary by horizon),
+        # but we average across horizon heads for consistent gradient to each.
+        for h_idx in range(n_horizons):
+            total_loss = total_loss + F.binary_cross_entropy_with_logits(
+                filter_logits[h_idx], dp_trade_labels, pos_weight=self.pos_weight,
+            )
+        loss = total_loss / n_horizons
+
+        # Diagnostics
+        with torch.no_grad():
+            probs = torch.sigmoid(filter_logits[0])
+            pred_trade = (probs > 0.5).float()
+            actual_trade = dp_trade_labels
+            tp = ((pred_trade == 1) & (actual_trade == 1)).sum().float()
+            fp = ((pred_trade == 1) & (actual_trade == 0)).sum().float()
+            fn = ((pred_trade == 0) & (actual_trade == 1)).sum().float()
+            precision = tp / (tp + fp).clamp(min=1)
+            recall = tp / (tp + fn).clamp(min=1)
+            info = {
+                "filter_loss": loss.detach(),
+                "filter_precision": precision,
+                "filter_recall": recall,
+                "filter_trade_rate": pred_trade.mean(),
+                "filter_mean_prob": probs.mean(),
+            }
+
+        return loss, info

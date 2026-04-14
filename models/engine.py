@@ -210,6 +210,19 @@ class Engine(LightningModule):
             self.loss_type = "ntb_trading"
             self.is_dfl = False
 
+        # --- CPT: DP-supervised trade filter ---
+        self.is_cpt = str(model_type).upper() == "CPT"
+        if self.is_cpt:
+            from models.trading_loss import CPTFilterLoss
+            dp_trade_rate = model_kwargs.get("dp_trade_rate", 0.06)
+            pos_weight = (1 - dp_trade_rate) / max(dp_trade_rate, 1e-6)
+            self.filter_loss = CPTFilterLoss(pos_weight=pos_weight)
+            self.cpt_lambda_filter = model_kwargs.get("cpt_lambda_filter", 1.0)
+            self.cpt_filter_threshold = model_kwargs.get("cpt_filter_threshold", 0.5)
+            self.loss_type = "cpt_filter"
+            self.is_dfl = False
+            self._batch_dp_data = None
+
         # Learnable log-variance parameters for homoscedastic uncertainty weighting.
         # One scalar per horizon; initialised to 0 (σ_h = 1, equal initial weights).
         # Stored in Engine (not the backbone) so ONNX export is unaffected.
@@ -229,6 +242,7 @@ class Engine(LightningModule):
         self.val_predictions = []
         self.val_mid_prices = []
         self.val_z_half_spreads = []
+        self.val_filter_probs = []
         self.min_loss = np.inf
         # Save hyperparameters, ignoring unused ones for cleaner checkpoints
         ignore_params = []
@@ -244,6 +258,7 @@ class Engine(LightningModule):
         self.test_mid_prices = []
         self.test_half_spreads = []
         self.test_z_half_spreads = []
+        self.test_filter_probs = []
         self.train_epoch_start_time = None
         self.epoch_sample_count = 0
         self.epoch_iteration_count = 0
@@ -327,10 +342,18 @@ class Engine(LightningModule):
         Event models:           batch = (snapshot, events, mask, y)
         DFL multi-horizon:      batch = (x, y, delta_mids, half_spread)
         TradeLOB chunks:        batch = (x_chunk, y_chunk, dm_chunk, hs_chunk)
+        CPT with DP labels:     batch = (x, y, dm, hs, dp_trade, dp_prev_pos)
         """
-        # TradeLOB: always interpret 4-element batch as DFL data
-        if self.is_tradelob and len(batch) == 4:
+        # CPT with DP labels: 6-element batch (training only)
+        if self.is_cpt and len(batch) == 6:
+            x, y, delta_mids, half_spread, dp_trade, dp_prev_pos = batch
+            self._batch_dp_data = (dp_trade, dp_prev_pos)
+            return x, y, None, None, (delta_mids, half_spread)
+
+        # TradeLOB/CPT: always interpret 4-element batch as DFL data
+        if (self.is_tradelob or self.is_cpt) and len(batch) == 4:
             x, y, delta_mids, half_spread = batch
+            self._batch_dp_data = None
             return x, y, None, None, (delta_mids, half_spread)
 
         if len(batch) == 4:
@@ -446,6 +469,10 @@ class Engine(LightningModule):
         if self.is_tradelob:
             return self._tradelob_training_step(x, y, dfl_data)
 
+        # --- CPT: sequential chunk training with commitment + hold ---
+        if self.is_cpt:
+            return self._cpt_training_step(x, y, dfl_data)
+
         if self.multi_horizon:
             y_hat_list = self.forward(x, events=events, event_mask=mask)
             batch_loss, per_h_loss = self._multi_horizon_loss(y_hat_list, y, dfl_data)
@@ -479,9 +506,15 @@ class Engine(LightningModule):
         self.epoch_sample_count = 0
         self.epoch_iteration_count = 0
 
-        # TradeLOB: unfreeze encoder after N epochs
-        if self.is_tradelob:
+        # TradeLOB/CPT: unfreeze encoder after N epochs
+        if self.is_tradelob or self.is_cpt:
             freeze_epochs = self.hparams.get("encoder_freeze_epochs", 0)
+            if freeze_epochs > 0 and self.current_epoch < freeze_epochs:
+                n_frozen = sum(1 for n, p in self.model.named_parameters()
+                               if not p.requires_grad and any(n.startswith(ep)
+                               for ep in ("order_type_embedder", "norm_layer", "emb_layer", "pos_encoder", "layers")))
+                if self.current_epoch == 0:
+                    self._console(f"Encoder FROZEN ({n_frozen} tensors) — heads-only training until epoch {freeze_epochs}")
             if freeze_epochs > 0 and self.current_epoch == freeze_epochs:
                 encoder_prefixes = ("order_type_embedder", "norm_layer", "emb_layer", "pos_encoder", "layers")
                 n_unfrozen = 0
@@ -489,7 +522,8 @@ class Engine(LightningModule):
                     if any(name.startswith(ep) for ep in encoder_prefixes):
                         param.requires_grad = True
                         n_unfrozen += 1
-                self._console(f"Epoch {self.current_epoch}: Unfreezing {n_unfrozen} encoder parameters")
+                n_total = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+                self._console(f"Epoch {self.current_epoch}: UNFREEZING encoder ({n_unfrozen} tensors, {n_total:,} total trainable params)")
 
         # Temperature annealing for TradeLOB Gumbel-Softmax
         if self.is_tradelob and hasattr(self.model, 'gumbel_temperature'):
@@ -639,6 +673,78 @@ class Engine(LightningModule):
         self.ema.update()
         return batch_loss_mean
 
+    def _cpt_training_step(self, x, y, dfl_data):
+        """Per-sample training for CPT with DP-supervised trade filter.
+
+        Input x has shape (B, seq_size, features) — standard per-sample, not chunks.
+        Two losses: direction CE (same as TLOB) + trade filter BCE (DP labels).
+        """
+        import torch.nn.functional as F
+
+        num_horizons = len(HORIZONS) if self.multi_horizon else 1
+
+        # DP labels from batch unpacking
+        dp_trade, dp_prev_pos = self._batch_dp_data
+        # Expand DP prev pos to (B, H) — trade filter is horizon-independent
+        current_positions = dp_prev_pos.unsqueeze(1).expand(-1, num_horizons)
+
+        result = self.model(x, current_positions=current_positions)
+
+        # Direction CE (standard multi-horizon)
+        ce_total = torch.tensor(0.0, device=x.device)
+        for h_idx in range(num_horizons):
+            w = self.class_weights[h_idx] if self.class_weights is not None and self.class_weights.ndim == 2 else self.class_weights
+            ce_total = ce_total + F.cross_entropy(
+                result["directions"][h_idx], y[:, h_idx] if y.dim() == 2 else y, weight=w,
+            )
+        ce_loss = ce_total / num_horizons
+
+        # Trade filter BCE (DP supervised)
+        filter_loss, filter_info = self.filter_loss(result["filter_logits"], dp_trade)
+
+        batch_loss = ce_loss + self.cpt_lambda_filter * filter_loss
+
+        self.train_losses.append(batch_loss.detach())
+        self.epoch_iteration_count += 1
+        self.epoch_sample_count += int(y.shape[0])
+        self.ema.update()
+        return batch_loss
+
+    def _cpt_validation_step(self, x, y, dfl_data):
+        """Validation for CPT: per-sample, derive predictions from direction logits."""
+        B = x.shape[0]
+        num_horizons = len(HORIZONS) if self.multi_horizon else 1
+        current_pos = torch.zeros(B, num_horizons, device=x.device)
+
+        result = self.model(x, current_positions=current_pos)
+
+        # Store filter probs for validation trading simulation
+        filter_probs = torch.sigmoid(result["filter_logits"][0]).detach().float().cpu().numpy()
+        self.val_filter_probs.append(filter_probs)
+
+        # Use direction logits for classification metrics
+        for h_idx in range(num_horizons):
+            dir_logits = result["directions"][h_idx]
+            pred = dir_logits.argmax(dim=1)
+            if self.multi_horizon:
+                self.val_predictions_per_h[h_idx].append(pred)
+                self.val_targets_per_h[h_idx].append(y[:, h_idx])
+
+        # Primary horizon for early stopping
+        self.val_targets.append(y[:, 0] if self.multi_horizon else y)
+        self.val_predictions.append(result["directions"][0].argmax(dim=1))
+
+        # Compute validation loss (CE on direction logits)
+        batch_loss = torch.tensor(0.0, device=x.device)
+        for h_idx in range(num_horizons):
+            w = self.class_weights[h_idx] if self.class_weights is not None and self.class_weights.ndim == 2 else self.class_weights
+            batch_loss = batch_loss + torch.nn.functional.cross_entropy(
+                result["directions"][h_idx], y[:, h_idx] if y.dim() == 2 else y, weight=w
+            )
+        batch_loss = batch_loss / num_horizons
+        self.val_losses.append(batch_loss.detach())
+        return batch_loss
+
     def _tradelob_validation_step(self, x, y, dfl_data):
         """Validation for TradeLOB: per-sample, derive predictions from NTB positions."""
         B = x.shape[0]
@@ -695,6 +801,8 @@ class Engine(LightningModule):
         with self.ema.average_parameters():
             if self.is_tradelob:
                 return self._tradelob_validation_step(x, y, dfl_data)
+            if self.is_cpt:
+                return self._cpt_validation_step(x, y, dfl_data)
             if self.multi_horizon:
                 y_hat_list = self.forward(x, events=events, event_mask=mask)
                 batch_loss, _ = self._multi_horizon_loss(y_hat_list, y, dfl_data)
@@ -802,6 +910,66 @@ class Engine(LightningModule):
         self.test_losses.append(batch_loss.detach())
         return batch_loss
 
+    def _cpt_test_step(self, x, y, dfl_data):
+        """Test step for CPT: use trade filter to gate position changes."""
+        B = x.shape[0]
+        num_horizons = len(HORIZONS) if self.multi_horizon else 1
+
+        # Position carry-forward across test batches
+        if not hasattr(self, '_test_cpt_positions'):
+            self._test_cpt_positions = torch.zeros(1, num_horizons, device=x.device)
+        current_pos = self._test_cpt_positions.expand(B, -1).clone()
+
+        # Use EMA only during training (EMA state is lost when loading from checkpoint).
+        if self.experiment_type == "TRAINING":
+            ctx = self.ema.average_parameters()
+        else:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+        with ctx:
+            result = self.model(x, current_positions=current_pos)
+
+        # Store filter probabilities for trading evaluation
+        self.test_filter_probs.append(
+            torch.sigmoid(result["filter_logits"][0]).detach().float().cpu().numpy()
+        )
+
+        for h_idx in range(num_horizons):
+            dir_logits = result["directions"][h_idx]
+            pred = dir_logits.argmax(dim=1)
+            proba = torch.softmax(dir_logits, dim=1)
+
+            if self.multi_horizon:
+                self.test_targets_per_h[h_idx].append(y[:, h_idx])
+                self.test_predictions_per_h[h_idx].append(pred)
+                self.test_proba_per_h[h_idx].append(proba)
+                self.test_logits_per_h[h_idx].append(dir_logits.detach().cpu())
+
+        # Primary horizon
+        pred_0 = result["directions"][0].argmax(dim=1)
+        self.test_targets.append(y[:, 0] if self.multi_horizon else y)
+        self.test_predictions.append(pred_0)
+
+        # Carry forward positions using filter-gated decisions
+        _POS_MAP = torch.tensor([1.0, 0.0, -1.0], device=x.device)
+        new_positions = current_pos.clone()
+        for h_idx in range(num_horizons):
+            dir_pred = result["directions"][h_idx].argmax(dim=1)
+            target_pos = _POS_MAP[dir_pred]
+            filter_prob = torch.sigmoid(result["filter_logits"][h_idx])
+            trade_mask = filter_prob > self.cpt_filter_threshold
+            new_positions[:, h_idx] = torch.where(trade_mask, target_pos, current_pos[:, h_idx])
+        self._test_cpt_positions = new_positions[-1:].detach()
+
+        # Batch loss: direction CE for logging
+        ce = torch.tensor(0.0, device=x.device)
+        for h_idx in range(num_horizons):
+            ce = ce + torch.nn.functional.cross_entropy(result["directions"][h_idx], y[:, h_idx] if y.dim() == 2 else y)
+        batch_loss = ce / num_horizons
+
+        self.test_losses.append(batch_loss.detach())
+        return batch_loss
+
     # ------------------------------------------------------------------
     # Test
     # ------------------------------------------------------------------
@@ -821,6 +989,8 @@ class Engine(LightningModule):
 
         if self.is_tradelob:
             return self._tradelob_test_step(x, y, dfl_data)
+        if self.is_cpt:
+            return self._cpt_test_step(x, y, dfl_data)
 
         if self.multi_horizon:
             if self.experiment_type == "TRAINING":
@@ -944,11 +1114,14 @@ class Engine(LightningModule):
             # Trading simulation per horizon
             val_mid = np.concatenate(self.val_mid_prices)
             val_z_hs = np.concatenate(self.val_z_half_spreads)
+            val_filter = np.concatenate(self.val_filter_probs) if self.val_filter_probs else None
             trading_per_h = []
             for i in range(len(HORIZONS)):
                 h_preds = torch.cat(self.val_predictions_per_h[i]).cpu().numpy()
                 tm = compute_trading_metrics(
                     val_mid, h_preds, z_half_spreads=val_z_hs,
+                    filter_probs=val_filter,
+                    filter_threshold=self.cpt_filter_threshold if self.is_cpt else None,
                 )
                 trading_per_h.append(tm)
             self._console("Validation trading simulation")
@@ -973,6 +1146,7 @@ class Engine(LightningModule):
         self.val_predictions = []
         self.val_mid_prices = []
         self.val_z_half_spreads = []
+        self.val_filter_probs = []
         if self.multi_horizon:
             self.val_targets_per_h = [[] for _ in HORIZONS]
             self.val_predictions_per_h = [[] for _ in HORIZONS]
@@ -1104,6 +1278,13 @@ class Engine(LightningModule):
         if self.is_dfl:
             self._console("(DFL: Gumbel-Softmax training, hard argmax evaluation)")
 
+        test_filter = np.concatenate(self.test_filter_probs) if self.test_filter_probs else None
+        _ft = self.cpt_filter_threshold if self.is_cpt else None
+
+        # Save CPT filter probabilities for evaluate_trading.py
+        if test_filter is not None:
+            np.save(os.path.join(save_dir, "filter_probs"), test_filter)
+
         if self.multi_horizon:
             trading_metrics_per_h = []
             for i, h in enumerate(HORIZONS):
@@ -1117,6 +1298,8 @@ class Engine(LightningModule):
                     z_half_spreads=z_half_spreads_all,
                     segment_boundaries=segment_boundaries,
                     use_soft_positions=False,
+                    filter_probs=test_filter,
+                    filter_threshold=_ft,
                 )
                 trading_metrics_per_h.append(tm)
                 self.log(f"trading/sharpe_h{h}", tm["sharpe"])
@@ -1140,6 +1323,8 @@ class Engine(LightningModule):
                             half_spreads=half_spreads_all[s:e] if half_spreads_all is not None else None,
                             z_half_spreads=z_half_spreads_all[s:e] if z_half_spreads_all is not None else None,
                             use_soft_positions=False,
+                            filter_probs=test_filter[s:e] if test_filter is not None else None,
+                            filter_threshold=_ft,
                         )
                         product_sharpes.append(prod_tm["sharpe"])
                     if product_sharpes:
@@ -1173,6 +1358,7 @@ class Engine(LightningModule):
         self.test_targets = []
         self.test_half_spreads = []
         self.test_z_half_spreads = []
+        self.test_filter_probs = []
         if self.multi_horizon:
             self.test_logits_per_h = [[] for _ in HORIZONS]
         self.test_predictions = []
@@ -1226,6 +1412,7 @@ class Engine(LightningModule):
             self.optimizer = Lion(self.parameters(), lr=self.lr)
 
         # TradeLOB: differential LR (slower encoder, faster heads) + warm restarts
+        # CPT uses standard LR when training from scratch (no pre-trained encoder).
         if self.is_tradelob:
             encoder_prefixes = ("order_type_embedder", "norm_layer", "emb_layer", "pos_encoder", "layers")
             encoder_params = []
@@ -1251,7 +1438,7 @@ class Engine(LightningModule):
             }
 
         # TLOB benefits from validation-aware LR drops when the larger model plateaus early.
-        if self.model_type in ("TLOB", "PATCHLOB", "FUSELOB", "NEXUSLOB"):
+        if self.model_type in ("TLOB", "PATCHLOB", "FUSELOB", "NEXUSLOB", "CPT"):
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode="min",

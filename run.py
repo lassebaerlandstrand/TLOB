@@ -450,7 +450,10 @@ def train(config: Config, trainer: L.Trainer, run=None):
             np.save(os.path.join(_boundaries_dir, "product_boundaries"), _boundaries)
 
             train_set = ConcatDataset(train_datasets)
-            val_set = ConcatDataset(val_datasets)
+            val_concat = ConcatDataset(val_datasets)
+            _val_boundaries = np.array(val_concat.cumulative_sizes, dtype=np.int64)
+            np.save(os.path.join(_boundaries_dir, "val_product_boundaries"), _val_boundaries)
+            val_set = val_concat
             # Expose train_input for num_features used by model instantiation
             first_train = train_datasets[0]
             train_input = first_train.x if hasattr(first_train, "x") else first_train.data

@@ -246,7 +246,6 @@ class Engine(LightningModule):
             self.register_buffer("_dpvn_target_std", torch.tensor(1.0))
             self._dpvn_target_std_init = False
             self._batch_q_target = None
-            self.test_v_values = []
 
         # Learnable log-variance parameters for homoscedastic uncertainty weighting.
         # One scalar per horizon; initialised to 0 (σ_h = 1, equal initial weights).
@@ -262,9 +261,11 @@ class Engine(LightningModule):
         self.test_predictions = []
         self.test_proba = []
         self.test_proba_full = []
+        self.test_v_values = []
         self.val_targets = []
         self.val_loss = np.inf
         self.val_predictions = []
+        self.val_v_values = []
         self.val_mid_prices = []
         self.val_z_half_spreads = []
         self.val_filter_probs = []
@@ -946,6 +947,7 @@ class Engine(LightningModule):
 
         self.val_targets.append(y)
         self.val_predictions.append(pred)
+        self.val_v_values.append(v_pred.detach().cpu())
         self.val_losses.append(loss.detach())
         return loss
 
@@ -1383,12 +1385,40 @@ class Engine(LightningModule):
                           f"Acc={class_report['accuracy']:.4f}")
             val_mid = np.concatenate(self.val_mid_prices)
             val_z_hs = np.concatenate(self.val_z_half_spreads)
-            tm = compute_trading_metrics(val_mid, predictions, z_half_spreads=val_z_hs)
-            self._console(f"Trading: PnL={tm['total_pnl']:.4f}, Sharpe={tm['sharpe']:.2e}, "
-                          f"Trades={tm['n_trades']}")
+            val_save_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt)
+            val_segments_path = os.path.join(val_save_dir, "val_product_boundaries.npy")
+            val_segments = np.load(val_segments_path) if os.path.exists(val_segments_path) else None
+            tm = compute_trading_metrics(
+                val_mid, predictions, z_half_spreads=val_z_hs,
+                segment_boundaries=val_segments,
+            )
+            if self.is_dpvn and self.val_v_values:
+                v_values = torch.cat(self.val_v_values).float().numpy()
+                preds_spread = _dpvn_spread_argmax_predictions(v_values, val_z_hs, val_segments)
+                tm_spread = compute_trading_metrics(
+                    val_mid, preds_spread, z_half_spreads=val_z_hs,
+                    segment_boundaries=val_segments,
+                )
+                self._console(
+                    f"[argmax]        PnL={tm['total_pnl']:.4f}  Sharpe={tm['sharpe']:.2e}  "
+                    f"Trades={tm['n_trades']}"
+                )
+                self._console(
+                    f"[spread_argmax] PnL={tm_spread['total_pnl']:.4f}  Sharpe={tm_spread['sharpe']:.2e}  "
+                    f"Sortino={tm_spread['sortino']:.2e}  MaxDD={tm_spread['max_drawdown_pct']:.1f}%  "
+                    f"WinRate={tm_spread['win_rate'] * 100:.1f}%  Trades={tm_spread['n_trades']}"
+                )
+                self.log("val_trading/pnl", tm["total_pnl"])
+                self.log("val_trading/sharpe", tm["sharpe"])
+                self.log("val_trading/pnl_spread", tm_spread["total_pnl"])
+                self.log("val_trading/sharpe_spread", tm_spread["sharpe"])
+            else:
+                self._console(f"Trading: PnL={tm['total_pnl']:.4f}, Sharpe={tm['sharpe']:.2e}, "
+                              f"Trades={tm['n_trades']}")
 
         self.val_targets = []
         self.val_predictions = []
+        self.val_v_values = []
         self.val_mid_prices = []
         self.val_z_half_spreads = []
         self.val_filter_probs = []

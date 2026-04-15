@@ -81,6 +81,8 @@ def base_command(args, is_preprocessed="True"):
         f"experiment.is_wandb={not args.no_wandb and IS_WANDB}",
     ]
     command += profile_overrides(args)
+    if args.extra_override:
+        command += args.extra_override
     if args.loss_type is not None:
         command.append(f"experiment.loss_type={args.loss_type}")
     if args.encoder_checkpoint:
@@ -189,6 +191,16 @@ def main():
         type=str,
         default="",
         help="Path to pre-trained TLOB checkpoint for TradeLOB encoder loading.",
+    )
+    parser.add_argument(
+        "--extra-override",
+        action="append",
+        default=[],
+        help=(
+            "Extra Hydra override, repeatable. Appended verbatim to the main.py "
+            "command. Example: "
+            "--extra-override ++model.hyperparameters_fixed.dpvn_subtract_entry_cost=true"
+        ),
     )
 
     args = parser.parse_args()

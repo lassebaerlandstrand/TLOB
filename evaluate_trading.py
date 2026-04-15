@@ -860,15 +860,6 @@ def main():
              "softmax probabilities with the model's confidence_h*.npy arrays.",
     )
     parser.add_argument(
-        "--decision_rule",
-        type=str,
-        choices=["argmax", "spread_argmax"],
-        default="argmax",
-        help="Decision rule for single-horizon DPVN: 'argmax' (naive V argmax) or "
-             "'spread_argmax' (subtract |Delta pos| * half_spread before argmax). "
-             "Requires dpvn_values.npy in the checkpoint directory.",
-    )
-    parser.add_argument(
         "--audit_seed",
         type=int,
         default=0,
@@ -948,51 +939,68 @@ def main():
         print(f"CPT trade filter detected ({n_filter:,} probs, threshold={filter_threshold}, "
               f"trade_rate={trade_rate:.1%})")
 
-    # DPVN spread-aware decision rule: recompute predictions from V values + spread.
+    # DPVN auto-detection: if dpvn_values.npy exists and run is single-horizon,
+    # run the evaluation for both raw argmax and spread-aware argmax.
+    is_dpvn = (not multi_horizon) and (data.get("dpvn_values") is not None)
     raw_argmax_preds = None
-    if args.decision_rule == "spread_argmax":
-        if multi_horizon:
-            print("Error: --decision_rule spread_argmax is only valid for single-horizon DPVN runs.")
-            sys.exit(1)
-        v_values = data.get("dpvn_values")
-        if v_values is None:
-            print("Error: dpvn_values.npy not found. Was this run a DPVN model?")
-            sys.exit(1)
+    spread_argmax_preds = None
+    if is_dpvn:
+        v_values = data["dpvn_values"]
         z_hs = data.get("z_half_spreads")
         if z_hs is None:
-            print("Error: z_half_spreads.npy not found. Cannot apply spread-aware decision rule.")
-            sys.exit(1)
-        n_v = v_values.shape[0]
-        n_pred = len(data["predictions"])
-        if n_v != n_pred:
-            print(f"Warning: dpvn_values length ({n_v}) != predictions length ({n_pred}); truncating to min.")
-            m = min(n_v, n_pred)
-            v_values = v_values[:m]
-            z_hs = z_hs[:m]
-        # Re-align everything to the truncated length so the audit is consistent.
-        raw_argmax_preds = data["predictions"][: v_values.shape[0]].copy()
-        if data.get("targets") is not None:
-            data["targets"] = data["targets"][: v_values.shape[0]]
-        data["dpvn_values"] = v_values
-        data["z_half_spreads"] = z_hs
-        print(f"Applying spread-aware decision rule to {v_values.shape[0]:,} timesteps...")
-        new_preds = _spread_argmax_predictions(v_values, z_hs, data.get("segment_boundaries"))
-        n_changed = int(np.sum(new_preds != raw_argmax_preds))
-        data["predictions"] = new_preds
-        print(f"Predictions updated by spread-aware rule: {n_changed:,} changed "
-              f"({n_changed / max(new_preds.shape[0], 1) * 100:.2f}%)")
+            print("Warning: dpvn_values.npy present but z_half_spreads.npy missing; "
+                  "running raw argmax only.")
+            is_dpvn = False
+        else:
+            n_v = v_values.shape[0]
+            n_pred = len(data["predictions"])
+            if n_v != n_pred:
+                print(f"Warning: dpvn_values length ({n_v}) != predictions length ({n_pred}); "
+                      f"truncating to min.")
+                m = min(n_v, n_pred)
+                v_values = v_values[:m]
+                z_hs = z_hs[:m]
+                data["predictions"] = data["predictions"][:m]
+                if data.get("targets") is not None:
+                    data["targets"] = data["targets"][:m]
+                data["dpvn_values"] = v_values
+                data["z_half_spreads"] = z_hs
+            raw_argmax_preds = data["predictions"].copy()
+            spread_argmax_preds = _spread_argmax_predictions(
+                v_values, z_hs, data.get("segment_boundaries"),
+            )
+            n_changed = int(np.sum(spread_argmax_preds != raw_argmax_preds))
+            print(f"DPVN detected: {n_changed:,} / {spread_argmax_preds.shape[0]:,} predictions "
+                  f"differ between raw and spread-aware argmax "
+                  f"({n_changed / max(spread_argmax_preds.shape[0], 1) * 100:.2f}%)")
 
     # Detect dataset and std_price for dollar/EUR conversion
     std_price, currency = _detect_std_price(checkpoint_dir, data)
     if std_price is not None:
         print(f"Price conversion: 1 z-unit = {currency}{std_price:.2f}")
 
-    results = _run_evaluation(
-        data, multi_horizon, costs, confidence_thresholds,
-        min_holds=min_holds, use_soft_positions=args.soft_positions,
-        filter_threshold=filter_threshold,
-    )
-    _print_results(results, multi_horizon, costs, confidence_thresholds, min_holds=min_holds)
+    def _eval_and_print(data_in, header=None):
+        if header is not None:
+            print("\n" + "=" * 72)
+            print(header)
+            print("=" * 72)
+        r = _run_evaluation(
+            data_in, multi_horizon, costs, confidence_thresholds,
+            min_holds=min_holds, use_soft_positions=args.soft_positions,
+            filter_threshold=filter_threshold,
+        )
+        _print_results(r, multi_horizon, costs, confidence_thresholds, min_holds=min_holds)
+        return r
+
+    if is_dpvn:
+        # Run raw-argmax against a shallow copy so the shared dict stays on the
+        # spread-aware predictions (the designed rule) for plots, JSON, and baselines.
+        _eval_and_print({**data, "predictions": raw_argmax_preds},
+                        header="=== Decision rule: RAW ARGMAX ===")
+        data["predictions"] = spread_argmax_preds
+        results = _eval_and_print(data, header="=== Decision rule: SPREAD-AWARE ARGMAX ===")
+    else:
+        results = _eval_and_print(data)
 
     # Print sweep summary if running threshold sweep
     if args.sweep_thresholds and multi_horizon:
@@ -1021,8 +1029,8 @@ def main():
             baselines_per_h = {10: baselines}  # single horizon
             _print_baselines(baselines_per_h, [10], std_price, currency)
 
-    if args.decision_rule == "spread_argmax" and raw_argmax_preds is not None:
-        _dpvn_audit(data, raw_argmax_preds, data["predictions"], seed=args.audit_seed)
+    if is_dpvn:
+        _dpvn_audit(data, raw_argmax_preds, spread_argmax_preds, seed=args.audit_seed)
 
     print("\nGenerating plots...")
     _plot_cumulative_pnl(results, data, multi_horizon, checkpoint_dir)

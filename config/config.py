@@ -128,137 +128,6 @@ class DeepLOB(Model):
 
 
 @dataclass
-class PatchLOBConfig(Model):
-    hyperparameters_fixed: dict = field(
-        default_factory=lambda: {
-            "num_layers": 4,
-            "hidden_dim": 64,
-            "num_heads": 1,
-            "is_sin_emb": False,
-            "lr": 0.0001,
-            "seq_size": 128,
-            "all_features": True,
-            "weight_decay": 0.01,
-            "dropout": 0.0,
-        }
-    )
-    hyperparameters_sweep: dict = field(
-        default_factory=lambda: {
-            "num_layers": [4, 6],
-            "hidden_dim": [64, 96, 128],
-            "num_heads": [1],
-            "lr": [0.0001],
-            "seq_size": [128],
-        }
-    )
-    type: ModelType = ModelType.PATCHLOB
-
-
-@dataclass
-class FuseLOBConfig(Model):
-    hyperparameters_fixed: dict = field(
-        default_factory=lambda: {
-            "num_layers": 4,
-            "hidden_dim": 64,
-            "num_heads": 1,
-            "is_sin_emb": True,
-            "lr": 0.0001,
-            "seq_size": 128,
-            "all_features": True,
-            "weight_decay": 0.01,
-            "dropout": 0.1,
-            "max_events_per_window": 64,
-            "n_event_features": 11,
-            "n_perceiver_queries": 8,
-            "event_encoder_layers": 2,
-            "snap_encoder_layers": 2,
-            "event_heads": 4,
-        }
-    )
-    hyperparameters_sweep: dict = field(
-        default_factory=lambda: {
-            "num_layers": [3, 4],
-            "hidden_dim": [48, 64],
-            "num_heads": [1],
-            "lr": [0.0001],
-            "seq_size": [128],
-        }
-    )
-    type: ModelType = ModelType.FUSELOB
-
-
-@dataclass
-class NexusLOBConfig(Model):
-    hyperparameters_fixed: dict = field(
-        default_factory=lambda: {
-            "num_layers": 4,
-            "hidden_dim": 128,
-            "num_heads": 2,
-            "is_sin_emb": True,
-            "lr": 0.0001,
-            "seq_size": 128,
-            "all_features": True,
-            "weight_decay": 0.01,
-            "dropout": 0.1,
-            "max_events_per_window": 64,
-            "n_event_features": 7,
-            "n_perceiver_queries": 4,
-            "event_encoder_layers": 2,
-            "event_heads": 4,
-            "patch_size": 4,
-            "cross_attn_heads": 4,
-        }
-    )
-    hyperparameters_sweep: dict = field(
-        default_factory=lambda: {
-            "num_layers": [3, 4],
-            "hidden_dim": [48, 64],
-            "num_heads": [1],
-            "lr": [0.0001],
-            "seq_size": [128],
-        }
-    )
-    type: ModelType = ModelType.NEXUSLOB
-
-
-@dataclass
-class TradeLOBConfig(Model):
-    hyperparameters_fixed: dict = field(
-        default_factory=lambda: {
-            "num_layers": 4,
-            "hidden_dim": 40,
-            "num_heads": 1,
-            "is_sin_emb": True,
-            "lr": 0.0001,
-            "seq_size": 128,
-            "all_features": True,
-            "weight_decay": 0.01,
-            "dropout": 0.0,
-            "max_band_width": 1.5,
-            "pos_embed_dim": 8,
-            "band_hidden_dim": 64,
-            "signal_hidden_dim": 64,
-            "sharpness": 10.0,
-            "gumbel_temperature": 1.0,
-            "chunk_size": 64,
-            "encoder_checkpoint": "",
-            "encoder_freeze_epochs": 3,
-        }
-    )
-    hyperparameters_sweep: dict = field(
-        default_factory=lambda: {
-            "num_layers": [4],
-            "hidden_dim": [40, 64],
-            "num_heads": [1],
-            "lr": [0.0001],
-            "seq_size": [128],
-            "chunk_size": [64, 128],
-        }
-    )
-    type: ModelType = ModelType.TRADELOB
-
-
-@dataclass
 class Dataset:
     type: DatasetType = MISSING
     dates: list = MISSING
@@ -322,71 +191,9 @@ class BATTERY(Dataset):
     model_overrides: dict = field(
         default_factory=lambda: {
             "_default": {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1},
-            "FUSELOB": {"hidden_dim": 64, "num_heads": 1, "dropout": 0.1},
-            "NEXUSLOB": {"hidden_dim": 64, "num_heads": 1, "dropout": 0.1},
             "DPVN": {"hidden_dim": 64, "num_heads": 4, "dropout": 0.1, "all_features": False},
         }
     )
-
-
-@dataclass
-class CPTConfig(Model):
-    hyperparameters_fixed: dict = field(
-        default_factory=lambda: {
-            "num_layers": 4,
-            "hidden_dim": 40,
-            "num_heads": 1,
-            "is_sin_emb": True,
-            "lr": 0.0001,
-            "seq_size": 128,
-            "all_features": True,
-            "weight_decay": 0.01,
-            "dropout": 0.0,
-            "spread_embed_dim": 16,
-            "pos_embed_dim": 16,
-            "head_hidden_dim": 64,
-            "encoder_checkpoint": "",
-            "encoder_freeze_epochs": 0,
-        }
-    )
-    hyperparameters_sweep: dict = field(
-        default_factory=lambda: {
-            "num_layers": [4],
-            "hidden_dim": [40, 64],
-            "num_heads": [1],
-            "lr": [0.0001],
-            "seq_size": [128],
-        }
-    )
-    type: ModelType = ModelType.CPT
-
-
-@dataclass
-class CostLOBConfig(Model):
-    hyperparameters_fixed: dict = field(
-        default_factory=lambda: {
-            "num_layers": 4,
-            "hidden_dim": 40,
-            "num_heads": 1,
-            "is_sin_emb": True,
-            "lr": 0.0001,
-            "seq_size": 128,
-            "all_features": True,
-            "weight_decay": 0.01,
-            "dropout": 0.0,
-            "cost_embed_dim": 8,
-        }
-    )
-    hyperparameters_sweep: dict = field(
-        default_factory=lambda: {
-            "num_layers": [4],
-            "hidden_dim": [40, 64],
-            "num_heads": [1],
-            "lr": [0.0001],
-            "seq_size": [128],
-        }
-    )
-    type: ModelType = ModelType.COSTLOB
 
 
 @dataclass
@@ -460,17 +267,6 @@ class Experiment:
     dfl_lambda_drawdown: float = 0.0  # Drawdown penalty weight
     dfl_lambda_turnover: float = 0.0  # Turnover penalty weight
     dfl_lambda_entropy: float = 0.01  # Entropy regularization (prevents position collapse)
-    # TradeLOB parameters
-    ntb_objective: str = "sharpe"  # "pnl" | "sharpe" | "sortino"
-    ntb_lambda_activity: float = 0.0  # Penalize always-hold collapse
-    ntb_lambda_ce: float = 0.0  # CE regularization weight (0 = pure PnL)
-    ntb_chunk_size: int = 64  # Number of consecutive steps per training chunk
-    # CPT parameters
-    cpt_lambda_filter: float = 1.0  # Trade filter BCE weight
-    cpt_filter_threshold: float = 0.5  # Trade filter threshold at inference
-    # CostLOB parameters
-    costlob_lambda_conf: float = 0.5  # Confidence BCE weight
-    costlob_conf_margin: float = 0.0  # Margin above spread to count as profitable
 
 
 defaults = [Model, Experiment, Dataset]
@@ -498,12 +294,6 @@ cs.store(group="model", name="mlplob_original", node=MLPLOBOriginal)
 cs.store(group="model", name="tlob_original", node=TLOBOriginal)
 cs.store(group="model", name="binctabl", node=BiNCTABL)
 cs.store(group="model", name="deeplob", node=DeepLOB)
-cs.store(group="model", name="patchlob", node=PatchLOBConfig)
-cs.store(group="model", name="fuselob", node=FuseLOBConfig)
-cs.store(group="model", name="nexuslob", node=NexusLOBConfig)
-cs.store(group="model", name="tradelob", node=TradeLOBConfig)
-cs.store(group="model", name="cpt", node=CPTConfig)
-cs.store(group="model", name="costlob", node=CostLOBConfig)
 cs.store(group="model", name="dpvn", node=DPVNConfig)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)

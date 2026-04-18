@@ -19,8 +19,7 @@ from models.engine import Engine
 from models.original.engine import Engine as OriginalEngine
 from preprocessing.battery import battery_cache_subdir, battery_load, battery_load_multi
 from preprocessing.btc import btc_load, btc_load_multi
-from preprocessing.dataset import DataModule, Dataset, MultiHorizonDataset, SequentialChunkDataset
-from preprocessing.event_dataset import EventSnapshotDataset, load_events_for_product
+from preprocessing.dataset import DataModule, Dataset, MultiHorizonDataset
 from preprocessing.fi_2010 import fi_2010_load, fi_2010_load_multi
 from preprocessing.lobster import lobster_load, lobster_load_multi
 from utils.utils_data import compute_lob_diffs
@@ -35,8 +34,6 @@ def _fmt_int_space(value: int) -> str:
 def _fmt_float_space(value: float, decimals: int = 1) -> str:
     return f"{float(value):,.{decimals}f}"
 
-
-_EVENT_MODELS = {cst.ModelType.FUSELOB, cst.ModelType.NEXUSLOB}
 
 # Number of message features in Battery preprocessing (before LOB columns)
 _N_MSG_FEATURES = 18
@@ -55,49 +52,6 @@ def _compute_dpvn_q_targets(inp: torch.Tensor, seq_size: int, horizon: int, gamm
         return None
     q_raw = compute_q_targets(z_mid, z_hs, horizon=horizon, gamma=gamma)
     return q_raw[seq_size - 1:]
-
-
-def _compute_dp_labels(inp: torch.Tensor, seq_size: int):
-    """Compute DP optimal trade/hold labels for CPT filter supervision.
-
-    Extracts mid-price and half-spread from columns 0 and 2 of the input
-    tensor (consistent with engine test_step's extraction). Runs DP optimal
-    and returns per-timestep binary trade labels.
-
-    Args:
-        inp: (N, num_features) full feature tensor (z-scored).
-             Columns 0 and 2 are used for mid-price and half-spread, matching
-             the engine test_step which uses x[:,-1,0] and x[:,-1,2].
-        seq_size: Sequence window size for label offset.
-
-    Returns:
-        (dp_trade, dp_prev_pos) each shape (N_trimmed,), or None.
-    """
-    from utils.metrics import compute_dp_optimal
-
-    col0 = inp[:, 0].numpy().astype(np.float64)
-    col2 = inp[:, 2].numpy().astype(np.float64)
-    z_mid = (col0 + col2) / 2.0
-    z_hs = np.abs((col0 - col2) / 2.0)  # abs ensures non-negative cost
-
-    if len(z_mid) < seq_size + 2:
-        return None
-
-    dp_result = compute_dp_optimal(z_mid, z_hs)
-    dp_positions = dp_result["positions"]
-
-    dp_trade = np.zeros(len(dp_positions), dtype=np.float32)
-    dp_trade[1:] = (np.abs(np.diff(dp_positions)) > 0).astype(np.float32)
-
-    dp_prev_pos = np.zeros(len(dp_positions), dtype=np.float32)
-    dp_prev_pos[1:] = dp_positions[:-1]
-
-    # Trim to align with direction labels (which start at label_start offset)
-    label_start = seq_size - cst.LEN_SMOOTH
-    dp_trade = dp_trade[label_start:]
-    dp_prev_pos = dp_prev_pos[label_start:]
-
-    return (dp_trade, dp_prev_pos)
 
 
 def _dataset_labels(dataset):
@@ -288,16 +242,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
             )
             val_input, val_labels, val_dfl = btc_load_multi(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, seq_size)
             test_input, test_labels, test_dfl = btc_load_multi(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, seq_size)
-            # Compute DP labels for CPT (before diff features, needs raw cols 0/2)
-            train_dp, val_dp = None, None
-            if model_type == cst.ModelType.CPT:
-                train_dp = _compute_dp_labels(train_input, seq_size)
-                val_dp = _compute_dp_labels(val_input, seq_size)
             train_input = maybe_add_diff_features(train_input)
             val_input = maybe_add_diff_features(val_input)
             test_input = maybe_add_diff_features(test_input)
-            train_set = MultiHorizonDataset(train_input, train_labels, seq_size, dfl_data=train_dfl, dp_data=train_dp)
-            val_set = MultiHorizonDataset(val_input, val_labels, seq_size, dfl_data=val_dfl, dp_data=val_dp)
+            train_set = MultiHorizonDataset(train_input, train_labels, seq_size, dfl_data=train_dfl)
+            val_set = MultiHorizonDataset(val_input, val_labels, seq_size, dfl_data=val_dfl)
             test_set = MultiHorizonDataset(test_input, test_labels, seq_size, dfl_data=test_dfl)
         else:
             train_input, train_labels = btc_load(cst.DATA_DIR + "/BTC/train.npy", cst.LEN_SMOOTH, horizon, seq_size)
@@ -357,17 +306,9 @@ def train(config: Config, trainer: L.Trainer, run=None):
             train_datasets = []
             val_datasets = []
             test_datasets = []
-            uses_events = model_type in _EVENT_MODELS
 
             for product in products:
                 product_dir = os.path.join(pp_dir, "products", product)
-
-                # Load events once per product (shared across splits)
-                product_events = None
-                if uses_events:
-                    product_events = load_events_for_product(product_dir)
-                    if product_events is None:
-                        continue  # skip products without events
 
                 for split in ("train", "val", "test"):
                     path = os.path.join(product_dir, f"{split}.npy")
@@ -385,22 +326,8 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     if inp.shape[0] < seq_size:
                         continue
 
-                    # Compute DP labels for CPT trade filter supervision
-                    dp_data = None
-                    if model_type == cst.ModelType.CPT and multi_horizon:
-                        dp_data = _compute_dp_labels(inp, seq_size)
-
-                    if uses_events and product_events is not None:
-                        ds = EventSnapshotDataset(
-                            snapshot_input=inp,
-                            event_features=product_events["event_features"],
-                            event_mask=product_events["event_mask"],
-                            labels=lab,
-                            seq_size=seq_size,
-                            event_aggregates=product_events.get("event_aggregates"),
-                        )
-                    elif multi_horizon:
-                        ds = MultiHorizonDataset(inp, lab, seq_size, dfl_data=prod_dfl, dp_data=dp_data)
+                    if multi_horizon:
+                        ds = MultiHorizonDataset(inp, lab, seq_size, dfl_data=prod_dfl)
                     else:
                         q_targets = None
                         if model_type == cst.ModelType.DPVN:
@@ -424,9 +351,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 raise RuntimeError("[BATTERY] No test data found in per_product mode")
 
             test_concat = ConcatDataset(test_datasets)
-            # Event models hit FlashAttention kernel limits at large B*T;
-            # cap test batch multiplier at 2x for event models, 4x otherwise.
-            _test_mult = 2 if uses_events else 4
+            _test_mult = 4
             test_loaders = [
                 DataLoader(
                     dataset=test_concat,
@@ -484,17 +409,11 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 test_input, test_labels, test_dfl = battery_load_multi(
                     concat_dir + "/test.npy", all_features, cst.LEN_SMOOTH, seq_size
                 )
-                # Compute DP labels for CPT
-                train_dp, val_dp = None, None
-                if model_type == cst.ModelType.CPT:
-                    train_dp = _compute_dp_labels(train_input, seq_size)
-                    val_dp = _compute_dp_labels(val_input, seq_size)
-
                 train_input = maybe_add_diff_features(train_input)
                 val_input = maybe_add_diff_features(val_input)
                 test_input = maybe_add_diff_features(test_input)
-                train_set = MultiHorizonDataset(train_input, train_labels, seq_size, dfl_data=train_dfl, dp_data=train_dp)
-                val_set = MultiHorizonDataset(val_input, val_labels, seq_size, dfl_data=val_dfl, dp_data=val_dp)
+                train_set = MultiHorizonDataset(train_input, train_labels, seq_size, dfl_data=train_dfl)
+                val_set = MultiHorizonDataset(val_input, val_labels, seq_size, dfl_data=val_dfl)
                 test_set = MultiHorizonDataset(test_input, test_labels, seq_size, dfl_data=test_dfl)
             else:
                 train_input, train_labels = battery_load(
@@ -986,39 +905,6 @@ def train(config: Config, trainer: L.Trainer, run=None):
             )
 
     else:
-        # TradeLOB: wrap training dataset in SequentialChunkDataset for position carry-forward
-        if model_type == cst.ModelType.TRADELOB:
-            chunk_size = config.model.hyperparameters_fixed.get("chunk_size", 64)
-            old_train = data_module.train_set
-            if isinstance(old_train, MultiHorizonDataset):
-                dfl_data_for_chunks = (old_train.delta_mids, old_train.half_spreads) if old_train.has_dfl else None
-                chunk_train = SequentialChunkDataset(
-                    old_train.x, old_train.y_multi, seq_size,
-                    chunk_size=chunk_size,
-                    dfl_data=dfl_data_for_chunks,
-                )
-                data_module.train_set = chunk_train
-                data_module.is_shuffle_train = False
-                print(f"{model_type.value}: wrapped training set in SequentialChunkDataset "
-                      f"(chunk_size={chunk_size}, {len(chunk_train)} chunks)")
-            elif isinstance(old_train, ConcatDataset):
-                chunk_datasets = []
-                for sub_ds in old_train.datasets:
-                    if isinstance(sub_ds, MultiHorizonDataset) and hasattr(sub_ds, 'x'):
-                        dfl_sub = (sub_ds.delta_mids, sub_ds.half_spreads) if sub_ds.has_dfl else None
-                        chunk_sub = SequentialChunkDataset(
-                            sub_ds.x, sub_ds.y_multi, seq_size,
-                            chunk_size=chunk_size,
-                            dfl_data=dfl_sub,
-                        )
-                        chunk_datasets.append(chunk_sub)
-                if chunk_datasets:
-                    data_module.train_set = ConcatDataset(chunk_datasets)
-                    data_module.is_shuffle_train = False
-                    total_chunks = sum(len(cd) for cd in chunk_datasets)
-                    print(f"{model_type.value}: wrapped {len(chunk_datasets)} products -> "
-                          f"{total_chunks} chunks (chunk_size={chunk_size})")
-
         if model_type == cst.ModelType.MLPLOB_ORIGINAL:
             optimizer_name = "Adam" if config.experiment.optimizer == "AdamW" else config.experiment.optimizer
             model = OriginalEngine(
@@ -1192,348 +1078,6 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dfl_cost_multiplier=config.experiment.dfl_cost_multiplier,
                 dfl_lambda_drawdown=config.experiment.dfl_lambda_drawdown,
             )
-        elif model_type == cst.ModelType.PATCHLOB:
-            model = Engine(
-                seq_size=seq_size,
-                horizon=horizon,
-                max_epochs=config.experiment.max_epochs,
-                model_type=config.model.type.value,
-                is_wandb=config.experiment.is_wandb,
-                experiment_type=experiment_type,
-                lr=config.model.hyperparameters_fixed["lr"],
-                optimizer=config.experiment.optimizer,
-                dir_ckpt=config.experiment.dir_ckpt,
-                hidden_dim=config.model.hyperparameters_fixed["hidden_dim"],
-                num_layers=config.model.hyperparameters_fixed["num_layers"],
-                num_features=train_input.shape[1],
-                dataset_type=dataset_type,
-                num_heads=config.model.hyperparameters_fixed["num_heads"],
-                is_sin_emb=config.model.hyperparameters_fixed["is_sin_emb"],
-                len_test_dataloader=len(test_loaders[0]),
-                use_torch_compile=config.experiment.use_torch_compile,
-                torch_compile_mode=config.experiment.torch_compile_mode,
-                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
-                torch_compile_backend=config.experiment.torch_compile_backend,
-                use_fast_attention=config.experiment.use_fast_attention,
-                weight_decay=config.model.hyperparameters_fixed["weight_decay"],
-                dropout=config.model.hyperparameters_fixed.get("dropout", 0.0),
-                multi_horizon=multi_horizon,
-                class_weights=class_weights,
-                loss_type=config.experiment.loss_type,
-                focal_gamma=config.experiment.focal_gamma,
-                ordinal_smoothing=config.experiment.ordinal_smoothing,
-                dfl_temperature=config.experiment.dfl_temperature,
-                dfl_temperature_final=config.experiment.dfl_temperature_final,
-                dfl_objective=config.experiment.dfl_objective,
-                dfl_lambda_turnover=config.experiment.dfl_lambda_turnover,
-                dfl_lambda_entropy=config.experiment.dfl_lambda_entropy,
-                dfl_cost_multiplier=config.experiment.dfl_cost_multiplier,
-                dfl_lambda_drawdown=config.experiment.dfl_lambda_drawdown,
-            )
-        elif model_type == cst.ModelType.FUSELOB:
-            hp = config.model.hyperparameters_fixed
-            model = Engine(
-                seq_size=seq_size,
-                horizon=horizon,
-                max_epochs=config.experiment.max_epochs,
-                model_type=config.model.type.value,
-                is_wandb=config.experiment.is_wandb,
-                experiment_type=experiment_type,
-                lr=hp["lr"],
-                optimizer=config.experiment.optimizer,
-                dir_ckpt=config.experiment.dir_ckpt,
-                hidden_dim=hp["hidden_dim"],
-                num_layers=hp["num_layers"],
-                num_features=train_input.shape[1],
-                dataset_type=dataset_type,
-                num_heads=hp["num_heads"],
-                is_sin_emb=hp["is_sin_emb"],
-                len_test_dataloader=len(test_loaders[0]),
-                use_torch_compile=config.experiment.use_torch_compile,
-                torch_compile_mode=config.experiment.torch_compile_mode,
-                torch_compile_dynamic=True,
-                torch_compile_backend=config.experiment.torch_compile_backend,
-                use_fast_attention=config.experiment.use_fast_attention,
-                weight_decay=hp["weight_decay"],
-                dropout=hp.get("dropout", 0.0),
-                multi_horizon=multi_horizon,
-                class_weights=class_weights,
-                loss_type=config.experiment.loss_type,
-                focal_gamma=config.experiment.focal_gamma,
-                ordinal_smoothing=config.experiment.ordinal_smoothing,
-                dfl_temperature=config.experiment.dfl_temperature,
-                dfl_temperature_final=config.experiment.dfl_temperature_final,
-                dfl_objective=config.experiment.dfl_objective,
-                dfl_lambda_turnover=config.experiment.dfl_lambda_turnover,
-                dfl_lambda_entropy=config.experiment.dfl_lambda_entropy,
-                dfl_cost_multiplier=config.experiment.dfl_cost_multiplier,
-                dfl_lambda_drawdown=config.experiment.dfl_lambda_drawdown,
-                max_events_per_window=hp.get("max_events_per_window", 64),
-                n_event_features=hp.get("n_event_features", 7),
-                n_perceiver_queries=hp.get("n_perceiver_queries", 8),
-                event_encoder_layers=hp.get("event_encoder_layers", 2),
-                snap_encoder_layers=hp.get("snap_encoder_layers", 2),
-                event_heads=hp.get("event_heads", 4),
-            )
-
-        elif model_type == cst.ModelType.NEXUSLOB:
-            hp = config.model.hyperparameters_fixed
-            model = Engine(
-                seq_size=seq_size,
-                horizon=horizon,
-                max_epochs=config.experiment.max_epochs,
-                model_type=config.model.type.value,
-                is_wandb=config.experiment.is_wandb,
-                experiment_type=experiment_type,
-                lr=hp["lr"],
-                optimizer=config.experiment.optimizer,
-                dir_ckpt=config.experiment.dir_ckpt,
-                hidden_dim=hp["hidden_dim"],
-                num_layers=hp["num_layers"],
-                num_features=train_input.shape[1],
-                dataset_type=dataset_type,
-                num_heads=hp["num_heads"],
-                is_sin_emb=hp["is_sin_emb"],
-                len_test_dataloader=len(test_loaders[0]),
-                use_torch_compile=config.experiment.use_torch_compile,
-                torch_compile_mode=config.experiment.torch_compile_mode,
-                torch_compile_dynamic=True,
-                torch_compile_backend=config.experiment.torch_compile_backend,
-                use_fast_attention=config.experiment.use_fast_attention,
-                weight_decay=hp["weight_decay"],
-                dropout=hp.get("dropout", 0.0),
-                multi_horizon=multi_horizon,
-                class_weights=class_weights,
-                loss_type=config.experiment.loss_type,
-                focal_gamma=config.experiment.focal_gamma,
-                ordinal_smoothing=config.experiment.ordinal_smoothing,
-                dfl_temperature=config.experiment.dfl_temperature,
-                dfl_temperature_final=config.experiment.dfl_temperature_final,
-                dfl_objective=config.experiment.dfl_objective,
-                dfl_lambda_turnover=config.experiment.dfl_lambda_turnover,
-                dfl_lambda_entropy=config.experiment.dfl_lambda_entropy,
-                dfl_cost_multiplier=config.experiment.dfl_cost_multiplier,
-                dfl_lambda_drawdown=config.experiment.dfl_lambda_drawdown,
-                max_events_per_window=hp.get("max_events_per_window", 64),
-                n_event_features=hp.get("n_event_features", 7),
-                n_perceiver_queries=hp.get("n_perceiver_queries", 4),
-                event_encoder_layers=hp.get("event_encoder_layers", 2),
-                event_heads=hp.get("event_heads", 4),
-                patch_size=hp.get("patch_size", 4),
-                cross_attn_heads=hp.get("cross_attn_heads", 4),
-            )
-
-        elif model_type == cst.ModelType.TRADELOB:
-            hp = config.model.hyperparameters_fixed
-            model = Engine(
-                seq_size=seq_size,
-                horizon=horizon,
-                max_epochs=config.experiment.max_epochs,
-                model_type=config.model.type.value,
-                is_wandb=config.experiment.is_wandb,
-                experiment_type=experiment_type,
-                lr=hp["lr"],
-                optimizer=config.experiment.optimizer,
-                dir_ckpt=config.experiment.dir_ckpt,
-                hidden_dim=hp["hidden_dim"],
-                num_layers=hp["num_layers"],
-                num_features=train_input.shape[1],
-                dataset_type=dataset_type,
-                num_heads=hp["num_heads"],
-                is_sin_emb=hp["is_sin_emb"],
-                len_test_dataloader=len(test_loaders[0]),
-                use_torch_compile=config.experiment.use_torch_compile,
-                torch_compile_mode=config.experiment.torch_compile_mode,
-                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
-                torch_compile_backend=config.experiment.torch_compile_backend,
-                use_fast_attention=config.experiment.use_fast_attention,
-                weight_decay=hp.get("weight_decay", 0.01),
-                dropout=hp.get("dropout", 0.0),
-                multi_horizon=multi_horizon,
-                class_weights=class_weights,
-                loss_type=config.experiment.loss_type,
-                focal_gamma=config.experiment.focal_gamma,
-                ordinal_smoothing=config.experiment.ordinal_smoothing,
-                dfl_temperature=config.experiment.dfl_temperature,
-                dfl_temperature_final=config.experiment.dfl_temperature_final,
-                dfl_objective=config.experiment.dfl_objective,
-                dfl_lambda_turnover=config.experiment.dfl_lambda_turnover,
-                dfl_lambda_entropy=config.experiment.dfl_lambda_entropy,
-                dfl_cost_multiplier=config.experiment.dfl_cost_multiplier,
-                dfl_lambda_drawdown=config.experiment.dfl_lambda_drawdown,
-                max_band_width=hp.get("max_band_width", 1.5),
-                pos_embed_dim=hp.get("pos_embed_dim", 8),
-                band_hidden_dim=hp.get("band_hidden_dim", 64),
-                signal_hidden_dim=hp.get("signal_hidden_dim", 64),
-                sharpness=hp.get("sharpness", 10.0),
-                gumbel_temperature=hp.get("gumbel_temperature", 1.0),
-                ntb_objective=config.experiment.ntb_objective,
-                ntb_lambda_activity=config.experiment.ntb_lambda_activity,
-                ntb_lambda_ce=config.experiment.ntb_lambda_ce,
-                encoder_freeze_epochs=hp.get("encoder_freeze_epochs", 0),
-            )
-
-            # Load pre-trained encoder weights from TLOB checkpoint
-            encoder_ckpt = os.environ.get("TRADELOB_ENCODER_CHECKPOINT", "") or hp.get("encoder_checkpoint", "")
-            if encoder_ckpt:
-                import torch as _torch
-                print(f"Loading pre-trained encoder from: {encoder_ckpt}")
-                ckpt = _torch.load(encoder_ckpt, map_location="cpu", weights_only=False)
-                sd = ckpt.get("state_dict", ckpt)
-                encoder_prefixes = ("order_type_embedder", "norm_layer", "emb_layer", "pos_encoder", "layers")
-                encoder_sd = {}
-                for k, v in sd.items():
-                    # Strip Engine "model." prefix and torch.compile "_orig_mod." prefix
-                    clean_key = k.replace("model.", "", 1).replace("_orig_mod.", "", 1)
-                    if any(clean_key.startswith(ep) for ep in encoder_prefixes):
-                        encoder_sd[clean_key] = v
-                n_loaded = len(encoder_sd)
-                loaded_keys = model.model.load_state_dict(encoder_sd, strict=False)
-                if loaded_keys.unexpected_keys:
-                    print(f"  Warning: {len(loaded_keys.unexpected_keys)} unexpected keys (shape mismatch?)")
-                    print(f"    First 3: {loaded_keys.unexpected_keys[:3]}")
-                print(f"  Loaded {n_loaded} encoder parameters")
-                # Freeze encoder
-                n_frozen = 0
-                for name, p in model.model.named_parameters():
-                    if any(name.startswith(ep) for ep in encoder_prefixes):
-                        p.requires_grad = False
-                        n_frozen += 1
-                print(f"  Frozen {n_frozen} encoder parameters (unfreeze after epoch {hp.get('encoder_freeze_epochs', 3)})")
-
-            # Enable CE regularization heads if ntb_lambda_ce > 0
-            if config.experiment.ntb_lambda_ce > 0:
-                model.model.enable_classification_heads()
-                print(f"  CE regularization enabled (lambda_ce={config.experiment.ntb_lambda_ce})")
-
-        elif model_type == cst.ModelType.CPT:
-            hp = config.model.hyperparameters_fixed
-            # Compute DP trade rate from training data for filter loss pos_weight
-            _dp_trade_rate = 0.06  # default estimate
-            _train_data = data_module.train_set
-            if isinstance(_train_data, ConcatDataset):
-                _dp_counts = [ds.dp_trade.sum().item() for ds in _train_data.datasets if hasattr(ds, 'dp_trade') and ds.has_dp]
-                _dp_totals = [len(ds.dp_trade) for ds in _train_data.datasets if hasattr(ds, 'dp_trade') and ds.has_dp]
-                if _dp_totals:
-                    _dp_trade_rate = sum(_dp_counts) / max(sum(_dp_totals), 1)
-            elif hasattr(_train_data, 'dp_trade') and _train_data.has_dp:
-                _dp_trade_rate = _train_data.dp_trade.sum().item() / max(len(_train_data.dp_trade), 1)
-            print(f"CPT: DP trade rate = {_dp_trade_rate:.4f} ({_dp_trade_rate*100:.1f}% of timesteps are trades)")
-
-            model = Engine(
-                seq_size=seq_size,
-                horizon=horizon,
-                max_epochs=config.experiment.max_epochs,
-                model_type=config.model.type.value,
-                is_wandb=config.experiment.is_wandb,
-                experiment_type=experiment_type,
-                lr=hp["lr"],
-                optimizer=config.experiment.optimizer,
-                dir_ckpt=config.experiment.dir_ckpt,
-                hidden_dim=hp["hidden_dim"],
-                num_layers=hp["num_layers"],
-                num_features=train_input.shape[1],
-                dataset_type=dataset_type,
-                num_heads=hp["num_heads"],
-                is_sin_emb=hp["is_sin_emb"],
-                len_test_dataloader=len(test_loaders[0]),
-                use_torch_compile=config.experiment.use_torch_compile,
-                torch_compile_mode=config.experiment.torch_compile_mode,
-                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
-                torch_compile_backend=config.experiment.torch_compile_backend,
-                use_fast_attention=config.experiment.use_fast_attention,
-                weight_decay=hp.get("weight_decay", 0.01),
-                dropout=hp.get("dropout", 0.0),
-                multi_horizon=multi_horizon,
-                class_weights=class_weights,
-                loss_type=config.experiment.loss_type,
-                spread_embed_dim=hp.get("spread_embed_dim", 16),
-                pos_embed_dim=hp.get("pos_embed_dim", 16),
-                head_hidden_dim=hp.get("head_hidden_dim", 64),
-                cpt_lambda_filter=config.experiment.cpt_lambda_filter,
-                cpt_filter_threshold=config.experiment.cpt_filter_threshold,
-                dp_trade_rate=_dp_trade_rate,
-                encoder_freeze_epochs=hp.get("encoder_freeze_epochs", 0),
-            )
-
-            # Load pre-trained encoder weights from TLOB checkpoint
-            encoder_ckpt = os.environ.get("CPT_ENCODER_CHECKPOINT", "") or hp.get("encoder_checkpoint", "")
-            freeze_epochs = hp.get("encoder_freeze_epochs", 0)
-            if encoder_ckpt:
-                import torch as _torch
-                print(f"\n{'='*60}")
-                print(f"  CPT: Loading pre-trained encoder")
-                print(f"{'='*60}")
-                print(f"  Checkpoint: {encoder_ckpt}")
-                ckpt = _torch.load(encoder_ckpt, map_location="cpu", weights_only=False)
-                sd = ckpt.get("state_dict", ckpt)
-                encoder_prefixes = ("order_type_embedder", "norm_layer", "emb_layer", "pos_encoder", "layers")
-                encoder_sd = {}
-                for k, v in sd.items():
-                    clean_key = k.replace("model.", "", 1).replace("_orig_mod.", "", 1)
-                    if any(clean_key.startswith(ep) for ep in encoder_prefixes):
-                        encoder_sd[clean_key] = v
-                n_encoder_params = sum(v.numel() for v in encoder_sd.values())
-                loaded_keys = model.model.load_state_dict(encoder_sd, strict=False)
-                if loaded_keys.unexpected_keys:
-                    print(f"  Warning: {len(loaded_keys.unexpected_keys)} unexpected keys (shape mismatch?)")
-                    print(f"    First 3: {loaded_keys.unexpected_keys[:3]}")
-                print(f"  Loaded {len(encoder_sd)} encoder tensors ({n_encoder_params:,} parameters)")
-
-                # Freeze encoder
-                if freeze_epochs > 0:
-                    n_frozen = 0
-                    for name, p in model.model.named_parameters():
-                        if any(name.startswith(ep) for ep in encoder_prefixes):
-                            p.requires_grad = False
-                            n_frozen += 1
-                    n_head_params = sum(p.numel() for p in model.model.parameters() if p.requires_grad)
-                    print(f"  Frozen {n_frozen} encoder tensors for {freeze_epochs} epochs")
-                    print(f"  Trainable (heads only): {n_head_params:,} parameters")
-                    print(f"  Unfreeze at epoch {freeze_epochs} for end-to-end fine-tuning")
-                else:
-                    print(f"  Encoder NOT frozen (encoder_freeze_epochs=0)")
-                print(f"{'='*60}\n")
-            else:
-                print(f"\n  CPT: Training encoder from scratch (no encoder_checkpoint)")
-                if freeze_epochs > 0:
-                    print(f"  Warning: encoder_freeze_epochs={freeze_epochs} but no pretrained encoder — ignoring freeze")
-                print()
-
-        elif model_type == cst.ModelType.COSTLOB:
-            hp = config.model.hyperparameters_fixed
-            model = Engine(
-                seq_size=seq_size,
-                horizon=horizon,
-                max_epochs=config.experiment.max_epochs,
-                model_type=config.model.type.value,
-                is_wandb=config.experiment.is_wandb,
-                experiment_type=experiment_type,
-                lr=hp["lr"],
-                optimizer=config.experiment.optimizer,
-                dir_ckpt=config.experiment.dir_ckpt,
-                hidden_dim=hp["hidden_dim"],
-                num_layers=hp["num_layers"],
-                num_features=train_input.shape[1],
-                dataset_type=dataset_type,
-                num_heads=hp["num_heads"],
-                is_sin_emb=hp["is_sin_emb"],
-                len_test_dataloader=len(test_loaders[0]),
-                use_torch_compile=config.experiment.use_torch_compile,
-                torch_compile_mode=config.experiment.torch_compile_mode,
-                torch_compile_dynamic=config.experiment.torch_compile_dynamic,
-                torch_compile_backend=config.experiment.torch_compile_backend,
-                use_fast_attention=config.experiment.use_fast_attention,
-                weight_decay=hp.get("weight_decay", 0.01),
-                dropout=hp.get("dropout", 0.0),
-                multi_horizon=multi_horizon,
-                class_weights=class_weights,
-                loss_type=config.experiment.loss_type,
-                cost_embed_dim=hp.get("cost_embed_dim", 8),
-                costlob_lambda_conf=config.experiment.costlob_lambda_conf,
-                costlob_conf_margin=config.experiment.costlob_conf_margin,
-            )
-
         elif model_type == cst.ModelType.DPVN:
             hp = config.model.hyperparameters_fixed
             model = Engine(

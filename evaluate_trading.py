@@ -407,10 +407,6 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
         path = os.path.join(checkpoint_dir, f"{name}.npy")
         data[name] = np.load(path) if os.path.exists(path) else None
 
-    # Load CPT trade filter probabilities (if present)
-    filter_path = os.path.join(checkpoint_dir, "filter_probs.npy")
-    data["filter_probs"] = np.load(filter_path) if os.path.exists(filter_path) else None
-
     if multi_horizon:
         data["horizons"] = []
         for h in HORIZONS:
@@ -428,10 +424,6 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
 
             logits_path = os.path.join(checkpoint_dir, f"logits_h{h}.npy")
             h_data["logits"] = np.load(logits_path) if os.path.exists(logits_path) else None
-
-            # CostLOB learned confidence (if present)
-            conf_path = os.path.join(checkpoint_dir, f"confidence_h{h}.npy")
-            h_data["confidence"] = np.load(conf_path) if os.path.exists(conf_path) else None
 
             data["horizons"].append((h, h_data))
     else:
@@ -459,7 +451,6 @@ def _run_evaluation(
     confidence_thresholds: list[float],
     min_holds: list[int] | None = None,
     use_soft_positions: bool = False,
-    filter_threshold: float | None = None,
 ) -> dict:
     """Run trading simulation for all parameter combinations."""
     if min_holds is None:
@@ -469,7 +460,6 @@ def _run_evaluation(
     segment_boundaries = data["segment_boundaries"]
     half_spreads = data.get("half_spreads")
     z_half_spreads = data.get("z_half_spreads")
-    filter_probs = data.get("filter_probs")
 
     if multi_horizon:
         for cost in costs:
@@ -498,8 +488,6 @@ def _run_evaluation(
                             min_hold=mh,
                             segment_boundaries=segment_boundaries,
                             use_soft_positions=use_soft_positions,
-                            filter_probs=filter_probs,
-                            filter_threshold=filter_threshold,
                         )
                         metrics_list.append(tm)
                         horizons_found.append(h)
@@ -533,8 +521,6 @@ def _run_evaluation(
                         min_hold=mh,
                         segment_boundaries=segment_boundaries,
                         use_soft_positions=use_soft_positions,
-                        filter_probs=filter_probs,
-                        filter_threshold=filter_threshold,
                     )
                     results[cost_key][conf_key][mh_key] = _serializable(tm)
                     results[cost_key][conf_key][mh_key]["_metrics"] = tm
@@ -835,12 +821,6 @@ def main():
         help="Use continuous positions from logits instead of hard argmax (for DFL models)",
     )
     parser.add_argument(
-        "--filter-threshold",
-        type=float,
-        default=0.5,
-        help="CPT trade filter threshold (default: 0.5). Only used when filter_probs.npy exists.",
-    )
-    parser.add_argument(
         "--sweep-thresholds",
         action="store_true",
         help="Run a predefined grid search over min_hold and confidence_threshold",
@@ -849,15 +829,6 @@ def main():
         "--no-baselines",
         action="store_true",
         help="Skip reference baselines (Buy & Hold, SMA, Perfect Foresight)",
-    )
-    parser.add_argument(
-        "--confidence-mode",
-        type=str,
-        choices=["softmax", "learned"],
-        default="softmax",
-        help="Confidence source for hysteresis: 'softmax' (default, max softmax prob) "
-             "or 'learned' (CostLOB trained confidence). When 'learned', replaces "
-             "softmax probabilities with the model's confidence_h*.npy arrays.",
     )
     parser.add_argument(
         "--audit_seed",
@@ -915,30 +886,6 @@ def main():
         else:
             print("Warning: --soft-positions requested but no logits found, falling back to hard positions")
 
-    # CostLOB learned confidence: replace softmax probabilities with confidence scalars
-    # so the existing hysteresis and confidence_threshold logic uses them automatically.
-    if args.confidence_mode == "learned" and multi_horizon:
-        n_replaced = 0
-        for h, h_data in data["horizons"]:
-            if h_data.get("confidence") is not None:
-                # Expand scalar confidence to (N, 1) so max(axis=1) returns the confidence
-                # The hysteresis code uses max_conf = probabilities.max(axis=1)
-                conf = h_data["confidence"]
-                h_data["probabilities"] = conf.reshape(-1, 1)
-                n_replaced += 1
-        if n_replaced > 0:
-            print(f"CostLOB: Replaced softmax probabilities with learned confidence for {n_replaced} horizons")
-        else:
-            print("Warning: --confidence-mode=learned but no confidence_h*.npy found, using softmax")
-
-    filter_threshold = None
-    if data.get("filter_probs") is not None:
-        filter_threshold = args.filter_threshold
-        n_filter = len(data["filter_probs"])
-        trade_rate = (data["filter_probs"] > filter_threshold).mean()
-        print(f"CPT trade filter detected ({n_filter:,} probs, threshold={filter_threshold}, "
-              f"trade_rate={trade_rate:.1%})")
-
     # DPVN auto-detection: if dpvn_values.npy exists and run is single-horizon,
     # run the evaluation for both raw argmax and spread-aware argmax.
     is_dpvn = (not multi_horizon) and (data.get("dpvn_values") is not None)
@@ -987,7 +934,6 @@ def main():
         r = _run_evaluation(
             data_in, multi_horizon, costs, confidence_thresholds,
             min_holds=min_holds, use_soft_positions=args.soft_positions,
-            filter_threshold=filter_threshold,
         )
         _print_results(r, multi_horizon, costs, confidence_thresholds, min_holds=min_holds)
         return r

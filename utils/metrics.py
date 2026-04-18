@@ -339,8 +339,6 @@ def compute_trading_metrics(
     use_soft_positions: bool = False,
     hysteresis_entry: float = 0.0,
     hysteresis_exit: float = 0.0,
-    filter_probs: np.ndarray | None = None,
-    filter_threshold: float | None = None,
 ) -> dict[str, Any]:
     """Simulate a directional trading strategy and compute performance metrics.
 
@@ -450,23 +448,6 @@ def compute_trading_metrics(
                     current_pos = 0.0
             hyst_positions[t] = current_pos
         raw_positions = hyst_positions
-
-    # --- apply trade filter (CPT DP-supervised gate) ---
-    if filter_probs is not None and filter_threshold is not None:
-        filter_probs = _to_numpy(filter_probs).astype(np.float64, copy=False).ravel()[:n]
-        boundary_set_f = set()
-        if segment_boundaries is not None:
-            boundary_set_f = set(np.asarray(segment_boundaries, dtype=np.int64).tolist())
-        filtered_positions = np.empty(n, dtype=np.float64)
-        current_pos = 0.0
-        for t in range(n):
-            if t in boundary_set_f:
-                current_pos = 0.0
-            target = raw_positions[t]
-            if filter_probs[t] >= filter_threshold:
-                current_pos = target
-            filtered_positions[t] = current_pos
-        raw_positions = filtered_positions
 
     # --- apply min_hold persistence ---
     if min_hold > 0:

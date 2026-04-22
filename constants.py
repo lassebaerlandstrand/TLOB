@@ -18,6 +18,7 @@ class ModelType(Enum):
     BINCTABL = "BINCTABL"
     DEEPLOB = "DEEPLOB"
     DPVN = "DPVN"
+    DAVN = "DAVN"
 
 
 class SamplingType(Enum):

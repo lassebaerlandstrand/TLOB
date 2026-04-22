@@ -17,28 +17,33 @@ Both BTC and Battery are profitably tradeable. The key variable is the **spread/
 | Strategy | h10 PnL (z) | h10 ($) | h20 (z) | h50 (z) | h100 (z) | Trades (h10) |
 |----------|:-----------:|:-------:|:-------:|:-------:|:--------:|:------------:|
 | *DP optimal (ceiling)* | *41.63* | *+$65,612* | — | — | — | *12,830* |
-| Perfect Foresight | 35.11 | +$55,336 | 29.47 | 20.54 | 14.39 | 29,812 |
-| **TLOB CA-CE** | **24.75** | **+$39,006** | **25.81** | **26.19** | **25.36** | 76,569 |
-| **TLOB CE (default)** | **18.09** | **+$28,519** | **21.42** | **23.52** | **23.26** | 56,991 |
+| Perfect Label Follower (PF) | 35.11 | +$55,336 | 29.47 | 20.54 | 14.39 | 29,812 |
+| **DPVN (spread_argmax, 495k params)** | **30.93** | — | — | — | — | **68,842** |
+| **DPVN (spread_argmax, 88k params)** | **30.43** | **+$47,971** | — | — | **30.34** | **66,468** |
+| TLOB CA-CE | 24.75 | +$39,006 | 25.81 | 26.19 | 25.36 | 76,569 |
+| TLOB CE (default) | 18.09 | +$28,519 | 21.42 | 23.52 | 23.26 | 56,991 |
 | SMA-10 | 15.69 | +$24,738 | — | — | — | 28,738 |
 | Buy & Hold | 0.40 | +$638 | 0.40 | 0.40 | 0.40 | 2 |
 
-*DP optimal is horizon-independent — it finds the position sequence {-1, 0, +1} maximizing net PnL over actual returns and spreads via dynamic programming. PF uses per-horizon labels with optimal min_hold (h10: mh=0, h20: mh=5, h50: mh=30, h100: mh=50). Dollar amounts are notional (1-unit position size).*
+*DP optimal is horizon-independent — it finds the position sequence {-1, 0, +1} maximizing net PnL over actual returns and spreads via dynamic programming. PF follows the quantized horizon-h labels with optimal min_hold (h10: mh=0, h20: mh=5, h50: mh=30, h100: mh=50); it is the ceiling for a 3-class classifier at 100% label accuracy, not "true" omniscience. The gap between DP optimal and PF is the labeling loss — PnL that a 3-class horizon-h classifier cannot reach even with 100% label accuracy, because the "stat" class and fixed horizon discard magnitude and sub-horizon structure. Dollar amounts are notional (1-unit position size).*
 
 ### Battery Summary Table (6h truncated, 1 z-unit = €15.43)
 
 | Strategy | h10 PnL (z) | h10 (€) | h20 (z) | h50 (z) | h100 (z) | Trades (h10) |
 |----------|:-----------:|:---------:|:-------:|:-------:|:--------:|:------------:|
 | *DP optimal (ceiling)* | *376.41* | *+€5,808* | — | — | — | *3,769* |
-| Perfect Foresight | 234.26 | +€3,615 | 190.42 | 141.51 | 108.87 | 4,657 |
-| **DPVN (spread_argmax)** | **+65.52** | **+€1,011** | — | — | -14.93 | 2,510 |
+| Perfect Label Follower (PF) | 234.26 | +€3,615 | 190.42 | 141.51 | 108.87 | 4,657 |
+| **DPVN (spread_argmax, 1.1M params, all_features)** | **+106.33** | **+€1,641** | — | — | — | 3,841 |
+| **DPVN (spread_argmax, 501k params, all_features)** | **+98.20** | **+€1,515** | — | — | -8.98 | 4,044 |
+| **DPVN (spread_argmax, 495k params)** | **+72.20** | **+€1,114** | — | — | -10.76 | 2,510 |
+| **DPVN (spread_argmax, 88k params)** | **+69.79** | — | — | — | -14.49 | 2,139 |
 | TLOB CE (default) + best hyst | +18.89 | +€291 | +33.01 | +39.13 | +17.80 | 3,202 |
 | TLOB CE (default) + mh=20 | +0.93 | +€14 | -3.47 | -11.10 | -10.92 | 2,932 |
 | TLOB CE (default) | -114.10 | -€1,761 | -112.21 | -120.38 | -134.19 | 10,624 |
 | SMA-20 | -113.06 | -€1,744 | — | — | — | 5,281 |
 | Buy & Hold | -7.41 | -€114 | -7.41 | -7.41 | -7.41 | 96 |
 
-*PF uses per-horizon labels with optimal min_hold (h10: mh=0, h20: mh=0, h50: mh=30, h100: mh=100). Best hysteresis per horizon: h10=(0.8,0.45), h20=(0.7,0.4), h50=(0.6,0.35), h100=(0.5,0.3). Battery uses only the last 6h before gate closure per product. € amounts are notional (1 MW position size).*
+*PF follows the quantized horizon-h labels with optimal min_hold (h10: mh=0, h20: mh=0, h50: mh=30, h100: mh=100); it is the ceiling for a 3-class classifier at 100% label accuracy, not "true" omniscience. The gap between DP optimal and PF is the labeling loss — PnL that a 3-class horizon-h classifier cannot reach even with 100% label accuracy, because the "stat" class and fixed horizon discard magnitude and sub-horizon structure. Best hysteresis per horizon: h10=(0.8,0.45), h20=(0.7,0.4), h50=(0.6,0.35), h100=(0.5,0.3). Battery uses only the last 6h before gate closure per product. € amounts are notional (1 MW position size).*
 
 ---
 
@@ -200,13 +205,14 @@ TLOB CE over-trades on Battery (10.6K trades vs PF's 4.7K). We evaluated three i
 |----------|:-------:|:------:|:------:|
 | *DP optimal (ceiling)* | *41.63* | *12,830* | — |
 | *PF (no mh)* | *35.11* | *29,812* | *0.200* |
-| **TLOB CA-CE** | **24.75** | **76,569** | **0.138** |
+| **DPVN (spread_argmax)** | **30.43** | **66,468** | **0.174** |
+| TLOB CA-CE | 24.75 | 76,569 | 0.138 |
 | TLOB CE (default) | 18.09 | 56,991 | 0.117 |
 | TLOB CE (default) + hyst(0.5,0.3) | 17.07 | 45,775 | 0.109 |
 | SMA-10 | 15.69 | 28,738 | 0.091 |
 | TLOB CE (default) + mh=20 | 8.96 | 20,591 | 0.059 |
 
-**On BTC, no trade frequency control is needed.** TLOB CE (18.09z) is already profitable and beats SMA-10. min_hold and hysteresis both *hurt* — the spread is so low that high-frequency trading is profitable. TLOB CA-CE (24.75z) is the best model, achieving 59% of the DP optimal ceiling.
+**On BTC, DPVN with spread-aware argmax is the strongest model.** It achieves 30.43z — 87% of Perfect Foresight (35.11z) and 73% of the DP optimal ceiling (41.63z). The `spread_argmax` decision rule (prefer flat unless the directional confidence premium exceeds the local half-spread) reduces trades from 103,530 (plain argmax, 28.96z) to 66,468 while increasing PnL by +1.48z — a direct demonstration that even at BTC's low spread/vol ratio (0.11), trade-cost-aware decision-making pays off. min_hold and hysteresis still hurt TLOB on BTC — DPVN's gain comes from a smarter per-step rule, not from holding longer.
 
 ### Battery — TLOB Strategy Comparison (h10)
 

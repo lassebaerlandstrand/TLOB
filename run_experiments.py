@@ -7,6 +7,7 @@ multi-horizons - one joint run training all horizons simultaneously
 
 Examples:
   python run_experiments.py --mode multi-horizons --model tlob --dataset battery
+  python run_experiments.py --mode single --model dpvn --dataset battery --horizon 10
   python run_experiments.py --dataset battery --sampling-time 5s --rebuild-data
   python run_experiments.py --dataset battery --sampling-time 10s --dates 2021-01-11 2021-01-15
   python run_experiments.py --dataset battery --mode all-horizons --sampling-time 5s --dry-run
@@ -124,9 +125,7 @@ def main():
         default=HORIZONS,
         help=f"Horizons for 'all-horizons' mode (default: {HORIZONS}).",
     )
-    parser.add_argument(
-        "--model", type=str, default=MODEL, help=f"Model to use (default: {MODEL})"
-    )
+    parser.add_argument("--model", type=str, default=MODEL, help=f"Model to use (default: {MODEL})")
     parser.add_argument(
         "--dataset",
         type=str,
@@ -144,9 +143,7 @@ def main():
         action="store_true",
         help="Force data preprocessing on the first run.",
     )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Print commands without executing them."
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing them.")
     parser.add_argument(
         "--sampling-time",
         type=str,

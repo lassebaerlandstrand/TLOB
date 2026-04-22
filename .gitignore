@@ -301,3 +301,7 @@ ccswitch.sh
 
 # Specific files
 FUSELOB_EXPERIMENTS.md
+
+# Fleet state (runtime, per-machine)
+.fleet/
+latex/

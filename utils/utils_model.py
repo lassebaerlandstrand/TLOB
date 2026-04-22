@@ -1,10 +1,11 @@
 from models.binctabl import BiN_CTABL
+from models.davn import DAVN
 from models.deeplob import DeepLOB
+from models.dpvn import DPVN
 from models.mlplob import MLPLOB
 from models.original.mlplob import MLPLOB as MLPLOBOriginal
 from models.original.tlob import TLOB as TLOBOriginal
 from models.tlob import TLOB
-from models.dpvn import DPVN
 
 
 def pick_model(
@@ -80,6 +81,22 @@ def pick_model(
             use_fast_attention=use_fast_attention,
             num_horizons=num_horizons,
             dropout=dropout,
+            all_features=kwargs.get("all_features", False),
+        )
+    elif model_type == "DAVN":
+        return DAVN(
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            seq_size=seq_size,
+            num_features=num_features,
+            num_heads=num_heads,
+            dataset_type=dataset_type,
+            use_fast_attention=use_fast_attention,
+            num_horizons=num_horizons,
+            dropout=dropout,
+            all_features=kwargs.get("all_features", True),
+            davn_dual_axis=kwargs.get("davn_dual_axis", True),
+            davn_attn_pool=kwargs.get("davn_attn_pool", True),
         )
     else:
         raise ValueError("Model not found")

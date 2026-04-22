@@ -26,9 +26,17 @@ def hydra_app(config: Config):
     else:
         accelerator = "gpu"
 
+    # Keep model-level all_features aligned with dataset setting when available.
+    # Applied first so that an explicit per-model override (below) can still win.
+    if hasattr(config.dataset, "all_features"):
+        config.model.hyperparameters_fixed["all_features"] = config.dataset.all_features
+
     # Apply dataset-specific model overrides from config.
     # Supports per-model overrides: {"_default": {...}, "DPVN": {...}}
     # or flat dict for backward compatibility: {"hidden_dim": 50, ...}
+    # These take precedence over the dataset-level sync above so that model-
+    # specific choices (e.g. DPVN baseline with all_features=False on Battery)
+    # survive the generic sync.
     if hasattr(config.dataset, "model_overrides") and config.dataset.model_overrides:
         overrides = config.dataset.model_overrides
         model_name = config.model.type.value
@@ -41,10 +49,6 @@ def hydra_app(config: Config):
             resolved = dict(overrides)
         for key, value in resolved.items():
             config.model.hyperparameters_fixed[key] = value
-
-    # Keep model-level all_features aligned with dataset setting when available.
-    if hasattr(config.dataset, "all_features"):
-        config.model.hyperparameters_fixed["all_features"] = config.dataset.all_features
 
     if (
         config.dataset.type.value == "LOBSTER"

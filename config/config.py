@@ -166,7 +166,22 @@ class BTC(Dataset):
     batch_size: int = 128
     training_stocks: list = field(default_factory=lambda: ["BTC"])
     testing_stocks: list = field(default_factory=lambda: ["BTC"])
-    model_overrides: dict = field(default_factory=lambda: {"hidden_dim": 40})
+    model_overrides: dict = field(
+        default_factory=lambda: {
+            "_default": {"hidden_dim": 40},
+            "DPVN": {
+                "hidden_dim": 96,
+                "num_heads": 4,
+                "dropout": 0.1,
+                "all_features": True,
+            },
+            "DAVN": {
+                "hidden_dim": 64,
+                "num_heads": 4,
+                "dropout": 0.1,
+            },
+        }
+    )
 
 
 @dataclass
@@ -191,7 +206,8 @@ class BATTERY(Dataset):
     model_overrides: dict = field(
         default_factory=lambda: {
             "_default": {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1},
-            "DPVN": {"hidden_dim": 64, "num_heads": 4, "dropout": 0.1, "all_features": False},
+            "DPVN": {"hidden_dim": 64, "num_heads": 4, "dropout": 0.1, "all_features": True},
+            "DAVN": {"hidden_dim": 96, "num_heads": 4, "dropout": 0.1, "all_features": True},
         }
     )
 
@@ -233,6 +249,46 @@ class DPVNConfig(Model):
 
 
 @dataclass
+class DAVNConfig(Model):
+    """Dual-Axis Value Network.
+
+    Extends DPVN's DP-distilled value paradigm with (1) a fused input path
+    (LOB + aux engineered features + in-model spread features), (2) a dual-axis
+    transformer trunk alternating temporal and feature-axis attention, and
+    (3) an attention-pool readout over all timesteps. Single-horizon only;
+    same Huber loss on DP Q-targets as DPVN.
+    """
+
+    hyperparameters_fixed: dict = field(
+        default_factory=lambda: {
+            "num_layers": 2,  # 2 DualBlocks = 4 attention ops (2 temporal + 2 feature-axis)
+            "hidden_dim": 64,
+            "num_heads": 4,
+            "lr": 0.0003,
+            "seq_size": 128,
+            "all_features": True,
+            "weight_decay": 0.01,
+            "dropout": 0.0,
+            "dpvn_gamma": 1.0,
+            "dpvn_huber_delta": 1.0,
+            "dpvn_label_normalize": True,
+            "davn_dual_axis": True,
+            "davn_attn_pool": True,
+        }
+    )
+    hyperparameters_sweep: dict = field(
+        default_factory=lambda: {
+            "num_layers": [2],
+            "hidden_dim": [64, 96],
+            "num_heads": [4],
+            "lr": [0.0003],
+            "seq_size": [128],
+        }
+    )
+    type: ModelType = ModelType.DAVN
+
+
+@dataclass
 class Experiment:
     is_data_preprocessed: bool = False
     is_wandb: bool = True
@@ -251,11 +307,13 @@ class Experiment:
     torch_compile_backend: str = "inductor"
     precision: str = "bf16-mixed"
     use_fast_attention: bool = True
-    use_diff_features: bool = True
+    use_diff_features: bool = False
     use_class_weights: bool = True
     label_mode: str = "absolute_change"  # "absolute_change" | "percent_change"
     multi_horizon: bool = False
-    loss_type: str = "cross_entropy"  # "cross_entropy" | "cost_aware_ce" | "focal" | "focal_ordinal" | "dfl_proxy" | "dfl_trading"
+    loss_type: str = (
+        "cross_entropy"  # "cross_entropy" | "cost_aware_ce" | "focal" | "focal_ordinal" | "dfl_proxy" | "dfl_trading"
+    )
     focal_gamma: float = 2.0  # Unused if loss_type is not "focal" or "focal_ordinal"
     ordinal_smoothing: float = 0.15  # Unused if loss_type is not "focal_ordinal"
     trading_cost: float = 0.0  # Cost multiplier (x mean |Δmid|) for trading simulation
@@ -295,6 +353,7 @@ cs.store(group="model", name="tlob_original", node=TLOBOriginal)
 cs.store(group="model", name="binctabl", node=BiNCTABL)
 cs.store(group="model", name="deeplob", node=DeepLOB)
 cs.store(group="model", name="dpvn", node=DPVNConfig)
+cs.store(group="model", name="davn", node=DAVNConfig)
 cs.store(group="dataset", name="lobster", node=LOBSTER)
 cs.store(group="dataset", name="fi_2010", node=FI_2010)
 cs.store(group="dataset", name="btc", node=BTC)

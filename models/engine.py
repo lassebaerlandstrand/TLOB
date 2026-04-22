@@ -197,8 +197,12 @@ class Engine(LightningModule):
                     ordinal_smoothing=smoothing,
                 )
 
-        # --- DPVN: DP-distilled value network ---
-        self.is_dpvn = str(model_type).upper() == "DPVN"
+        # --- DPVN family (DPVN + DAVN): DP-distilled value networks ---
+        # Both share the same training paradigm (Huber on DP Q-targets), inference
+        # rule (spread_argmax), and output shape (B, 3) — only the model
+        # architecture differs. Kept under the `is_dpvn` flag name for minimal
+        # disruption of downstream checks.
+        self.is_dpvn = str(model_type).upper() in ("DPVN", "DAVN")
         if self.is_dpvn:
             self.dpvn_gamma = model_kwargs.get("dpvn_gamma", 1.0)
             self.dpvn_huber_delta = model_kwargs.get("dpvn_huber_delta", 1.0)
@@ -1096,6 +1100,25 @@ class Engine(LightningModule):
                 },
             }
 
+        if self.model_type == "DPVN":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=0.5,
+                patience=1,
+                threshold=0.005,
+                threshold_mode="rel",
+                min_lr=1e-6,
+            )
+            return {
+                "optimizer": self.optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "epoch",
+                    "monitor": "val_loss",
+                },
+            }
+
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.max_epochs, eta_min=1e-6)
         return {
             "optimizer": self.optimizer,
@@ -1145,7 +1168,8 @@ class Engine(LightningModule):
             self.trainer.save_checkpoint(path_ckpt)
 
             # ONNX export — single-head only (multi-horizon output is a list, not yet ONNX-friendly)
-            if not self.multi_horizon and self.model_type != "DPVN":
+            # Skip for DPVN family (DPVN/DAVN) — value-regression models that don't need ONNX.
+            if not self.multi_horizon and self.model_type not in ("DPVN", "DAVN"):
                 onnx_dir = os.path.join(cst.DIR_SAVED_MODEL, str(self.model_type), self.dir_ckpt, "onnx")
                 os.makedirs(onnx_dir, exist_ok=True)
                 onnx_filename = "val_loss=" + str(round(loss, 3)) + "_epoch=" + str(self.current_epoch) + ".onnx"

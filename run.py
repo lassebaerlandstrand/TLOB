@@ -253,7 +253,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
             val_input, val_labels = btc_load(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, horizon, seq_size)
             test_input, test_labels = btc_load(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, horizon, seq_size)
             train_q = val_q = test_q = None
-            if model_type == cst.ModelType.DPVN:
+            if model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN):
                 train_q = _compute_dpvn_q_targets(train_input, seq_size, horizon)
                 val_q = _compute_dpvn_q_targets(val_input, seq_size, horizon)
                 test_q = _compute_dpvn_q_targets(test_input, seq_size, horizon)
@@ -280,7 +280,13 @@ def train(config: Config, trainer: L.Trainer, run=None):
 
     elif dataset_type == "BATTERY":
         stock = config.dataset.training_stocks[0]
+        # Model-level flag controls input features passed to the model.
         all_features = config.model.hyperparameters_fixed["all_features"]
+        # Cache subdir tracks how the data was *preprocessed*, which is a
+        # dataset-level concern. Decoupling from the model flag lets e.g. DPVN
+        # (model all_features=False) read a `_msg` cache and downselect to LOB
+        # at load time, avoiding a cache rebuild per model variant.
+        cache_all_features = getattr(config.dataset, "all_features", all_features)
         base_dir = cst.DATA_DIR + f"/{stock}"
         _pm = getattr(config.dataset, "product_mode", "concat")
         product_mode = ProductMode(_pm) if isinstance(_pm, str) else _pm
@@ -288,7 +294,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
             config.dataset.sampling_time,
             config.dataset.dates,
             config.dataset.sampling_type.value,
-            all_features,
+            cache_all_features,
             getattr(config.dataset, "max_hours_before_delivery", 0.0),
         )
 
@@ -330,7 +336,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                         ds = MultiHorizonDataset(inp, lab, seq_size, dfl_data=prod_dfl)
                     else:
                         q_targets = None
-                        if model_type == cst.ModelType.DPVN:
+                        if model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN):
                             q_targets = _compute_dpvn_q_targets(inp, seq_size, horizon)
                             if q_targets is None:
                                 continue  # product too small for DP targets
@@ -438,7 +444,7 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     seq_size,
                 )
                 train_q = val_q = test_q = None
-                if model_type == cst.ModelType.DPVN:
+                if model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN):
                     train_q = _compute_dpvn_q_targets(train_input, seq_size, horizon)
                     val_q = _compute_dpvn_q_targets(val_input, seq_size, horizon)
                     test_q = _compute_dpvn_q_targets(test_input, seq_size, horizon)
@@ -1078,8 +1084,14 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dfl_cost_multiplier=config.experiment.dfl_cost_multiplier,
                 dfl_lambda_drawdown=config.experiment.dfl_lambda_drawdown,
             )
-        elif model_type == cst.ModelType.DPVN:
+        elif model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN):
             hp = config.model.hyperparameters_fixed
+            extra_model_kwargs = {
+                "all_features": hp.get("all_features", False),
+            }
+            if model_type == cst.ModelType.DAVN:
+                extra_model_kwargs["davn_dual_axis"] = hp.get("davn_dual_axis", True)
+                extra_model_kwargs["davn_attn_pool"] = hp.get("davn_attn_pool", True)
             model = Engine(
                 seq_size=seq_size,
                 horizon=horizon,
@@ -1107,9 +1119,41 @@ def train(config: Config, trainer: L.Trainer, run=None):
                 dpvn_gamma=hp.get("dpvn_gamma", 1.0),
                 dpvn_huber_delta=hp.get("dpvn_huber_delta", 1.0),
                 dpvn_label_normalize=hp.get("dpvn_label_normalize", True),
+                **extra_model_kwargs,
             )
 
     print("total number of parameters: ", sum(p.numel() for p in model.parameters()))
+
+    # Log per-timestep channel breakdown for DPVN-family models. num_features
+    # reported above reflects only the input tensor on disk; DPVN-F and DAVN
+    # additionally compute spread + engineered features in-model, so the
+    # effective channel count exceeds num_features.
+    if model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN):
+        inner = model.model
+        if hasattr(inner, "input_breakdown"):
+            breakdown = inner.input_breakdown()
+            parts = [
+                f"mode={breakdown['mode']}",
+                f"input_tensor_cols={breakdown['input_tensor_cols']}",
+                f"lob={breakdown['lob_cols']}",
+                f"aux_extra={breakdown['aux_extra_cols']}",
+                f"spread_in_model={breakdown['spread_in_model']}",
+                f"engineered_in_model={breakdown['engineered_in_model']}",
+                f"aux_proj_in={breakdown['aux_proj_in_dim']}",
+                f"effective_channels={breakdown['effective_channels']}",
+            ]
+            if breakdown["ignored_input_cols"]:
+                parts.append(f"ignored_input_cols={breakdown['ignored_input_cols']}")
+            print("Model input breakdown: " + ", ".join(parts), flush=True)
+            if run is not None:
+                # Strings go to config/metadata; numeric fields to run.log so
+                # they show up alongside other per-run scalars.
+                run.config.update({"input_mode": breakdown["mode"]}, allow_val_change=True)
+                for key, value in breakdown.items():
+                    if key == "mode":
+                        continue
+                    run.log({f"input/{key}": int(value)}, commit=False)
+
     train_dataloader, val_dataloader = (
         data_module.train_dataloader(),
         data_module.val_dataloader(),
@@ -1130,12 +1174,13 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     weights_only=False,
                 )
             else:
-                _load_class_weights = None if model_type == cst.ModelType.DPVN else class_weights
+                _is_value_net = model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN)
+                _load_class_weights = None if _is_value_net else class_weights
                 best_model = Engine.load_from_checkpoint(
                     best_model_path,
                     map_location=cst.DEVICE,
                     weights_only=False,
-                    use_torch_compile=config.experiment.use_torch_compile if model_type != cst.ModelType.DPVN else False,
+                    use_torch_compile=config.experiment.use_torch_compile if not _is_value_net else False,
                     torch_compile_mode=config.experiment.torch_compile_mode,
                     torch_compile_dynamic=config.experiment.torch_compile_dynamic,
                     torch_compile_backend=config.experiment.torch_compile_backend,

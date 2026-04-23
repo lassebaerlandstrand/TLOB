@@ -325,6 +325,27 @@ def plot_confusion_matrices(metrics_list, horizons, save_dir):
 _POSITION_MAP = np.array([1, 0, -1], dtype=np.float64)  # UP=+1, STAT=0, DOWN=-1
 
 
+def _infer_std_price(raw_hs: np.ndarray, z_hs: np.ndarray) -> float | None:
+    """Recover the price z-score normalization scale from raw/z-scored half-spread pairs.
+
+    Uses the elementwise ratio raw_hs / z_hs (same std_price for every row), taking
+    the median to be robust against occasional zero-spread / crossed-book rows.
+    Returns None if the two series are not aligned enough to recover a stable ratio.
+    """
+    raw_hs = np.asarray(raw_hs, dtype=np.float64).ravel()
+    z_hs = np.asarray(z_hs, dtype=np.float64).ravel()
+    n = min(len(raw_hs), len(z_hs))
+    if n == 0:
+        return None
+    valid = (np.abs(z_hs[:n]) > 1e-10) & np.isfinite(raw_hs[:n]) & np.isfinite(z_hs[:n])
+    if valid.sum() < 10:
+        return None
+    ratio = float(np.median(raw_hs[:n][valid] / z_hs[:n][valid]))
+    if ratio <= 1e-10 or not np.isfinite(ratio):
+        return None
+    return ratio
+
+
 def compute_trading_metrics(
     mid_prices: np.ndarray,
     predictions: np.ndarray,
@@ -332,6 +353,7 @@ def compute_trading_metrics(
     logits: np.ndarray | None = None,
     half_spreads: np.ndarray | None = None,
     z_half_spreads: np.ndarray | None = None,
+    transaction_costs: np.ndarray | None = None,
     cost_per_trade: float = 0.0,
     confidence_threshold: float = 0.0,
     min_hold: int = 0,
@@ -344,6 +366,7 @@ def compute_trading_metrics(
 
     Extends the Zhang et al. (2019) DeepLOB protocol with:
     - Spread-aware transaction costs using actual bid-ask spreads
+    - Exchange-fee transaction costs on top of spread (transaction_costs, raw units)
     - Soft (continuous) positions from logits for DFL models
     - Position persistence with minimum hold period
 
@@ -360,6 +383,10 @@ def compute_trading_metrics(
     z_half_spreads : (N,) z-score normalized half spread, optional.
         Computed from input tensor as (x[:,-1,0] - x[:,-1,2]) / 2.
         Used to estimate the price normalization scale factor.
+    transaction_costs : (N,) exchange fee per unit |Δpos| in raw price units, optional.
+        Layered on top of the half-spread cost. Requires raw half_spreads AND
+        z_half_spreads so the raw->z conversion is well-defined (shares std_price
+        with the spread path). Ignored in the z-only fallback branch.
     cost_per_trade : Legacy cost multiplier (x mean |Δmid|) per unit of
         position change. Only used when spread data is not available.
     confidence_threshold : Minimum max-class probability to act.
@@ -398,6 +425,8 @@ def compute_trading_metrics(
         half_spreads = _to_numpy(half_spreads).astype(np.float64, copy=False).ravel()[:n]
     if z_half_spreads is not None:
         z_half_spreads = _to_numpy(z_half_spreads).astype(np.float64, copy=False).ravel()[:n]
+    if transaction_costs is not None:
+        transaction_costs = _to_numpy(transaction_costs).astype(np.float64, copy=False).ravel()[:n]
 
     # --- build raw signal series ---
     if use_soft_positions and logits is not None:
@@ -494,67 +523,56 @@ def compute_trading_metrics(
     has_spread_costs = False
     std_price = None
     total_spread_cost = 0.0
+    total_tc_cost = 0.0
+
+    # Precompute |Δpos| vector aligned to per-step costs
+    first_change = np.abs(positions[0])
+    pos_changes = np.abs(np.diff(positions))  # (N-1,)
+
+    def _apply_per_unit(per_unit: np.ndarray) -> np.ndarray:
+        """Compose step costs from a per-unit-|Δpos| cost series of length n."""
+        out = np.empty(n - 1, dtype=np.float64)
+        out[0] = first_change * per_unit[0]
+        out[1:] = pos_changes[:-1] * per_unit[1:n - 1]
+        if n > 2:
+            out[-1] += pos_changes[-1] * per_unit[n - 1]
+        return out
 
     if half_spreads is not None and z_half_spreads is not None:
-        # Spread-aware costs: convert raw half_spread to z-score units
-        valid = np.abs(z_half_spreads) > 1e-10
-        if valid.sum() > 10:
-            std_price = float(np.median(half_spreads[valid] / z_half_spreads[valid]))
-        else:
-            std_price = None
+        std_price = _infer_std_price(half_spreads, z_half_spreads)
 
-        if std_price is not None and std_price > 1e-10:
+        if std_price is not None:
             has_spread_costs = True
             half_spreads_z = half_spreads / std_price
+            spread_costs = _apply_per_unit(half_spreads_z)
+            total_spread_cost = float(spread_costs.sum())
 
-            # Cost = |position_change| × half_spread_z at each step
-            first_change = np.abs(positions[0])
-            pos_changes = np.abs(np.diff(positions))  # (N-1,)
-
-            costs = np.empty(n - 1, dtype=np.float64)
-            costs[0] = first_change * half_spreads_z[0]
-            costs[1:] = pos_changes[:-1] * half_spreads_z[1:n - 1]
-            # Closing cost (going to positions[-1]=0)
-            if n > 2:
-                costs[-1] += pos_changes[-1] * half_spreads_z[n - 1]
-
-            total_spread_cost = float(costs.sum())
+            if transaction_costs is not None:
+                tc_z = transaction_costs / std_price
+                tc_costs = _apply_per_unit(tc_z)
+                total_tc_cost = float(tc_costs.sum())
+                costs = spread_costs + tc_costs
+            else:
+                costs = spread_costs
         else:
-            # Fallback: z_half_spreads only (no raw half_spreads or bad scale)
-            first_change = np.abs(positions[0])
-            pos_changes = np.abs(np.diff(positions))
-            z_hs = np.abs(z_half_spreads)
-
+            # Fallback: z_half_spreads only (no raw half_spreads or bad scale).
+            # We cannot convert raw-unit transaction_costs without std_price, so tc is ignored here.
             has_spread_costs = True
-            costs = np.empty(n - 1, dtype=np.float64)
-            costs[0] = first_change * z_hs[0]
-            costs[1:] = pos_changes[:-1] * z_hs[1:n - 1]
-            if n > 2:
-                costs[-1] += pos_changes[-1] * z_hs[n - 1]
+            z_hs = np.abs(z_half_spreads)
+            costs = _apply_per_unit(z_hs)
             total_spread_cost = float(costs.sum())
     elif z_half_spreads is not None:
-        # Only z-scored spread available (e.g., CE runs without DFL data)
+        # Only z-scored spread available (e.g., CE runs without DFL data).
+        # transaction_costs (raw units) requires std_price, so it is ignored in this branch.
         has_spread_costs = True
         z_hs = np.abs(z_half_spreads)
-        first_change = np.abs(positions[0])
-        pos_changes = np.abs(np.diff(positions))
-
-        costs = np.empty(n - 1, dtype=np.float64)
-        costs[0] = first_change * z_hs[0]
-        costs[1:] = pos_changes[:-1] * z_hs[1:n - 1]
-        if n > 2:
-            costs[-1] += pos_changes[-1] * z_hs[n - 1]
+        costs = _apply_per_unit(z_hs)
         total_spread_cost = float(costs.sum())
     elif cost_per_trade > 0.0:
         # Legacy cost model (proportional to mean |Δmid|)
         effective_cost = cost_per_trade * mean_abs_price_change
-        first_change = np.abs(positions[0])
-        pos_changes = np.abs(np.diff(positions))
-        costs = np.empty(n - 1, dtype=np.float64)
-        costs[0] = effective_cost * first_change
-        costs[1:] = effective_cost * pos_changes[:-1]
-        if n > 2:
-            costs[-1] += effective_cost * pos_changes[-1]
+        per_unit = np.full(n, effective_cost, dtype=np.float64)
+        costs = _apply_per_unit(per_unit)
     else:
         costs = np.zeros(n - 1, dtype=np.float64)
 
@@ -671,6 +689,7 @@ def compute_trading_metrics(
         "positions": positions,
         "has_spread_costs": has_spread_costs,
         "total_spread_cost": total_spread_cost,
+        "total_tc_cost": total_tc_cost,
         "std_price": std_price,
     }
 
@@ -679,20 +698,27 @@ def compute_dp_optimal(
     z_mid: np.ndarray,
     z_half_spread: np.ndarray,
     segment_boundaries: np.ndarray | None = None,
+    z_transaction_cost: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Find the position sequence {-1, 0, +1} that maximizes net PnL via DP.
 
     This is the true theoretical ceiling — no strategy can beat it.
     Runs in O(9N) time where N is the number of timesteps.
 
+    The per-unit cost at each step is ``z_half_spread[t] + z_transaction_cost[t]``,
+    both in z-score units. ``z_transaction_cost`` defaults to zeros (spread-only).
+
     Returns dict with total_pnl, n_trades, positions.
     """
 
-    def _dp_segment(mid: np.ndarray, hs: np.ndarray) -> tuple[float, int, np.ndarray]:
+    def _dp_segment(
+        mid: np.ndarray, hs: np.ndarray, ztc: np.ndarray
+    ) -> tuple[float, int, np.ndarray]:
         n = len(mid)
         if n < 2:
             return 0.0, 0, np.zeros(n)
         returns = np.diff(mid)  # length n-1
+        per_unit = hs + ztc  # (n,) — spread + fee in z-space
         pos_vals = np.array([-1.0, 0.0, 1.0])
         # dp[pos_idx] = best cumulative PnL ending at this step with this position
         dp = np.full(3, -np.inf)
@@ -704,7 +730,7 @@ def compute_dp_optimal(
                 best_val = -np.inf
                 best_prev = 0
                 for i in range(3):  # previous position
-                    cost = abs(pos_vals[j] - pos_vals[i]) * hs[t]
+                    cost = abs(pos_vals[j] - pos_vals[i]) * per_unit[t]
                     val = dp[i] + pos_vals[j] * returns[t] - cost
                     if val > best_val:
                         best_val = val
@@ -716,7 +742,7 @@ def compute_dp_optimal(
         best_end = -1
         best_pnl = -np.inf
         for j in range(3):
-            close_cost = abs(pos_vals[j]) * hs[-1]
+            close_cost = abs(pos_vals[j]) * per_unit[-1]
             val = dp[j] - close_cost
             if val > best_pnl:
                 best_pnl = val
@@ -735,6 +761,14 @@ def compute_dp_optimal(
 
     z_mid = np.asarray(z_mid, dtype=np.float64)
     z_half_spread = np.asarray(z_half_spread, dtype=np.float64)
+    if z_transaction_cost is None:
+        z_tc = np.zeros_like(z_half_spread)
+    else:
+        z_tc = np.asarray(z_transaction_cost, dtype=np.float64)
+        if len(z_tc) != len(z_half_spread):
+            raise ValueError(
+                f"z_transaction_cost length {len(z_tc)} must match z_half_spread length {len(z_half_spread)}"
+            )
 
     if segment_boundaries is not None:
         boundaries = np.asarray(segment_boundaries, dtype=np.int64)
@@ -753,7 +787,9 @@ def compute_dp_optimal(
     total_trades = 0
     all_positions = np.zeros(len(z_mid))
     for start, end in segments:
-        pnl, trades, pos = _dp_segment(z_mid[start:end], z_half_spread[start:end])
+        pnl, trades, pos = _dp_segment(
+            z_mid[start:end], z_half_spread[start:end], z_tc[start:end]
+        )
         total_pnl += pnl
         total_trades += trades
         all_positions[start:end] = pos

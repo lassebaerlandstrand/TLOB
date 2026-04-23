@@ -13,6 +13,30 @@ from utils.utils_data import (
 )
 
 
+def lobster_load_tc_columns(path: str):
+    """Return (raw_hs, raw_tc) aligned to the LOB input (length N, not mask-filtered).
+
+    Helper for the single-horizon DPVN/DAVN path that needs raw half-spread and
+    transaction cost alongside the z-scored LOB to compute tc-aware Q-targets.
+    Raises if the .npy lacks the expected 57-column layout.
+    """
+    arr = np.load(path)
+    ncols = arr.shape[1]
+    n_msg = cst.LEN_ORDER
+    n_lob = 40
+    n_labels = 5
+    expected = n_msg + n_lob + n_labels + 4 + 1 + 1  # 57
+    if ncols != expected:
+        raise RuntimeError(
+            f"{path}: {ncols}-col layout cannot supply transaction_cost; "
+            "run with --rebuild-data."
+        )
+    dfl_start = n_msg + n_lob + n_labels
+    raw_hs = arr[:, dfl_start + 4].astype(np.float32)
+    raw_tc = arr[:, dfl_start + 5].astype(np.float32)
+    return raw_hs, raw_tc
+
+
 def lobster_load(path, all_features, len_smooth, h, seq_size):
     set = np.load(path)
     if h == 10:
@@ -44,14 +68,15 @@ def lobster_load(path, all_features, len_smooth, h, seq_size):
 def lobster_load_multi(path, all_features, len_smooth, seq_size):
     """Load LOBSTER data returning all 4 horizon labels stacked.
 
-    Supports two .npy formats:
-      - 51 cols: [6 msg | 40 LOB | 5 labels(h10,h20,h50,h100,h200)]
-      - 56 cols: [6 msg | 40 LOB | 5 labels | 4 delta_mids | 1 half_spread]
+    Expected .npy format (post-DFL + post-transaction-cost):
+      - 57 cols: [6 msg | 40 LOB | 5 labels | 4 delta_mids | 1 half_spread | 1 tc_raw]
+
+    Older layouts (56 = no tc; 51 = labels-only) raise a rebuild prompt.
 
     Returns:
         input:    FloatTensor (N, num_features)
         labels:   LongTensor  (N_valid, 4)
-        dfl_data: tuple(delta_mids, half_spreads) or None
+        dfl_data: tuple(delta_mids, half_spreads, transaction_costs) or None
     """
     arr = np.load(path)
     ncols = arr.shape[1]
@@ -59,29 +84,26 @@ def lobster_load_multi(path, all_features, len_smooth, seq_size):
     n_lob = 40
     n_labels = 5  # h10,h20,h50,h100,h200
 
-    has_dfl = ncols == n_msg + n_lob + n_labels + 4 + 1  # 56
+    expected_ncols = n_msg + n_lob + n_labels + 4 + 1 + 1  # 57
 
-    if has_dfl:
-        lob_start = n_msg
+    if ncols == expected_ncols:
         label_start_col = n_msg + n_lob
         dfl_start = label_start_col + n_labels
         delta_mids_arr = arr[:, dfl_start:dfl_start + 4]
         half_spreads_arr = arr[:, dfl_start + 4].ravel()
+        tc_arr = arr[:, dfl_start + 5].ravel()
+    elif ncols in (51, 56):
+        raise RuntimeError(
+            f"{path}: {ncols}-col layout is stale (missing transaction_cost column). "
+            "Run with --rebuild-data to regenerate the .npy files."
+        )
     else:
-        delta_mids_arr = None
-        half_spreads_arr = None
+        raise RuntimeError(f"{path}: unexpected {ncols}-col layout (expected {expected_ncols}).")
 
     label_start = seq_size - len_smooth
-    # Labels: use h10(-5), h20(-4/-9), h50(-3/-8), h100(-2/-7) depending on format
-    if has_dfl:
-        label_cols = arr[:, n_msg + n_lob:n_msg + n_lob + n_labels]
-        # h10=col0, h20=col1, h50=col2, h100=col3 (skip h200=col4)
-        all_labels = label_cols[label_start:, :4]
-    else:
-        # Legacy: labels are last 5 cols
-        all_labels = np.stack(
-            [arr[label_start:, c] for c in [-5, -4, -3, -2]], axis=1
-        )
+    label_cols = arr[:, n_msg + n_lob:n_msg + n_lob + n_labels]
+    # h10=col0, h20=col1, h50=col2, h100=col3 (skip h200=col4)
+    all_labels = label_cols[label_start:, :4]
 
     finite_mask = np.all(np.isfinite(all_labels), axis=1)
     all_labels = all_labels[finite_mask].astype(np.int64)
@@ -96,14 +118,14 @@ def lobster_load_multi(path, all_features, len_smooth, seq_size):
     else:
         input = torch.from_numpy(arr[:, n_msg:n_msg + n_lob]).float()
 
-    dfl_data = None
-    if delta_mids_arr is not None:
-        dm = delta_mids_arr[label_start:][finite_mask]
-        hs = half_spreads_arr[label_start:][finite_mask]
-        dfl_data = (
-            torch.from_numpy(dm.astype(np.float32)),
-            torch.from_numpy(hs.astype(np.float32)),
-        )
+    dm = delta_mids_arr[label_start:][finite_mask]
+    hs = half_spreads_arr[label_start:][finite_mask]
+    tc = tc_arr[label_start:][finite_mask]
+    dfl_data = (
+        torch.from_numpy(dm.astype(np.float32)),
+        torch.from_numpy(hs.astype(np.float32)),
+        torch.from_numpy(tc.astype(np.float32)),
+    )
 
     return input, labels, dfl_data
 
@@ -119,6 +141,8 @@ class LOBSTERDataBuilder:
         sampling_time,
         sampling_quantity,
         label_mode: str = "absolute_change",
+        tc_abs: float = 0.0,
+        tc_bps: float = 0.0,
     ):
         self.n_lob_levels = cst.N_LOB_LEVELS
         self.data_dir = data_dir
@@ -130,6 +154,8 @@ class LOBSTERDataBuilder:
         self.sampling_time = sampling_time
         self.sampling_quantity = sampling_quantity
         self.label_mode = label_mode
+        self.tc_abs = float(tc_abs)
+        self.tc_bps = float(tc_bps)
 
     def prepare_save_datasets(self):
         for i in range(len(self.stocks)):
@@ -157,11 +183,23 @@ class LOBSTERDataBuilder:
             parts_val = [pd.DataFrame(self.val_input), pd.DataFrame(self.val_labels_horizons)]
             parts_test = [pd.DataFrame(self.test_input), pd.DataFrame(self.test_labels_horizons)]
 
-            # Append DFL columns (delta_mids + half_spread) if available
+            # Append DFL columns (delta_mids + half_spread + transaction_cost) if available
             if hasattr(self, "train_delta_mids"):
-                parts_train.extend([pd.DataFrame(self.train_delta_mids), pd.DataFrame(self.train_half_spreads, columns=["half_spread"])])
-                parts_val.extend([pd.DataFrame(self.val_delta_mids), pd.DataFrame(self.val_half_spreads, columns=["half_spread"])])
-                parts_test.extend([pd.DataFrame(self.test_delta_mids), pd.DataFrame(self.test_half_spreads, columns=["half_spread"])])
+                parts_train.extend([
+                    pd.DataFrame(self.train_delta_mids),
+                    pd.DataFrame(self.train_half_spreads, columns=["half_spread"]),
+                    pd.DataFrame(self.train_transaction_costs, columns=["transaction_cost"]),
+                ])
+                parts_val.extend([
+                    pd.DataFrame(self.val_delta_mids),
+                    pd.DataFrame(self.val_half_spreads, columns=["half_spread"]),
+                    pd.DataFrame(self.val_transaction_costs, columns=["transaction_cost"]),
+                ])
+                parts_test.extend([
+                    pd.DataFrame(self.test_delta_mids),
+                    pd.DataFrame(self.test_half_spreads, columns=["half_spread"]),
+                    pd.DataFrame(self.test_transaction_costs, columns=["transaction_cost"]),
+                ])
 
             self.train_set = pd.concat(parts_train, axis=1).values
             self.val_set = pd.concat(parts_val, axis=1).values
@@ -231,6 +269,16 @@ class LOBSTERDataBuilder:
         self.train_half_spreads = (train_input[:, 0] - train_input[:, 2]).astype(np.float32) / 2
         self.val_half_spreads = (val_input[:, 0] - val_input[:, 2]).astype(np.float32) / 2
         self.test_half_spreads = (test_input[:, 0] - test_input[:, 2]).astype(np.float32) / 2
+
+        # Transaction cost per unit |Δpos| in raw USD:
+        #   tc_raw[t] = tc_abs + (tc_bps / 10_000) * |mid_raw[t]|
+        def _tc_raw(raw_lob: np.ndarray) -> np.ndarray:
+            mid = (raw_lob[:, 0] + raw_lob[:, 2]) / 2.0
+            return (self.tc_abs + (self.tc_bps / 10_000.0) * np.abs(mid)).astype(np.float32)
+
+        self.train_transaction_costs = _tc_raw(train_input)
+        self.val_transaction_costs = _tc_raw(val_input)
+        self.test_transaction_costs = _tc_raw(test_input)
 
         train_deltas, val_deltas, test_deltas = [], [], []
 

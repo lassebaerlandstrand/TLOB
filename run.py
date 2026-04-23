@@ -17,8 +17,13 @@ from config.config import Config
 from constants import ProductMode, SamplingType
 from models.engine import Engine
 from models.original.engine import Engine as OriginalEngine
-from preprocessing.battery import battery_cache_subdir, battery_load, battery_load_multi
-from preprocessing.btc import btc_load, btc_load_multi
+from preprocessing.battery import (
+    battery_cache_subdir,
+    battery_load,
+    battery_load_multi,
+    battery_load_tc_columns,
+)
+from preprocessing.btc import btc_load, btc_load_multi, btc_load_tc_columns
 from preprocessing.dataset import DataModule, Dataset, MultiHorizonDataset
 from preprocessing.fi_2010 import fi_2010_load, fi_2010_load_multi
 from preprocessing.lobster import lobster_load, lobster_load_multi
@@ -39,18 +44,43 @@ def _fmt_float_space(value: float, decimals: int = 1) -> str:
 _N_MSG_FEATURES = 18
 
 
-def _compute_dpvn_q_targets(inp: torch.Tensor, seq_size: int, horizon: int, gamma: float = 1.0):
+def _compute_dpvn_q_targets(
+    inp: torch.Tensor,
+    seq_size: int,
+    horizon: int,
+    gamma: float = 1.0,
+    raw_hs: np.ndarray | None = None,
+    raw_tc: np.ndarray | None = None,
+):
     """DP-distilled Q targets for DPVN, aligned to Dataset indexing.
 
     Returns (N_valid, 3) float32 array where row i corresponds to the window
     [i : i + seq_size] whose last step is at raw time (i + seq_size - 1).
+
+    When both ``raw_hs`` and ``raw_tc`` are provided (length N, raw price units),
+    the per-unit cost used for Q-target generation becomes ``z_hs + z_tc`` where
+    ``z_tc = raw_tc / std_price`` and ``std_price`` is inferred from the
+    ``raw_hs`` / ``z_hs`` ratio. Omit either argument to fall back to spread-only.
     """
     from models.dp_targets import compute_q_targets, extract_z_mid_z_half_spread
+    from utils.metrics import _infer_std_price
 
     z_mid, z_hs = extract_z_mid_z_half_spread(inp.numpy() if isinstance(inp, torch.Tensor) else inp)
     if len(z_mid) < seq_size + horizon:
         return None
-    q_raw = compute_q_targets(z_mid, z_hs, horizon=horizon, gamma=gamma)
+
+    z_tc = None
+    if raw_hs is not None and raw_tc is not None:
+        raw_hs = np.asarray(raw_hs).astype(np.float64).ravel()
+        raw_tc = np.asarray(raw_tc).astype(np.float64).ravel()
+        if len(raw_hs) == len(z_mid) and len(raw_tc) == len(z_mid):
+            std_price = _infer_std_price(raw_hs, z_hs)
+            if std_price is not None:
+                z_tc = raw_tc / std_price
+
+    q_raw = compute_q_targets(
+        z_mid, z_hs, horizon=horizon, gamma=gamma, z_transaction_cost=z_tc
+    )
     return q_raw[seq_size - 1:]
 
 
@@ -253,16 +283,24 @@ def train(config: Config, trainer: L.Trainer, run=None):
             val_input, val_labels = btc_load(cst.DATA_DIR + "/BTC/val.npy", cst.LEN_SMOOTH, horizon, seq_size)
             test_input, test_labels = btc_load(cst.DATA_DIR + "/BTC/test.npy", cst.LEN_SMOOTH, horizon, seq_size)
             train_q = val_q = test_q = None
+            train_dfl = val_dfl = test_dfl = None
             if model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN):
-                train_q = _compute_dpvn_q_targets(train_input, seq_size, horizon)
-                val_q = _compute_dpvn_q_targets(val_input, seq_size, horizon)
-                test_q = _compute_dpvn_q_targets(test_input, seq_size, horizon)
+                train_hs, train_tc = btc_load_tc_columns(cst.DATA_DIR + "/BTC/train.npy")
+                val_hs, val_tc = btc_load_tc_columns(cst.DATA_DIR + "/BTC/val.npy")
+                test_hs, test_tc = btc_load_tc_columns(cst.DATA_DIR + "/BTC/test.npy")
+                train_q = _compute_dpvn_q_targets(train_input, seq_size, horizon, raw_hs=train_hs, raw_tc=train_tc)
+                val_q = _compute_dpvn_q_targets(val_input, seq_size, horizon, raw_hs=val_hs, raw_tc=val_tc)
+                test_q = _compute_dpvn_q_targets(test_input, seq_size, horizon, raw_hs=test_hs, raw_tc=test_tc)
+                # Align per-sample cost arrays to Dataset indexing (last-step of each window).
+                train_dfl = (train_hs[seq_size - 1:], train_tc[seq_size - 1:])
+                val_dfl = (val_hs[seq_size - 1:], val_tc[seq_size - 1:])
+                test_dfl = (test_hs[seq_size - 1:], test_tc[seq_size - 1:])
             train_input = maybe_add_diff_features(train_input)
             val_input = maybe_add_diff_features(val_input)
             test_input = maybe_add_diff_features(test_input)
-            train_set = Dataset(train_input, train_labels, seq_size, q_targets=train_q)
-            val_set = Dataset(val_input, val_labels, seq_size, q_targets=val_q)
-            test_set = Dataset(test_input, test_labels, seq_size, q_targets=test_q)
+            train_set = Dataset(train_input, train_labels, seq_size, q_targets=train_q, dfl_data=train_dfl)
+            val_set = Dataset(val_input, val_labels, seq_size, q_targets=val_q, dfl_data=val_dfl)
+            test_set = Dataset(test_input, test_labels, seq_size, q_targets=test_q, dfl_data=test_dfl)
         if config.experiment.is_debug:
             train_set.length = 1000
             val_set.length = 1000
@@ -336,11 +374,16 @@ def train(config: Config, trainer: L.Trainer, run=None):
                         ds = MultiHorizonDataset(inp, lab, seq_size, dfl_data=prod_dfl)
                     else:
                         q_targets = None
+                        ds_dfl = None
                         if model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN):
-                            q_targets = _compute_dpvn_q_targets(inp, seq_size, horizon)
+                            prod_hs, prod_tc = battery_load_tc_columns(path)
+                            q_targets = _compute_dpvn_q_targets(
+                                inp, seq_size, horizon, raw_hs=prod_hs, raw_tc=prod_tc
+                            )
                             if q_targets is None:
                                 continue  # product too small for DP targets
-                        ds = Dataset(inp, lab, seq_size, q_targets=q_targets)
+                            ds_dfl = (prod_hs[seq_size - 1:], prod_tc[seq_size - 1:])
+                        ds = Dataset(inp, lab, seq_size, q_targets=q_targets, dfl_data=ds_dfl)
 
                     if split == "train":
                         train_datasets.append(ds)
@@ -444,16 +487,23 @@ def train(config: Config, trainer: L.Trainer, run=None):
                     seq_size,
                 )
                 train_q = val_q = test_q = None
+                train_dfl = val_dfl = test_dfl = None
                 if model_type in (cst.ModelType.DPVN, cst.ModelType.DAVN):
-                    train_q = _compute_dpvn_q_targets(train_input, seq_size, horizon)
-                    val_q = _compute_dpvn_q_targets(val_input, seq_size, horizon)
-                    test_q = _compute_dpvn_q_targets(test_input, seq_size, horizon)
+                    train_hs, train_tc = battery_load_tc_columns(concat_dir + "/train.npy")
+                    val_hs, val_tc = battery_load_tc_columns(concat_dir + "/val.npy")
+                    test_hs, test_tc = battery_load_tc_columns(concat_dir + "/test.npy")
+                    train_q = _compute_dpvn_q_targets(train_input, seq_size, horizon, raw_hs=train_hs, raw_tc=train_tc)
+                    val_q = _compute_dpvn_q_targets(val_input, seq_size, horizon, raw_hs=val_hs, raw_tc=val_tc)
+                    test_q = _compute_dpvn_q_targets(test_input, seq_size, horizon, raw_hs=test_hs, raw_tc=test_tc)
+                    train_dfl = (train_hs[seq_size - 1:], train_tc[seq_size - 1:])
+                    val_dfl = (val_hs[seq_size - 1:], val_tc[seq_size - 1:])
+                    test_dfl = (test_hs[seq_size - 1:], test_tc[seq_size - 1:])
                 train_input = maybe_add_diff_features(train_input)
                 val_input = maybe_add_diff_features(val_input)
                 test_input = maybe_add_diff_features(test_input)
-                train_set = Dataset(train_input, train_labels, seq_size, q_targets=train_q)
-                val_set = Dataset(val_input, val_labels, seq_size, q_targets=val_q)
-                test_set = Dataset(test_input, test_labels, seq_size, q_targets=test_q)
+                train_set = Dataset(train_input, train_labels, seq_size, q_targets=train_q, dfl_data=train_dfl)
+                val_set = Dataset(val_input, val_labels, seq_size, q_targets=val_q, dfl_data=val_dfl)
+                test_set = Dataset(test_input, test_labels, seq_size, q_targets=test_q, dfl_data=test_dfl)
             if config.experiment.is_debug:
                 train_set.length = 1000
                 val_set.length = 1000

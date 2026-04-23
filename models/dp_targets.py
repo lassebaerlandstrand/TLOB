@@ -28,6 +28,7 @@ def compute_q_targets(
     gamma: float = 1.0,
     segment_boundaries: np.ndarray | None = None,
     mean_center: bool = True,
+    z_transaction_cost: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return (N, 3) array of Q targets for actions {-1, 0, +1}.
 
@@ -38,11 +39,20 @@ def compute_q_targets(
     The argmax decision rule is invariant under this shift, but the action-
     dependent signal dominates the target (SNR gain ~100x on LOB data where
     tail values vastly exceed h-step return magnitudes).
+
+    ``z_transaction_cost`` (optional, length N) adds an exchange-fee term to the
+    per-unit entry cost: ``entry_cost = |a - pos_prev| * (hs + z_tc)``. Defaults
+    to zeros (spread-only cost, original behavior).
     """
     z_mid = np.asarray(z_mid, dtype=np.float64)
     z_half_spread = np.asarray(np.abs(z_half_spread), dtype=np.float64)
     n = len(z_mid)
     assert len(z_half_spread) == n, "z_mid and z_half_spread must be same length"
+    if z_transaction_cost is None:
+        z_tc = np.zeros(n, dtype=np.float64)
+    else:
+        z_tc = np.asarray(np.abs(z_transaction_cost), dtype=np.float64)
+        assert len(z_tc) == n, "z_transaction_cost must be same length as z_mid"
 
     if segment_boundaries is not None:
         boundaries = np.asarray(segment_boundaries, dtype=np.int64)
@@ -66,8 +76,10 @@ def compute_q_targets(
             continue
         mid = z_mid[start:end]
         hs = z_half_spread[start:end]
+        ztc = z_tc[start:end]
+        per_unit = hs + ztc  # spread + fee, in z-space
 
-        dp_result = compute_dp_optimal(mid, hs)
+        dp_result = compute_dp_optimal(mid, hs, z_transaction_cost=ztc)
         pos_DP = dp_result["positions"]  # length seg_len, pos_DP[-1] = 0 (force close)
 
         pos_prev = np.zeros(seg_len, dtype=np.float64)
@@ -77,8 +89,8 @@ def compute_q_targets(
         gross_DP[:-1] = pos_DP[:-1] * np.diff(mid)
 
         cost_DP = np.zeros(seg_len, dtype=np.float64)
-        cost_DP[1:] = np.abs(np.diff(pos_DP)) * hs[1:]
-        cost_DP[0] = np.abs(pos_DP[0]) * hs[0]
+        cost_DP[1:] = np.abs(np.diff(pos_DP)) * per_unit[1:]
+        cost_DP[0] = np.abs(pos_DP[0]) * per_unit[0]
 
         net_DP = gross_DP - cost_DP
         tail_V_DP = np.zeros(seg_len + 1, dtype=np.float64)
@@ -89,7 +101,7 @@ def compute_q_targets(
             t = np.arange(seg_len, dtype=np.int64)
             future_idx = np.minimum(t + horizon, seg_len - 1)
             r_t = a * (mid[future_idx] - mid)
-            entry_cost = np.abs(a - pos_prev) * hs
+            entry_cost = np.abs(a - pos_prev) * per_unit
             tail = gamma * tail_V_DP[future_idx]
             valid_tail = (t + horizon) <= (seg_len - 1)
             tail = np.where(valid_tail, tail, 0.0)

@@ -50,6 +50,9 @@ def hydra_app(config: Config):
         for key, value in resolved.items():
             config.model.hyperparameters_fixed[key] = value
 
+    tc_abs = float(getattr(config.dataset, "tc_abs", 0.0))
+    tc_bps = float(getattr(config.dataset, "tc_bps", 0.0))
+
     if (
         config.dataset.type.value == "LOBSTER"
         and not config.experiment.is_data_preprocessed
@@ -64,6 +67,8 @@ def hydra_app(config: Config):
             sampling_time=config.dataset.sampling_time,
             sampling_quantity=config.dataset.sampling_quantity,
             label_mode=config.experiment.label_mode,
+            tc_abs=tc_abs,
+            tc_bps=tc_bps,
         )
         data_builder.prepare_save_datasets()
 
@@ -71,6 +76,14 @@ def hydra_app(config: Config):
         config.dataset.type.value == "FI_2010"
         and not config.experiment.is_data_preprocessed
     ):
+        # FI-2010 is pre-z-scored and has no raw mid to convert a bps fee or
+        # absolute-unit fee to z-space. Silently allowing tc values here would
+        # produce meaningless numbers in downstream DP/loss/eval paths.
+        if tc_abs != 0.0 or tc_bps != 0.0:
+            raise ValueError(
+                "FI-2010 is pre-z-scored: transaction costs in raw price units are not "
+                f"meaningful (got tc_abs={tc_abs}, tc_bps={tc_bps}). Set both to 0."
+            )
         try:
             # take the .zip files name in data/FI_2010
             dir = cst.DATA_DIR + "/FI_2010/"
@@ -95,6 +108,8 @@ def hydra_app(config: Config):
             sampling_time=config.dataset.sampling_time,
             sampling_quantity=config.dataset.sampling_quantity,
             label_mode=config.experiment.label_mode,
+            tc_abs=tc_abs,
+            tc_bps=tc_bps,
         )
         data_builder.prepare_save_datasets()
 
@@ -120,6 +135,8 @@ def hydra_app(config: Config):
             extract_events=getattr(config.dataset, "extract_events", False),
             max_events_per_window=getattr(config.dataset, "max_events_per_window", 64),
             max_hours_before_delivery=getattr(config.dataset, "max_hours_before_delivery", 0.0),
+            tc_abs=tc_abs,
+            tc_bps=tc_bps,
         )
         data_builder.prepare_save_datasets()
 

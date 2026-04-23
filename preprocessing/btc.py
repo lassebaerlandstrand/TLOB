@@ -10,12 +10,31 @@ from constants import SamplingType
 from utils.utils_data import labeling, z_score_orderbook
 
 
+def btc_load_tc_columns(path: str):
+    """Return (raw_hs, raw_tc) aligned to the LOB input (length N, not mask-filtered).
+
+    Helper for the single-horizon DPVN/DAVN path that needs raw half-spread and
+    transaction cost alongside the z-scored LOB to compute tc-aware Q-targets.
+    Raises if the .npy lacks the expected 50-column layout.
+    """
+    arr = np.load(path)
+    if arr.shape[1] != 50:
+        raise RuntimeError(
+            f"{path}: {arr.shape[1]}-col layout cannot supply transaction_cost; "
+            "run with --rebuild-data."
+        )
+    n_lob = cst.N_LOB_LEVELS * 4
+    raw_hs = arr[:, n_lob + 8].astype(np.float32)
+    raw_tc = arr[:, n_lob + 9].astype(np.float32)
+    return raw_hs, raw_tc
+
+
 def btc_load(path, len_smooth, h, seq_size):
     arr = np.load(path)
     n_lob = cst.N_LOB_LEVELS * 4  # 40
     # Labels always occupy the 4 columns immediately after the LOB block,
     # in canonical order [h10, h20, h50, h100]. Older .npy files were 44 cols
-    # (labels at the tail); newer 49-col files append delta_mids + half_spread,
+    # (labels at the tail); newer files append delta_mids + half_spread (+ tc),
     # which pushed the labels away from the tail and broke -tmp indexing.
     horizon_to_idx = {10: 0, 20: 1, 50: 2, 100: 3}
     label_col = n_lob + horizon_to_idx[h]
@@ -29,31 +48,36 @@ def btc_load(path, len_smooth, h, seq_size):
 def btc_load_multi(path, len_smooth, seq_size):
     """Load BTC data returning all 4 horizon labels stacked.
 
-    Supports two .npy formats:
-      - 44 cols: [40 LOB | 4 labels]
-      - 49 cols: [40 LOB | 4 labels | 4 delta_mids | 1 half_spread]
+    Expected .npy format (post-DFL + post-transaction-cost):
+      - 50 cols: [40 LOB | 4 labels | 4 delta_mids | 1 half_spread | 1 tc_raw]
+
+    Older layouts (49 cols = no tc; 44 cols = legacy labels-only) raise a
+    rebuild prompt so training never silently runs with stale cost inputs.
 
     Returns:
         input:    FloatTensor (N, 40)
         labels:   LongTensor  (N_valid, 4)
-        dfl_data: tuple(delta_mids FloatTensor (N_valid, 4), half_spreads FloatTensor (N_valid,)) or None
+        dfl_data: tuple(delta_mids (N_valid, 4), half_spreads (N_valid,),
+                  transaction_costs (N_valid,)) or None
     """
     arr = np.load(path)
     ncols = arr.shape[1]
     n_lob = cst.N_LOB_LEVELS * 4  # 40
 
-    if ncols == 49:
-        # [40 LOB | 4 labels | 4 delta_mids | 1 half_spread]
+    if ncols == 50:
+        # [40 LOB | 4 labels | 4 delta_mids | 1 half_spread | 1 tc_raw]
         lob = arr[:, :n_lob]
         label_arr = arr[:, n_lob:n_lob + 4]
         delta_mids_arr = arr[:, n_lob + 4:n_lob + 8]
         half_spreads_arr = arr[:, n_lob + 8].ravel()
+        tc_arr = arr[:, n_lob + 9].ravel()
+    elif ncols == 49 or ncols == 44:
+        raise RuntimeError(
+            f"{path}: {ncols}-col layout is stale (missing transaction_cost column). "
+            "Run with --rebuild-data to regenerate the .npy files."
+        )
     else:
-        # [40 LOB | 4 labels] (legacy 44-col format)
-        lob = arr[:, :n_lob]
-        label_arr = arr[:, -4:]
-        delta_mids_arr = None
-        half_spreads_arr = None
+        raise RuntimeError(f"{path}: unexpected {ncols}-col layout (expected 50).")
 
     label_start = seq_size - len_smooth
     all_labels = label_arr[label_start:]
@@ -62,14 +86,14 @@ def btc_load_multi(path, len_smooth, seq_size):
     labels = torch.from_numpy(all_labels).long()
     input = torch.from_numpy(lob).float()
 
-    dfl_data = None
-    if delta_mids_arr is not None:
-        dm = delta_mids_arr[label_start:][finite_mask]
-        hs = half_spreads_arr[label_start:][finite_mask]
-        dfl_data = (
-            torch.from_numpy(dm.astype(np.float32)),
-            torch.from_numpy(hs.astype(np.float32)),
-        )
+    dm = delta_mids_arr[label_start:][finite_mask]
+    hs = half_spreads_arr[label_start:][finite_mask]
+    tc = tc_arr[label_start:][finite_mask]
+    dfl_data = (
+        torch.from_numpy(dm.astype(np.float32)),
+        torch.from_numpy(hs.astype(np.float32)),
+        torch.from_numpy(tc.astype(np.float32)),
+    )
 
     return input, labels, dfl_data
 
@@ -84,6 +108,8 @@ class BTCDataBuilder:
         sampling_time,
         sampling_quantity,
         label_mode: str = "absolute_change",
+        tc_abs: float = 0.0,
+        tc_bps: float = 0.0,
     ):
         self.n_lob_levels = cst.N_LOB_LEVELS
         self.data_dir = data_dir
@@ -94,6 +120,8 @@ class BTCDataBuilder:
         self.sampling_time = sampling_time
         self.sampling_quantity = sampling_quantity
         self.label_mode = label_mode
+        self.tc_abs = float(tc_abs)
+        self.tc_bps = float(tc_bps)
 
     def prepare_save_datasets(self):
 
@@ -257,11 +285,25 @@ class BTCDataBuilder:
         parts_val = [val_input, self.val_labels_horizons.values]
         parts_test = [test_input, self.test_labels_horizons.values]
 
-        # Append DFL columns (delta_mids + half_spread) if available
+        # Append DFL columns (delta_mids + half_spread + transaction_cost) if available.
+        # transaction_cost is in raw USDT per unit |Δpos|:
+        #   tc_raw[t] = tc_abs + (tc_bps / 10_000) * |mid_raw[t]|
         if hasattr(self, "train_delta_mids"):
-            parts_train.extend([self.train_delta_mids, self.train_half_spreads.reshape(-1, 1)])
-            parts_val.extend([self.val_delta_mids, self.val_half_spreads.reshape(-1, 1)])
-            parts_test.extend([self.test_delta_mids, self.test_half_spreads.reshape(-1, 1)])
+            parts_train.extend([
+                self.train_delta_mids,
+                self.train_half_spreads.reshape(-1, 1),
+                self.train_transaction_costs.reshape(-1, 1),
+            ])
+            parts_val.extend([
+                self.val_delta_mids,
+                self.val_half_spreads.reshape(-1, 1),
+                self.val_transaction_costs.reshape(-1, 1),
+            ])
+            parts_test.extend([
+                self.test_delta_mids,
+                self.test_half_spreads.reshape(-1, 1),
+                self.test_transaction_costs.reshape(-1, 1),
+            ])
 
         self.train_set = np.concatenate(parts_train, axis=1)
         self.val_set = np.concatenate(parts_val, axis=1)
@@ -327,6 +369,17 @@ class BTCDataBuilder:
         self.train_half_spreads = (train_input[:, 0] - train_input[:, 2]).astype(np.float32) / 2
         self.val_half_spreads = (val_input[:, 0] - val_input[:, 2]).astype(np.float32) / 2
         self.test_half_spreads = (test_input[:, 0] - test_input[:, 2]).astype(np.float32) / 2
+
+        # Transaction cost per unit |Δpos| in raw USDT:
+        #   tc_raw[t] = tc_abs + (tc_bps / 10_000) * |mid_raw[t]|
+        # For BTC the bps term dominates (e.g. 4 bps × $20k ≈ $8/unit) vs half-spread ≈ $0.05.
+        def _tc_raw(raw_lob: np.ndarray) -> np.ndarray:
+            mid = (raw_lob[:, 0] + raw_lob[:, 2]) / 2.0
+            return (self.tc_abs + (self.tc_bps / 10_000.0) * np.abs(mid)).astype(np.float32)
+
+        self.train_transaction_costs = _tc_raw(train_input)
+        self.val_transaction_costs = _tc_raw(val_input)
+        self.test_transaction_costs = _tc_raw(test_input)
 
         train_deltas, val_deltas, test_deltas = [], [], []
 

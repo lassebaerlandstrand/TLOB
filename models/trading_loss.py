@@ -138,17 +138,21 @@ class DFLTradingLoss(nn.Module):
         delta_mid: torch.Tensor,
         half_spread: torch.Tensor,
         prev_positions: torch.Tensor | None = None,
+        transaction_cost: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict]:
         """
         Args:
             logits: (B, 3) raw model output
             delta_mid: (B,) raw mid-price change at horizon h
-            half_spread: (B,) half bid-ask spread = (ask1 - bid1) / 2
+            half_spread: (B,) half bid-ask spread = (ask1 - bid1) / 2 (raw units)
             prev_positions: (B,) previous soft positions
+            transaction_cost: (B,) exchange fee per unit |Δpos| in raw price units
+                (e.g. 5 bps × mid for BTC, 0.09 EUR/MWh for Battery).
+                Layered on top of half_spread. Defaults to zero.
 
         Returns:
             loss: scalar, differentiable through logits
-            info: dict with positions, returns, costs for logging
+            info: dict with positions, returns, spread_cost, tc_cost, net_return
         """
         if self.training:
             one_hot = F.gumbel_softmax(logits, tau=self.temperature, hard=True, dim=1)
@@ -161,13 +165,19 @@ class DFLTradingLoss(nn.Module):
         # Gross return from position
         gross_return = position * delta_mid  # (B,)
 
-        # Transaction cost (spread traversal)
+        # Transaction cost: spread traversal + exchange fee
         if prev_positions is None:
             prev_positions = torch.zeros_like(position)
         # Smooth absolute value for better gradients
         pos_change = position - prev_positions
         smooth_abs_change = torch.sqrt(pos_change ** 2 + 1e-8)
-        cost = self.cost_multiplier * smooth_abs_change * half_spread.abs()
+        if transaction_cost is None:
+            tc = torch.zeros_like(half_spread)
+        else:
+            tc = transaction_cost.abs()
+        spread_cost = self.cost_multiplier * smooth_abs_change * half_spread.abs()
+        tc_cost = self.cost_multiplier * smooth_abs_change * tc
+        cost = spread_cost + tc_cost
 
         net_return = gross_return - cost  # (B,)
 
@@ -201,6 +211,8 @@ class DFLTradingLoss(nn.Module):
             "positions": position.detach(),
             "gross_return": gross_return.detach(),
             "cost": cost.detach(),
+            "spread_cost": spread_cost.detach(),
+            "tc_cost": tc_cost.detach(),
             "net_return": net_return.detach(),
             "mean_abs_position": position.abs().mean().detach(),
             "trade_fraction": (smooth_abs_change > 0.01).float().mean().detach(),

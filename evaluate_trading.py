@@ -80,7 +80,12 @@ import sys
 import matplotlib.pyplot as plt
 import numpy as np
 
-from utils.metrics import compute_dp_optimal, compute_trading_metrics, format_trading_table
+from utils.metrics import (
+    _infer_std_price,
+    compute_dp_optimal,
+    compute_trading_metrics,
+    format_trading_table,
+)
 
 HORIZONS = [10, 20, 50, 100]
 SMA_WINDOWS = [10, 20]
@@ -92,10 +97,11 @@ def _spread_argmax_predictions(
     v_values: np.ndarray,
     z_half_spread: np.ndarray,
     segment_boundaries: np.ndarray | None = None,
+    z_transaction_cost: np.ndarray | None = None,
 ) -> np.ndarray:
     """DPVN spread-aware decision rule. Returns predictions in label space.
 
-    For each t, choose a* = argmax_a [V(t, a) - |a - pos_prev| * z_half_spread[t]],
+    For each t, choose a* = argmax_a [V(t, a) - |a - pos_prev| * (z_hs[t] + z_tc[t])],
     with pos_prev reset to 0 at segment boundaries (Battery per-product).
 
     Label mapping: position +1 -> 0 (up), 0 -> 1 (stat), -1 -> 2 (down).
@@ -104,6 +110,15 @@ def _spread_argmax_predictions(
     if z_half_spread is None:
         z_half_spread = np.zeros(n, dtype=np.float64)
     z_half_spread = np.abs(z_half_spread.astype(np.float64))
+    if z_transaction_cost is None:
+        z_tc = np.zeros(n, dtype=np.float64)
+    else:
+        z_tc = np.abs(np.asarray(z_transaction_cost, dtype=np.float64))
+        if len(z_tc) != n:
+            raise ValueError(
+                f"z_transaction_cost length {len(z_tc)} must match v_values length {n}"
+            )
+    per_unit = z_half_spread + z_tc
     seg_starts = set(int(b) for b in segment_boundaries) if segment_boundaries is not None else set()
     positions = np.zeros(n, dtype=np.float64)
     pos_prev = 0.0
@@ -114,7 +129,7 @@ def _spread_argmax_predictions(
         best_score = -np.inf
         for a_idx in range(3):
             a = _DPVN_ACTIONS[a_idx]
-            score = v_values[t, a_idx] - abs(a - pos_prev) * z_half_spread[t]
+            score = v_values[t, a_idx] - abs(a - pos_prev) * per_unit[t]
             if score > best_score:
                 best_score = score
                 best_a_idx = a_idx
@@ -138,6 +153,9 @@ def _dpvn_audit(data: dict, raw_preds: np.ndarray, spread_preds: np.ndarray, see
     mid_prices = data["mid_prices"]
     v_values = data.get("dpvn_values")
     z_hs = data.get("z_half_spreads")
+    raw_hs = data.get("half_spreads")
+    tc_raw = data.get("transaction_costs")
+    z_tc = data.get("z_transaction_costs")
     targets = data.get("targets")
     boundaries = data.get("segment_boundaries")
 
@@ -191,9 +209,13 @@ def _dpvn_audit(data: dict, raw_preds: np.ndarray, spread_preds: np.ndarray, see
             sub_mid = mid_prices[s:e]
             sub_preds = spread_preds[s:e]
             sub_z_hs = z_hs[s:e] if z_hs is not None else None
+            sub_raw_hs = raw_hs[s:e] if raw_hs is not None else None
+            sub_tc = tc_raw[s:e] if tc_raw is not None else None
             tm = compute_trading_metrics(
                 sub_mid, sub_preds,
+                half_spreads=sub_raw_hs,
                 z_half_spreads=sub_z_hs,
+                transaction_costs=sub_tc,
             )
             per_product.append(tm["total_pnl"])
         if per_product:
@@ -210,15 +232,21 @@ def _dpvn_audit(data: dict, raw_preds: np.ndarray, spread_preds: np.ndarray, see
         rng = np.random.default_rng(seed)
         perm = rng.permutation(v_values.shape[0])
         v_shuf = v_values[perm]
-        shuf_preds = _spread_argmax_predictions(v_shuf, z_hs, boundaries)
+        shuf_preds = _spread_argmax_predictions(
+            v_shuf, z_hs, boundaries, z_transaction_cost=z_tc
+        )
         tm = compute_trading_metrics(
             mid_prices, shuf_preds,
+            half_spreads=raw_hs,
             z_half_spreads=z_hs,
+            transaction_costs=tc_raw,
             segment_boundaries=boundaries,
         )
         real_tm = compute_trading_metrics(
             mid_prices, spread_preds,
+            half_spreads=raw_hs,
             z_half_spreads=z_hs,
+            transaction_costs=tc_raw,
             segment_boundaries=boundaries,
         )
         print("\n  [D3] Shuffled-V sanity test (time-permuted V, spread_argmax rule)")
@@ -263,14 +291,25 @@ def _compute_baselines(
     half_spreads: np.ndarray | None,
     z_half_spreads: np.ndarray | None,
     segment_boundaries: np.ndarray | None,
+    transaction_costs: np.ndarray | None = None,
+    z_transaction_costs: np.ndarray | None = None,
 ) -> list[tuple[str, dict]]:
-    """Compute reference baselines: Buy & Hold, SMA, Perfect Foresight + min_hold."""
+    """Compute reference baselines: Buy & Hold, SMA, Perfect Foresight + min_hold.
+
+    When ``transaction_costs`` / ``z_transaction_costs`` are supplied, all
+    baselines (including the DP oracle) see the layered spread + fee cost model.
+    """
     baselines = []
     n = len(mid_prices)
 
     # DP optimal (true ceiling — horizon-independent)
     if z_half_spreads is not None:
-        dp_result = compute_dp_optimal(mid_prices, z_half_spreads, segment_boundaries)
+        dp_result = compute_dp_optimal(
+            mid_prices,
+            z_half_spreads,
+            segment_boundaries,
+            z_transaction_cost=z_transaction_costs,
+        )
         dp_pos = dp_result["positions"]
         # Convert positions {-1, 0, +1} to predictions {2, 1, 0}
         dp_preds = np.ones(n, dtype=np.int64)
@@ -278,7 +317,9 @@ def _compute_baselines(
         dp_preds[dp_pos < -0.5] = 2  # down
         dp_tm = compute_trading_metrics(
             mid_prices, dp_preds,
+            half_spreads=half_spreads,
             z_half_spreads=z_half_spreads,
+            transaction_costs=transaction_costs,
             segment_boundaries=segment_boundaries,
         )
         baselines.append(("DP optimal", dp_tm))
@@ -288,6 +329,7 @@ def _compute_baselines(
     bnh = compute_trading_metrics(
         mid_prices, bnh_preds,
         half_spreads=half_spreads, z_half_spreads=z_half_spreads,
+        transaction_costs=transaction_costs,
         segment_boundaries=segment_boundaries,
     )
     baselines.append(("Buy & Hold", bnh))
@@ -307,6 +349,7 @@ def _compute_baselines(
         sma_tm = compute_trading_metrics(
             mid_prices, sma_preds,
             half_spreads=half_spreads, z_half_spreads=z_half_spreads,
+            transaction_costs=transaction_costs,
             segment_boundaries=segment_boundaries,
         )
         baselines.append((f"SMA-{w}", sma_tm))
@@ -320,6 +363,7 @@ def _compute_baselines(
             pf_tm = compute_trading_metrics(
                 mid_prices, targets,
                 half_spreads=half_spreads, z_half_spreads=z_half_spreads,
+                transaction_costs=transaction_costs,
                 min_hold=mh,
                 segment_boundaries=segment_boundaries,
             )
@@ -334,6 +378,7 @@ def _compute_baselines(
             pf_raw = compute_trading_metrics(
                 mid_prices, targets,
                 half_spreads=half_spreads, z_half_spreads=z_half_spreads,
+                transaction_costs=transaction_costs,
                 segment_boundaries=segment_boundaries,
             )
             baselines.append(("PF (no mh)", pf_raw))
@@ -402,10 +447,21 @@ def _load_arrays(checkpoint_dir: str, multi_horizon: bool) -> dict:
     boundaries_path = os.path.join(checkpoint_dir, "product_boundaries.npy")
     data["segment_boundaries"] = np.load(boundaries_path) if os.path.exists(boundaries_path) else None
 
-    # Load spread data for spread-aware evaluation
-    for name in ["half_spreads", "z_half_spreads"]:
+    # Load spread data for spread-aware evaluation (and tc for fee-aware evaluation)
+    for name in ["half_spreads", "z_half_spreads", "transaction_costs"]:
         path = os.path.join(checkpoint_dir, f"{name}.npy")
         data[name] = np.load(path) if os.path.exists(path) else None
+
+    # Derive z-space transaction cost (shares std_price with the spread path).
+    data["z_transaction_costs"] = None
+    if (
+        data.get("transaction_costs") is not None
+        and data.get("half_spreads") is not None
+        and data.get("z_half_spreads") is not None
+    ):
+        std_price_tc = _infer_std_price(data["half_spreads"], data["z_half_spreads"])
+        if std_price_tc is not None:
+            data["z_transaction_costs"] = data["transaction_costs"] / std_price_tc
 
     if multi_horizon:
         data["horizons"] = []
@@ -460,6 +516,7 @@ def _run_evaluation(
     segment_boundaries = data["segment_boundaries"]
     half_spreads = data.get("half_spreads")
     z_half_spreads = data.get("z_half_spreads")
+    transaction_costs = data.get("transaction_costs")
 
     if multi_horizon:
         for cost in costs:
@@ -483,6 +540,7 @@ def _run_evaluation(
                             logits=h_data.get("logits"),
                             half_spreads=half_spreads,
                             z_half_spreads=z_half_spreads,
+                            transaction_costs=transaction_costs,
                             cost_per_trade=cost,
                             confidence_threshold=conf_thresh,
                             min_hold=mh,
@@ -516,6 +574,7 @@ def _run_evaluation(
                         logits=data.get("logits"),
                         half_spreads=half_spreads,
                         z_half_spreads=z_half_spreads,
+                        transaction_costs=transaction_costs,
                         cost_per_trade=cost,
                         confidence_threshold=conf_thresh,
                         min_hold=mh,
@@ -913,8 +972,14 @@ def main():
                 data["dpvn_values"] = v_values
                 data["z_half_spreads"] = z_hs
             raw_argmax_preds = data["predictions"].copy()
+            z_tc_vec = data.get("z_transaction_costs")
+            if z_tc_vec is not None and len(z_tc_vec) > len(z_hs):
+                z_tc_vec = z_tc_vec[:len(z_hs)]
             spread_argmax_preds = _spread_argmax_predictions(
-                v_values, z_hs, data.get("segment_boundaries"),
+                v_values,
+                z_hs,
+                data.get("segment_boundaries"),
+                z_transaction_cost=z_tc_vec,
             )
             n_changed = int(np.sum(spread_argmax_preds != raw_argmax_preds))
             print(f"DPVN detected: {n_changed:,} / {spread_argmax_preds.shape[0]:,} predictions "
@@ -957,6 +1022,8 @@ def main():
         mid_prices = data["mid_prices"]
         half_spreads = data.get("half_spreads")
         z_half_spreads = data.get("z_half_spreads")
+        transaction_costs = data.get("transaction_costs")
+        z_transaction_costs = data.get("z_transaction_costs")
         segment_boundaries = data.get("segment_boundaries")
 
         if multi_horizon:
@@ -965,12 +1032,16 @@ def main():
                 targets = h_data.get("targets")
                 baselines_per_h[h] = _compute_baselines(
                     mid_prices, targets, half_spreads, z_half_spreads, segment_boundaries,
+                    transaction_costs=transaction_costs,
+                    z_transaction_costs=z_transaction_costs,
                 )
             _print_baselines(baselines_per_h, [h for h, _ in data["horizons"]], std_price, currency)
         else:
             targets = data.get("targets")
             baselines = _compute_baselines(
                 mid_prices, targets, half_spreads, z_half_spreads, segment_boundaries,
+                transaction_costs=transaction_costs,
+                z_transaction_costs=z_transaction_costs,
             )
             baselines_per_h = {10: baselines}  # single horizon
             _print_baselines(baselines_per_h, [10], std_price, currency)

@@ -49,11 +49,14 @@ log = logging.getLogger(__name__)
 _N_MSG = 18
 _N_LOB = cst.N_LOB_LEVELS * cst.LEN_LEVEL  # 40
 _N_LABELS = len(cst.LOBSTER_HORIZONS)  # 4
-_N_DFL = _N_LABELS + 1  # 4 delta_mids + 1 half_spread
+_N_DFL = _N_LABELS + 1 + 1  # 4 delta_mids + 1 half_spread + 1 transaction_cost
 _NCOLS_FULL = _N_MSG + _N_LOB + _N_LABELS  # 62
 _NCOLS_LOB = _N_LOB + _N_LABELS  # 44
-_NCOLS_FULL_DFL = _NCOLS_FULL + _N_DFL  # 67
-_NCOLS_LOB_DFL = _NCOLS_LOB + _N_DFL  # 49
+_NCOLS_FULL_DFL = _NCOLS_FULL + _N_DFL  # 68
+_NCOLS_LOB_DFL = _NCOLS_LOB + _N_DFL  # 50
+# Legacy layouts (pre-tc) — used to raise a clear rebuild prompt
+_NCOLS_FULL_DFL_LEGACY = _NCOLS_FULL + _N_LABELS + 1  # 67
+_NCOLS_LOB_DFL_LEGACY = _NCOLS_LOB + _N_LABELS + 1  # 49
 _HORIZON_IDX = {
     h: i for i, h in enumerate(cst.LOBSTER_HORIZONS)
 }  # {10:0, 20:1, 50:2, 100:3}
@@ -62,6 +65,30 @@ _HORIZON_IDX = {
 # ─────────────────────────────────────────────────────────────────────────────
 # Data-loading functions (called by run.py at training time)
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def battery_load_tc_columns(path: str):
+    """Return (raw_hs, raw_tc) aligned to the LOB input (length N, not mask-filtered).
+
+    Helper for the single-horizon DPVN/DAVN path. Accepts both full-format (68 cols)
+    and LOB-only format (50 cols). Raises on legacy layouts without tc.
+    """
+    arr = np.load(path)
+    ncols = arr.shape[1]
+    if ncols == _NCOLS_FULL_DFL:  # 68
+        dfl_start = _N_MSG + _N_LOB + _N_LABELS
+    elif ncols == _NCOLS_LOB_DFL:  # 50
+        dfl_start = _N_LOB + _N_LABELS
+    elif ncols in (_NCOLS_FULL_DFL_LEGACY, _NCOLS_LOB_DFL_LEGACY):
+        raise RuntimeError(
+            f"{path}: {ncols}-col layout cannot supply transaction_cost; "
+            "run with --rebuild-data."
+        )
+    else:
+        raise ValueError(f"Unexpected column count {ncols} in {path}.")
+    raw_hs = arr[:, dfl_start + _N_LABELS].astype(np.float32)
+    raw_tc = arr[:, dfl_start + _N_LABELS + 1].astype(np.float32)
+    return raw_hs, raw_tc
 
 
 def battery_load(path: str, all_features: bool, len_smooth: int, h: int, seq_size: int):
@@ -117,7 +144,8 @@ def battery_load_multi(path: str, all_features: bool, len_smooth: int, seq_size:
     input_ : FloatTensor (N, num_features)
     labels  : LongTensor  (N_valid, 4)   columns: h10, h20, h50, h100
     dfl_data : tuple | None
-        If DFL data present: (delta_mids (N, 4), half_spreads (N,)) as FloatTensors.
+        If DFL data present: (delta_mids (N, 4), half_spreads (N,),
+        transaction_costs (N,)) as FloatTensors.
     """
     arr = np.load(path)
     msg_cols, lob_cols, label_cols, dfl_cols = _split_columns(arr, path)
@@ -131,10 +159,15 @@ def battery_load_multi(path: str, all_features: bool, len_smooth: int, seq_size:
 
     dfl_data = None
     if dfl_cols is not None:
-        delta_mids, half_spreads = dfl_cols
+        delta_mids, half_spreads, transaction_costs = dfl_cols
         delta_mids = delta_mids[label_start:][finite_mask].astype(np.float32)
         half_spreads = half_spreads[label_start:][finite_mask].astype(np.float32)
-        dfl_data = (torch.from_numpy(delta_mids).float(), torch.from_numpy(half_spreads).float())
+        transaction_costs = transaction_costs[label_start:][finite_mask].astype(np.float32)
+        dfl_data = (
+            torch.from_numpy(delta_mids).float(),
+            torch.from_numpy(half_spreads).float(),
+            torch.from_numpy(transaction_costs).float(),
+        )
 
     return torch.from_numpy(input_).float(), torch.from_numpy(all_labels).long(), dfl_data
 
@@ -142,23 +175,32 @@ def battery_load_multi(path: str, all_features: bool, len_smooth: int, seq_size:
 def _split_columns(arr: np.ndarray, path: str):
     """Parse .npy into (msg_cols, lob_cols, label_cols, dfl_cols) based on column count.
 
-    Returns dfl_cols=(delta_mids, half_spreads) when DFL data is present, else None.
+    Returns dfl_cols=(delta_mids, half_spreads, transaction_costs) when DFL data
+    is present, else None.
     """
     ncols = arr.shape[1]
     dfl_cols = None
 
-    if ncols == _NCOLS_FULL_DFL:  # 67: full + DFL
+    if ncols == _NCOLS_FULL_DFL:  # 68: full + DFL + tc
         msg_cols = arr[:, :_N_MSG]
         lob_cols = arr[:, _N_MSG : _N_MSG + _N_LOB]
         label_cols = arr[:, _N_MSG + _N_LOB : _N_MSG + _N_LOB + _N_LABELS]
         dfl_start = _N_MSG + _N_LOB + _N_LABELS
-        dfl_cols = (arr[:, dfl_start : dfl_start + _N_LABELS], arr[:, dfl_start + _N_LABELS])
-    elif ncols == _NCOLS_LOB_DFL:  # 49: LOB-only + DFL
+        dfl_cols = (
+            arr[:, dfl_start : dfl_start + _N_LABELS],
+            arr[:, dfl_start + _N_LABELS],
+            arr[:, dfl_start + _N_LABELS + 1],
+        )
+    elif ncols == _NCOLS_LOB_DFL:  # 50: LOB-only + DFL + tc
         msg_cols = None
         lob_cols = arr[:, :_N_LOB]
         label_cols = arr[:, _N_LOB : _N_LOB + _N_LABELS]
         dfl_start = _N_LOB + _N_LABELS
-        dfl_cols = (arr[:, dfl_start : dfl_start + _N_LABELS], arr[:, dfl_start + _N_LABELS])
+        dfl_cols = (
+            arr[:, dfl_start : dfl_start + _N_LABELS],
+            arr[:, dfl_start + _N_LABELS],
+            arr[:, dfl_start + _N_LABELS + 1],
+        )
     elif ncols == _NCOLS_FULL:  # 62: full format (no DFL)
         msg_cols = arr[:, :_N_MSG]
         lob_cols = arr[:, _N_MSG : _N_MSG + _N_LOB]
@@ -167,10 +209,15 @@ def _split_columns(arr: np.ndarray, path: str):
         msg_cols = None
         lob_cols = arr[:, :_N_LOB]
         label_cols = arr[:, _N_LOB:]
+    elif ncols in (_NCOLS_FULL_DFL_LEGACY, _NCOLS_LOB_DFL_LEGACY):
+        raise RuntimeError(
+            f"{path}: {ncols}-col layout is stale (missing transaction_cost column). "
+            "Run with --rebuild-data to regenerate the .npy files."
+        )
     else:
         raise ValueError(
-            f"Unexpected column count {ncols} in {path}. Expected {_NCOLS_FULL}/{_NCOLS_FULL_DFL} (full) "
-            f"or {_NCOLS_LOB}/{_NCOLS_LOB_DFL} (LOB-only)."
+            f"Unexpected column count {ncols} in {path}. Expected "
+            f"{_NCOLS_FULL}/{_NCOLS_FULL_DFL} (full) or {_NCOLS_LOB}/{_NCOLS_LOB_DFL} (LOB-only)."
         )
     return msg_cols, lob_cols, label_cols, dfl_cols
 
@@ -278,6 +325,8 @@ class BatteryDataBuilder:
         extract_events: bool = False,
         max_events_per_window: int = 64,
         max_hours_before_delivery: float = 0.0,
+        tc_abs: float = 0.0,
+        tc_bps: float = 0.0,
     ):
         self.data_dir = data_dir
         self.sampling_time_str = sampling_time
@@ -304,6 +353,8 @@ class BatteryDataBuilder:
         self.extract_events = extract_events
         self.max_events_per_window = max_events_per_window
         self.max_hours_before_delivery = max_hours_before_delivery
+        self.tc_abs = float(tc_abs)
+        self.tc_bps = float(tc_bps)
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -1054,9 +1105,9 @@ class BatteryDataBuilder:
 
         # Compute labels on raw LOB (before normalisation)
         print("  Computing labels...")
-        train_labels, train_dmid, train_hspread = self._build_labels(train_raw_lob)
-        val_labels, val_dmid, val_hspread = self._build_labels(val_raw_lob)
-        test_labels, test_dmid, test_hspread = self._build_labels(test_raw_lob)
+        train_labels, train_dmid, train_hspread, train_tc = self._build_labels(train_raw_lob)
+        val_labels, val_dmid, val_hspread, val_tc = self._build_labels(val_raw_lob)
+        test_labels, test_dmid, test_hspread, test_tc = self._build_labels(test_raw_lob)
 
         # Normalise
         print("  Normalising features...")
@@ -1064,10 +1115,10 @@ class BatteryDataBuilder:
             train_features, val_features, test_features
         )
 
-        # Save (with DFL data: delta_mids + half_spreads)
-        self._save_split(train_norm, train_labels, out_dir / "train.npy", train_dmid, train_hspread)
-        self._save_split(val_norm, val_labels, out_dir / "val.npy", val_dmid, val_hspread)
-        self._save_split(test_norm, test_labels, out_dir / "test.npy", test_dmid, test_hspread)
+        # Save (with DFL data: delta_mids + half_spreads + transaction_costs)
+        self._save_split(train_norm, train_labels, out_dir / "train.npy", train_dmid, train_hspread, train_tc)
+        self._save_split(val_norm, val_labels, out_dir / "val.npy", val_dmid, val_hspread, val_tc)
+        self._save_split(test_norm, test_labels, out_dir / "test.npy", test_dmid, test_hspread, test_tc)
 
         self._validate_and_report(out_dir)
 
@@ -1222,12 +1273,21 @@ class BatteryDataBuilder:
         else:
             features = lobs.astype(np.float32)
 
-        labels, delta_mids, half_spreads = self._build_labels(lobs.astype(np.float32))
+        labels, delta_mids, half_spreads, transaction_costs = self._build_labels(
+            lobs.astype(np.float32)
+        )
         if global_stats:
             norm_features, _ = self._normalise_features(features, stats=global_stats)
         else:
             norm_features, _, _ = self._normalise_single(features)
-        self._save_split(norm_features, labels, prod_dir / f"{split_name}.npy", delta_mids, half_spreads)
+        self._save_split(
+            norm_features,
+            labels,
+            prod_dir / f"{split_name}.npy",
+            delta_mids,
+            half_spreads,
+            transaction_costs,
+        )
 
         # Save empty placeholders for the other two splits
         ncols = _NCOLS_FULL_DFL if self.all_features else _NCOLS_LOB_DFL
@@ -1259,18 +1319,23 @@ class BatteryDataBuilder:
             n_test = n - n_train - n_val
         return days[:n_train], days[n_train : n_train + n_val], days[n_train + n_val :]
 
-    def _build_labels(self, raw_lob: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute multi-horizon labels and raw price changes from raw LOB.
+    def _build_labels(
+        self, raw_lob: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute multi-horizon labels, raw price changes, and transaction cost from raw LOB.
 
         Returns:
-            labels: (N, 4) float array with np.inf for invalid positions.
-            delta_mids: (N, 4) float array of raw mid-price changes per horizon.
-            half_spreads: (N,) float array of half bid-ask spread at each timestep.
+            labels:            (N, 4) float array with np.inf for invalid positions.
+            delta_mids:        (N, 4) float array of raw mid-price changes per horizon.
+            half_spreads:      (N,)   float array of half bid-ask spread at each timestep.
+            transaction_costs: (N,)   float array of exchange fee per unit |Δpos| in raw units,
+                               computed as tc_abs + (tc_bps / 10_000) * |mid_raw[t]|.
         """
         if raw_lob.shape[0] == 0:
             return (
                 np.full((0, _N_LABELS), np.inf, dtype=np.float32),
                 np.full((0, _N_LABELS), 0.0, dtype=np.float32),
+                np.zeros(0, dtype=np.float32),
                 np.zeros(0, dtype=np.float32),
             )
 
@@ -1294,7 +1359,14 @@ class BatteryDataBuilder:
         # Half spread: (ask1 - bid1) / 2 from raw LOB (col 0 = sell1, col 2 = buy1)
         half_spreads = ((raw_lob[:, 0] - raw_lob[:, 2]) / 2).astype(np.float32)  # (N,)
 
-        return labels, delta_mids, half_spreads
+        # Transaction cost: tc_abs + (tc_bps / 10_000) * |mid_raw[t]|
+        # Battery can have negative prices (renewable oversupply) — |mid_raw| keeps tc non-negative.
+        mid_raw = (raw_lob[:, 0] + raw_lob[:, 2]) / 2.0
+        transaction_costs = (
+            self.tc_abs + (self.tc_bps / 10_000.0) * np.abs(mid_raw)
+        ).astype(np.float32)
+
+        return labels, delta_mids, half_spreads, transaction_costs
 
     def _normalise_splits(
         self,
@@ -1457,8 +1529,9 @@ class BatteryDataBuilder:
         path: Path,
         delta_mids: np.ndarray | None = None,
         half_spreads: np.ndarray | None = None,
+        transaction_costs: np.ndarray | None = None,
     ):
-        """Concatenate features, labels, and optional DFL data, then save as .npy."""
+        """Concatenate features, labels, and optional DFL+tc data, then save as .npy."""
         if features.shape[0] == 0:
             if delta_mids is not None:
                 ncols = _NCOLS_FULL_DFL if self.all_features else _NCOLS_LOB_DFL
@@ -1471,6 +1544,8 @@ class BatteryDataBuilder:
             parts.append(delta_mids)
         if half_spreads is not None:
             parts.append(half_spreads.reshape(-1, 1))
+        if transaction_costs is not None:
+            parts.append(transaction_costs.reshape(-1, 1))
         arr = np.concatenate(parts, axis=1).astype(np.float32)
         np.save(path, arr)
 

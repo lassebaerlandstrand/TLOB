@@ -133,6 +133,13 @@ class Dataset:
     dates: list = MISSING
     batch_size: int = MISSING
     model_overrides: dict = field(default_factory=dict)
+    # Transaction cost (exchange fee / commission) per unit position change, layered
+    # on top of the bid-ask half-spread. Applied in raw price units per unit |Δpos|:
+    #   tc_raw[t] = tc_abs + (tc_bps / 10_000) * |mid_raw[t]|
+    # tc_abs: fixed component (e.g. EUR/MWh commission for Battery).
+    # tc_bps: proportional component in basis points of notional (e.g. taker fee for BTC).
+    tc_abs: float = 0.0
+    tc_bps: float = 0.0
 
 
 @dataclass
@@ -166,6 +173,10 @@ class BTC(Dataset):
     batch_size: int = 128
     training_stocks: list = field(default_factory=lambda: ["BTC"])
     testing_stocks: list = field(default_factory=lambda: ["BTC"])
+    # Binance USD-M Futures VIP-0 taker fee, Jan 2023 schedule (0.04% = 4 bps).
+    # Bump to 5-6 bps to include a slippage budget; our DP oracle assumes L1 execution.
+    tc_abs: float = 0.0
+    tc_bps: float = 4.0
     model_overrides: dict = field(
         default_factory=lambda: {
             "_default": {"hidden_dim": 40},
@@ -190,6 +201,9 @@ class BATTERY(Dataset):
     dates: list = field(default_factory=lambda: ["2021-01-11", "2021-01-22"])
     sampling_type: SamplingType = SamplingType.TIME_DEDUP
     sampling_time: str = "10s"
+    # dates: list = field(default_factory=lambda: ["2021-03-01", "2021-03-31"])
+    # sampling_type: SamplingType = SamplingType.TIME_DEDUP
+    # sampling_time: str = "10s"
     sampling_quantity: int = 0
     batch_size: int = 128
     training_stocks: list = field(default_factory=lambda: ["battery_markets"])
@@ -200,13 +214,17 @@ class BATTERY(Dataset):
     parsed_data_path: str = "data/battery_markets/parsed"
     max_lob_depth: float = 1000.0
     all_features: bool = True
-    extract_events: bool = True
+    extract_events: bool = False
     max_events_per_window: int = 64
     max_hours_before_delivery: float = 6.0
+    # EPEX intraday commission: 0.09 EUR/MWh per unit position change (absolute).
+    # bps path unused here; `|mid_raw|` would be ill-defined anyway since battery prices can be negative.
+    tc_abs: float = 0.09
+    tc_bps: float = 0.0
     model_overrides: dict = field(
         default_factory=lambda: {
             "_default": {"hidden_dim": 50, "num_heads": 1, "dropout": 0.1},
-            "DPVN": {"hidden_dim": 64, "num_heads": 4, "dropout": 0.1, "all_features": True},
+            "DPVN": {"hidden_dim": 96, "num_heads": 4, "dropout": 0.1, "all_features": True},
             "DAVN": {"hidden_dim": 96, "num_heads": 4, "dropout": 0.1, "all_features": True},
         }
     )
@@ -316,11 +334,10 @@ class Experiment:
     )
     focal_gamma: float = 2.0  # Unused if loss_type is not "focal" or "focal_ordinal"
     ordinal_smoothing: float = 0.15  # Unused if loss_type is not "focal_ordinal"
-    trading_cost: float = 0.0  # Cost multiplier (x mean |Δmid|) for trading simulation
     # DFL parameters (used when loss_type starts with "dfl_")
     dfl_temperature: float = 1.0  # Gumbel-Softmax initial temperature
     dfl_temperature_final: float = 0.1  # Final temperature after annealing
-    dfl_cost_multiplier: float = 1.0  # Transaction cost multiplier for spread-aware DFL
+    dfl_cost_multiplier: float = 1.0  # Multiplier on total cost (spread + transaction_cost) in DFL loss
     dfl_objective: str = "sharpe"  # "pnl" | "sharpe" | "sortino"
     dfl_lambda_drawdown: float = 0.0  # Drawdown penalty weight
     dfl_lambda_turnover: float = 0.0  # Turnover penalty weight

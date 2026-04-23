@@ -15,6 +15,7 @@ from lion_pytorch import Lion
 from torch_ema import ExponentialMovingAverage
 from utils.utils_model import pick_model
 from utils.metrics import (
+    _infer_std_price,
     compute_baselines,
     compute_metrics,
     compute_trading_metrics,
@@ -250,6 +251,7 @@ class Engine(LightningModule):
         self.test_mid_prices = []
         self.test_half_spreads = []
         self.test_z_half_spreads = []
+        self.test_transaction_costs = []
         self.train_epoch_start_time = None
         self.epoch_sample_count = 0
         self.epoch_iteration_count = 0
@@ -316,20 +318,37 @@ class Engine(LightningModule):
     def _unpack_batch(self, batch):
         """Unpack batch into (x, y, dfl_data).
 
-        Standard models:        batch = (x, y)
-        DFL multi-horizon:      batch = (x, y, delta_mids, half_spread)
-        DPVN:                   batch = (x, y, q_target)
+        Supported shapes:
+            (x, y)                                         — standard classification
+            (x, y, half_spread, transaction_cost)          — single-horizon + cost accumulators
+            (x, y, q_target)                               — DPVN / DAVN, no cost
+            (x, y, q_target, half_spread, transaction_cost) — DPVN / DAVN with cost
+            (x, y, delta_mids, half_spread, transaction_cost) — multi-horizon DFL
         """
-        # DPVN single-horizon with Q targets: 3-element batch
+        # DPVN with q_target + dfl: 5-element batch (DPVN flag disambiguates from multi-horizon DFL)
+        if self.is_dpvn and len(batch) == 5:
+            x, y, q_target, half_spread, transaction_cost = batch
+            self._batch_q_target = q_target
+            # delta_mids placeholder — single-horizon DPVN doesn't use DFL loss, we only need
+            # tc/hs accumulation in test_step. Store as (None, hs, tc) for the downstream unpacker.
+            return x, y, (None, half_spread, transaction_cost)
+
+        # DPVN with q_target only: 3-element batch
         if self.is_dpvn and len(batch) == 3:
             x, y, q_target = batch
             self._batch_q_target = q_target
             return x, y, None
 
+        if len(batch) == 5:
+            # Multi-horizon DFL data: (x, y_multi, delta_mids, half_spread, transaction_cost)
+            x, y, delta_mids, half_spread, transaction_cost = batch
+            return x, y, (delta_mids, half_spread, transaction_cost)
+
         if len(batch) == 4:
-            # DFL data: (x, y_multi, delta_mids, half_spread)
-            x, y, delta_mids, half_spread = batch
-            return x, y, (delta_mids, half_spread)
+            # Single-horizon classification with cost accumulators: (x, y, hs, tc)
+            x, y, half_spread, transaction_cost = batch
+            return x, y, (None, half_spread, transaction_cost)
+
         x, y = batch
         return x, y, None
 
@@ -351,9 +370,12 @@ class Engine(LightningModule):
         for horizon_index, y_hat_h in enumerate(y_hat_list):
             if self.is_dfl:
                 if self.loss_type == "dfl_trading" and dfl_data is not None:
-                    delta_mids, half_spreads = dfl_data
+                    delta_mids, half_spreads, transaction_costs = dfl_data
                     dfl_loss_h, _ = self.dfl_loss(
-                        y_hat_h, delta_mids[:, horizon_index], half_spreads
+                        y_hat_h,
+                        delta_mids[:, horizon_index],
+                        half_spreads,
+                        transaction_cost=transaction_costs,
                     )
                 else:
                     if self.loss_type == "dfl_trading" and dfl_data is None:
@@ -365,10 +387,10 @@ class Engine(LightningModule):
                     dfl_loss_h, _ = self.dfl_loss(y_hat_h, y_multi[:, horizon_index])
                 horizon_losses.append(dfl_loss_h)
             elif self.loss_type == "cost_aware_ce" and dfl_data is not None:
-                # Cost-aware CE: weight each sample by |delta_mid| / half_spread
-                delta_mids, half_spreads = dfl_data
+                # Cost-aware CE: weight each sample by |delta_mid| / (half_spread + tc)
+                delta_mids, half_spreads, transaction_costs = dfl_data
                 dm_h = delta_mids[:, horizon_index].abs()
-                hs = half_spreads.clamp(min=1e-8)
+                hs = (half_spreads + transaction_costs.abs()).clamp(min=1e-8)
                 sample_w = (dm_h / hs).clamp(min=0.01, max=10.0)
                 horizon_weight = None
                 if self.class_weights is not None:
@@ -436,8 +458,13 @@ class Engine(LightningModule):
         elif self.is_dfl:
             y_hat = self.forward(x)
             if self.loss_type == "dfl_trading" and dfl_data is not None:
-                delta_mids, half_spreads = dfl_data
-                batch_loss, _ = self.dfl_loss(y_hat, delta_mids, half_spreads)
+                delta_mids, half_spreads, transaction_costs = dfl_data
+                # Single-horizon DFL: delta_mids is the h-specific column already.
+                # For multi-horizon 2D tensors, pick column 0 (single-horizon path asserts this upstream).
+                dm = delta_mids[:, 0] if delta_mids.dim() == 2 else delta_mids
+                batch_loss, _ = self.dfl_loss(
+                    y_hat, dm, half_spreads, transaction_cost=transaction_costs
+                )
             else:
                 if self.loss_type == "dfl_trading" and dfl_data is None:
                     if not hasattr(self, "_warned_dfl_fallback"):
@@ -590,8 +617,11 @@ class Engine(LightningModule):
                 y_hat = self.forward(x)
                 if self.is_dfl:
                     if self.loss_type == "dfl_trading" and dfl_data is not None:
-                        delta_mids, half_spreads = dfl_data
-                        batch_loss, _ = self.dfl_loss(y_hat, delta_mids, half_spreads)
+                        delta_mids, half_spreads, transaction_costs = dfl_data
+                        dm = delta_mids[:, 0] if delta_mids.dim() == 2 else delta_mids
+                        batch_loss, _ = self.dfl_loss(
+                            y_hat, dm, half_spreads, transaction_cost=transaction_costs
+                        )
                     else:
                         batch_loss, _ = self.dfl_loss(y_hat, y)
                     batch_loss_mean = batch_loss
@@ -615,10 +645,11 @@ class Engine(LightningModule):
         z_half_spread = ((x[:, -1, 0] - x[:, -1, 2]) / 2).cpu().numpy().flatten()
         self.test_z_half_spreads.append(z_half_spread)
 
-        # Accumulate raw half-spread from DFL data (if available)
+        # Accumulate raw half-spread and transaction cost from DFL data (if available)
         if dfl_data is not None:
-            _, hs = dfl_data
+            _, hs, tc = dfl_data
             self.test_half_spreads.append(hs.cpu().numpy().flatten())
+            self.test_transaction_costs.append(tc.cpu().numpy().flatten())
 
         if self.is_dpvn:
             return self._dpvn_test_step(x, y)
@@ -647,8 +678,9 @@ class Engine(LightningModule):
             def _compute_loss(y_hat_, y_):
                 if self.is_dfl:
                     if self.loss_type == "dfl_trading" and dfl_data is not None:
-                        dm, hs = dfl_data
-                        loss_, _ = self.dfl_loss(y_hat_, dm, hs)
+                        dm, hs, tc = dfl_data
+                        dm0 = dm[:, 0] if dm.dim() == 2 else dm
+                        loss_, _ = self.dfl_loss(y_hat_, dm0, hs, transaction_cost=tc)
                     else:
                         loss_, _ = self.dfl_loss(y_hat_, y_)
                     return loss_
@@ -824,10 +856,15 @@ class Engine(LightningModule):
 
         z_half_spreads_all = np.concatenate(self.test_z_half_spreads) if self.test_z_half_spreads else None
         half_spreads_all = np.concatenate(self.test_half_spreads) if self.test_half_spreads else None
+        transaction_costs_all = (
+            np.concatenate(self.test_transaction_costs) if self.test_transaction_costs else None
+        )
         if z_half_spreads_all is not None:
             np.save(os.path.join(save_dir, "z_half_spreads"), z_half_spreads_all)
         if half_spreads_all is not None:
             np.save(os.path.join(save_dir, "half_spreads"), half_spreads_all)
+        if transaction_costs_all is not None:
+            np.save(os.path.join(save_dir, "transaction_costs"), transaction_costs_all)
 
         # Save per-horizon logits for soft-position trading evaluation
         if self.multi_horizon:
@@ -930,8 +967,21 @@ class Engine(LightningModule):
 
         if half_spreads_all is not None or z_half_spreads_all is not None:
             self._console("(spread-aware costs enabled)")
+        if transaction_costs_all is not None:
+            self._console("(transaction-cost fee enabled — layered on top of spread)")
         if self.is_dfl:
             self._console("(DFL: Gumbel-Softmax training, hard argmax evaluation)")
+
+        # Derive z-space transaction cost once (shares std_price with the spread path)
+        z_transaction_cost_all = None
+        if (
+            transaction_costs_all is not None
+            and half_spreads_all is not None
+            and z_half_spreads_all is not None
+        ):
+            std_price_for_tc = _infer_std_price(half_spreads_all, z_half_spreads_all)
+            if std_price_for_tc is not None:
+                z_transaction_cost_all = transaction_costs_all / std_price_for_tc
 
         if self.multi_horizon:
             trading_metrics_per_h = []
@@ -944,6 +994,7 @@ class Engine(LightningModule):
                     logits=h_logits,
                     half_spreads=half_spreads_all,
                     z_half_spreads=z_half_spreads_all,
+                    transaction_costs=transaction_costs_all,
                     segment_boundaries=segment_boundaries,
                     use_soft_positions=False,
                 )
@@ -968,6 +1019,7 @@ class Engine(LightningModule):
                             logits=h_logits[s:e] if h_logits is not None else None,
                             half_spreads=half_spreads_all[s:e] if half_spreads_all is not None else None,
                             z_half_spreads=z_half_spreads_all[s:e] if z_half_spreads_all is not None else None,
+                            transaction_costs=transaction_costs_all[s:e] if transaction_costs_all is not None else None,
                             use_soft_positions=False,
                         )
                         product_sharpes.append(prod_tm["sharpe"])
@@ -987,7 +1039,10 @@ class Engine(LightningModule):
                 self._console(f"DPVN values saved: {v_values.shape} to {save_dir}/dpvn_values.npy")
                 self.test_v_values = []
                 preds_for_trading = _dpvn_spread_argmax_predictions(
-                    v_values, z_half_spreads_all, segment_boundaries
+                    v_values,
+                    z_half_spreads_all,
+                    segment_boundaries,
+                    z_transaction_cost=z_transaction_cost_all,
                 )
                 np.save(os.path.join(save_dir, "predictions_spread_argmax"), preds_for_trading)
                 decision_label = "spread_argmax"
@@ -995,6 +1050,7 @@ class Engine(LightningModule):
                     mid_prices, predictions,
                     half_spreads=half_spreads_all,
                     z_half_spreads=z_half_spreads_all,
+                    transaction_costs=transaction_costs_all,
                     segment_boundaries=segment_boundaries,
                 )
                 self._console(
@@ -1005,6 +1061,7 @@ class Engine(LightningModule):
                 mid_prices, preds_for_trading,
                 half_spreads=half_spreads_all,
                 z_half_spreads=z_half_spreads_all,
+                transaction_costs=transaction_costs_all,
                 segment_boundaries=segment_boundaries,
             )
             self._console(
@@ -1024,6 +1081,7 @@ class Engine(LightningModule):
         self.test_targets = []
         self.test_half_spreads = []
         self.test_z_half_spreads = []
+        self.test_transaction_costs = []
         if self.multi_horizon:
             self.test_logits_per_h = [[] for _ in HORIZONS]
         self.test_predictions = []
@@ -1238,14 +1296,25 @@ def _dpvn_spread_argmax_predictions(
     v_values: np.ndarray,
     z_half_spread: np.ndarray,
     segment_boundaries: np.ndarray | None = None,
+    z_transaction_cost: np.ndarray | None = None,
 ) -> np.ndarray:
     """Sequential spread-aware argmax decision rule for DPVN.
 
     Mirrors evaluate_trading._spread_argmax_predictions so the training-time
     trading log reflects the architecture's intended inference path.
+    Decision rule: a* = argmax_a [V(t,a) - |a - pos_prev| * (z_hs[t] + z_tc[t])].
     """
     n = v_values.shape[0]
     z_hs = np.abs(np.asarray(z_half_spread, dtype=np.float64))
+    if z_transaction_cost is None:
+        z_tc = np.zeros(n, dtype=np.float64)
+    else:
+        z_tc = np.abs(np.asarray(z_transaction_cost, dtype=np.float64))
+        if len(z_tc) != n:
+            raise ValueError(
+                f"z_transaction_cost length {len(z_tc)} must match v_values length {n}"
+            )
+    per_unit = z_hs + z_tc
     seg_starts = set(int(b) for b in segment_boundaries) if segment_boundaries is not None else set()
     positions = np.zeros(n, dtype=np.float64)
     pos_prev = 0.0
@@ -1256,7 +1325,7 @@ def _dpvn_spread_argmax_predictions(
         best_score = -np.inf
         for a_idx in range(3):
             a = _DPVN_ACTION_VALUES[a_idx]
-            score = v_values[t, a_idx] - abs(a - pos_prev) * z_hs[t]
+            score = v_values[t, a_idx] - abs(a - pos_prev) * per_unit[t]
             if score > best_score:
                 best_score = score
                 best_idx = a_idx
